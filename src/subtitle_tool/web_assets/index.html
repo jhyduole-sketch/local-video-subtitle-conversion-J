@@ -80,22 +80,21 @@
 
           <div class="field span-all">
             <label>常用目标语言</label>
-            <div id="languagePicker" class="language-picker">
-              <button type="button" data-lang="zh-CN">中文</button>
-              <button type="button" data-lang="ja" class="selected">日语</button>
-              <button type="button" data-lang="en">英语</button>
-              <button type="button" data-lang="ko">韩语</button>
-              <button type="button" data-lang="fr">法语</button>
-              <button type="button" data-lang="de">德语</button>
-              <button type="button" data-lang="es">西班牙语</button>
-              <button type="button" data-lang="pt">葡萄牙语</button>
-              <button type="button" data-lang="it">意大利语</button>
-              <button type="button" data-lang="ru">俄语</button>
-              <button type="button" data-lang="ar">阿拉伯语</button>
-              <button type="button" data-lang="th">泰语</button>
-              <button type="button" data-lang="vi">越南语</button>
-              <button type="button" data-lang="id">印尼语</button>
+            <div class="language-dropdown">
+              <button
+                id="languagePickerToggle"
+                class="language-dropdown-toggle"
+                type="button"
+                aria-expanded="false"
+              >
+                选择常用语言
+              </button>
+              <div id="languagePickerPanel" class="language-dropdown-panel" hidden>
+                <div id="languagePicker" class="language-picker"></div>
+                <button id="clearLanguagesButton" class="text-button" type="button">清空选择</button>
+              </div>
             </div>
+            <p id="languagePickerHint" class="field-hint"></p>
           </div>
 
           <div class="field">
@@ -127,7 +126,7 @@
           </div>
 
           <div class="actions span-all">
-            <button id="runButton" class="primary-button" type="submit">开始转换</button>
+            <button id="runButton" class="primary-button" type="submit">开始任务</button>
             <button id="stopButton" class="secondary-button" type="button" disabled>停止任务</button>
             <span id="jobBadge" class="badge idle">空闲</span>
           </div>

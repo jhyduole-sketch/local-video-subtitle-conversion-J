@@ -12,6 +12,11 @@ const results = document.querySelector("#results");
 const resultSummary = document.querySelector("#resultSummary");
 const targetLangsInput = document.querySelector("#targetLangs");
 const languagePicker = document.querySelector("#languagePicker");
+const languagePickerToggle = document.querySelector("#languagePickerToggle");
+const languagePickerPanel = document.querySelector("#languagePickerPanel");
+const languagePickerHint = document.querySelector("#languagePickerHint");
+const clearLanguagesButton = document.querySelector("#clearLanguagesButton");
+const translatorSelect = document.querySelector("#translator");
 const progressBar = document.querySelector("#progressBar");
 const progressMessage = document.querySelector("#progressMessage");
 const progressPercent = document.querySelector("#progressPercent");
@@ -23,6 +28,96 @@ const whisperModelPaths = {
   small: "models/ggml-small.bin",
   medium: "models/ggml-medium.bin",
 };
+const cloudLanguages = [
+  ["zh-CN", "中文"],
+  ["zh-TW", "繁中"],
+  ["en", "英语"],
+  ["ja", "日语"],
+  ["ko", "韩语"],
+  ["fr", "法语"],
+  ["de", "德语"],
+  ["es", "西班牙语"],
+  ["pt", "葡萄牙语"],
+  ["it", "意大利语"],
+  ["ru", "俄语"],
+  ["ar", "阿拉伯语"],
+  ["th", "泰语"],
+  ["vi", "越南语"],
+  ["id", "印尼语"],
+  ["tr", "土耳其语"],
+  ["nl", "荷兰语"],
+  ["pl", "波兰语"],
+  ["uk", "乌克兰语"],
+  ["hi", "印地语"],
+  ["ms", "马来语"],
+  ["sv", "瑞典语"],
+  ["el", "希腊语"],
+  ["he", "希伯来语"],
+  ["fa", "波斯语"],
+  ["cs", "捷克语"],
+  ["ro", "罗马尼亚语"],
+  ["hu", "匈牙利语"],
+  ["fi", "芬兰语"],
+  ["da", "丹麦语"],
+  ["no", "挪威语"],
+  ["sk", "斯洛伐克语"],
+  ["bg", "保加利亚语"],
+  ["hr", "克罗地亚语"],
+  ["sr", "塞尔维亚语"],
+  ["sl", "斯洛文尼亚语"],
+  ["lt", "立陶宛语"],
+  ["lv", "拉脱维亚语"],
+  ["et", "爱沙尼亚语"],
+  ["bn", "孟加拉语"],
+  ["ur", "乌尔都语"],
+  ["ta", "泰米尔语"],
+  ["te", "泰卢固语"],
+  ["sw", "斯瓦希里语"],
+];
+const fastLocalLanguages = [
+  ["zh-CN", "中文"],
+  ["ja", "日语"],
+  ["en", "英语"],
+];
+const nllbLanguages = [
+  ["zh-CN", "中文"],
+  ["zh-TW", "繁中"],
+  ["en", "英语"],
+  ["ja", "日语"],
+  ["ko", "韩语"],
+  ["fr", "法语"],
+  ["de", "德语"],
+  ["es", "西班牙语"],
+  ["pt", "葡萄牙语"],
+  ["it", "意大利语"],
+  ["ru", "俄语"],
+  ["ar", "阿拉伯语"],
+  ["th", "泰语"],
+  ["vi", "越南语"],
+  ["id", "印尼语"],
+];
+const languagePickerModes = {
+  "local-transformer": {
+    languages: fastLocalLanguages,
+    allowCustom: false,
+    hint: "本地快速模型只建议选择中文、日语、英语；更多语言请切换 z.ai、OpenAI 或 NLLB。",
+  },
+  "local-nllb": {
+    languages: nllbLanguages,
+    allowCustom: false,
+    hint: "NLLB 覆盖更多本地语言，但模型更大、速度更慢。",
+  },
+  "z-ai": {
+    languages: cloudLanguages,
+    allowCustom: true,
+    hint: "z.ai 适合多语言翻译；快捷按钮只是常用语言，也可以在输入框手动填其它语言代码。",
+  },
+  openai: {
+    languages: cloudLanguages,
+    allowCustom: true,
+    hint: "OpenAI 适合多语言高质量翻译；快捷按钮只是常用语言，也可以在输入框手动填其它语言代码。",
+  },
+};
 let pollTimer = null;
 let elapsedTimer = null;
 let activeJob = null;
@@ -33,14 +128,17 @@ refreshHealth.addEventListener("click", loadHealth);
 stopButton.addEventListener("click", cancelCurrentJob);
 copyLogButton.addEventListener("click", copyCurrentLog);
 form.addEventListener("submit", submitJob);
-targetLangsInput.addEventListener("input", syncLanguageButtons);
+targetLangsInput.addEventListener("input", renderLanguagePicker);
+languagePickerToggle.addEventListener("click", toggleLanguagePickerPanel);
+clearLanguagesButton.addEventListener("click", clearLanguageSelection);
+document.addEventListener("click", closeLanguagePickerOnOutsideClick);
+document.addEventListener("keydown", closeLanguagePickerOnEscape);
+translatorSelect.addEventListener("change", handleTranslatorChange);
 whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
-languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
-  button.addEventListener("click", () => toggleLanguage(button.dataset.lang || ""));
-});
 
 loadHealth();
+renderLanguagePicker();
 syncWhisperPreset();
 
 async function loadHealth() {
@@ -174,7 +272,12 @@ function toggleLanguage(language) {
   } else {
     targetLangsInput.value = [...values, language].join(", ");
   }
-  syncLanguageButtons();
+  renderLanguagePicker();
+}
+
+function clearLanguageSelection() {
+  targetLangsInput.value = "";
+  renderLanguagePicker();
 }
 
 function selectedTargetLangs() {
@@ -186,9 +289,83 @@ function selectedTargetLangs() {
 
 function syncLanguageButtons() {
   const selected = new Set(selectedTargetLangs());
-  languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
-    button.classList.toggle("selected", selected.has(button.dataset.lang));
+  languagePicker.querySelectorAll("[data-lang]").forEach((checkbox) => {
+    checkbox.checked = selected.has(checkbox.dataset.lang);
   });
+  updateLanguagePickerSummary(selected);
+}
+
+function renderLanguagePicker() {
+  const mode = languagePickerModes[translatorSelect.value] || languagePickerModes["z-ai"];
+  const builtInLanguages = new Set(mode.languages.map(([language]) => language));
+  const customLanguages = mode.allowCustom
+    ? selectedTargetLangs()
+        .filter((language) => !builtInLanguages.has(language))
+        .map((language) => [language, `${language}（手动输入）`])
+    : [];
+  const languages = [...mode.languages, ...customLanguages];
+  languagePicker.innerHTML = languages
+    .map(
+      ([language, label]) =>
+        `<label class="language-option">
+          <input type="checkbox" data-lang="${escapeAttribute(language)}" />
+          <span>${escapeHtml(label)}</span>
+          <code>${escapeHtml(language)}</code>
+        </label>`,
+    )
+    .join("");
+  languagePickerHint.textContent = mode.hint;
+  languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
+    button.addEventListener("change", () => toggleLanguage(button.dataset.lang || ""));
+  });
+  syncLanguageButtons();
+}
+
+function handleTranslatorChange() {
+  const mode = languagePickerModes[translatorSelect.value] || languagePickerModes["z-ai"];
+  if (!mode.allowCustom) {
+    const supported = new Set(mode.languages.map(([language]) => language));
+    const filtered = selectedTargetLangs().filter((language) => supported.has(language));
+    targetLangsInput.value = filtered.join(", ");
+  }
+  renderLanguagePicker();
+}
+
+function toggleLanguagePickerPanel() {
+  const isOpen = languagePickerToggle.getAttribute("aria-expanded") === "true";
+  setLanguagePickerOpen(!isOpen);
+}
+
+function setLanguagePickerOpen(isOpen) {
+  languagePickerToggle.setAttribute("aria-expanded", String(isOpen));
+  languagePickerPanel.hidden = !isOpen;
+}
+
+function closeLanguagePickerOnOutsideClick(event) {
+  if (languagePickerPanel.hidden) return;
+  if (event.target.closest(".language-dropdown")) return;
+  setLanguagePickerOpen(false);
+}
+
+function closeLanguagePickerOnEscape(event) {
+  if (event.key === "Escape") {
+    setLanguagePickerOpen(false);
+  }
+}
+
+function updateLanguagePickerSummary(selected) {
+  const mode = languagePickerModes[translatorSelect.value] || languagePickerModes["z-ai"];
+  const labelByLanguage = new Map(mode.languages);
+  const selectedValues = selectedTargetLangs();
+  const labels = selectedValues.map((language) => labelByLanguage.get(language) || language);
+  if (!selected.size) {
+    languagePickerToggle.textContent = "选择常用语言";
+    return;
+  }
+  const visibleLabels = labels.slice(0, 3).join("、");
+  const extraCount = Math.max(0, labels.length - 3);
+  languagePickerToggle.textContent =
+    extraCount > 0 ? `${visibleLabels} +${extraCount}` : visibleLabels;
 }
 
 async function pollJob(jobId) {
