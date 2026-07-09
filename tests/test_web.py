@@ -34,7 +34,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(options.source_lang, "zh")
         self.assertEqual(options.target_langs, ["ja"])
         self.assertEqual(options.transcriber, "local-whisper")
-        self.assertEqual(options.translator, "local-transformer")
+        self.assertEqual(options.translator, "z-ai")
         self.assertTrue(options.embed_subtitles)
         self.assertTrue(options.avoid_subtitle_overlap)
 
@@ -57,6 +57,50 @@ class WebTests(unittest.TestCase):
 
         self.assertIn("checks", health)
         self.assertTrue(health["checks"])
+
+    def test_collect_health_includes_local_translation_models(self):
+        statuses = [
+            {
+                "label": "中文 -> 英语",
+                "source": "zh",
+                "target": "en",
+                "model": "Helsinki-NLP/opus-mt-zh-en",
+                "installed": False,
+                "downloadCommand": "python3 -c \"download\"",
+            }
+        ]
+
+        with patch("subtitle_tool.web.local_translation_model_statuses", return_value=statuses):
+            health = collect_health(Path.cwd())
+
+        matching = [
+            check
+            for check in health["checks"]
+            if check["name"] == "本地翻译 中文 -> 英语"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertFalse(matching[0]["ok"])
+        self.assertTrue(matching[0]["optional"])
+        self.assertIn("下载命令", matching[0]["detail"])
+
+    def test_collect_health_includes_nllb_model(self):
+        status = {
+            "label": "NLLB 本地多语言",
+            "model": "facebook/nllb-200-distilled-600M",
+            "installed": False,
+            "downloadCommand": "python3 -c \"download nllb\"",
+        }
+
+        with patch("subtitle_tool.web.nllb_model_status", return_value=status):
+            health = collect_health(Path.cwd())
+
+        matching = [
+            check for check in health["checks"] if check["name"] == "本地多语言 NLLB"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertFalse(matching[0]["ok"])
+        self.assertTrue(matching[0]["optional"])
+        self.assertIn("模型较大", matching[0]["detail"])
 
     def test_log_line_includes_clock_and_elapsed_time(self):
         job = JobState(id="abc", created_at=100.0)

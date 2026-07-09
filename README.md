@@ -10,7 +10,7 @@
 - YouTube 默认优先下载高清视频，不再优先使用低清 360p 格式。
 - 字幕来源支持自动判断：优先读视频内置字幕，没有内置字幕时再抽音频语音识别。
 - 语音转写支持本地 Whisper 和 OpenAI。
-- 字幕翻译支持本地中日模型、z.ai、OpenAI。
+- 字幕翻译支持 z.ai、本地中/日/英快速模型、本地多语言 NLLB 和 OpenAI。
 - 支持一次选择多个目标语言，分别输出多份字幕和多份软字幕视频。
 - 支持“重新下载”“只下载”“输出软字幕视频”“避免遮挡原字幕”等选项。
 - Web 页面提供环境检查、进度条、实时日志、已用时、停止任务按钮。
@@ -126,7 +126,8 @@ Web 页面支持：
 - 目标语言可以多选，例如 `ja, vi, en`。
 - 选择字幕来源：自动、内置字幕、音频识别。
 - 选择语音转写：本地 Whisper 或 OpenAI。
-- 选择字幕翻译：本地中日模型、z.ai、OpenAI。
+- 选择本地 Whisper 模型大小：`base`、`small`、`medium` 或自定义模型路径。
+- 选择字幕翻译：z.ai、本地快速模型、本地多语言 NLLB、OpenAI。
 - 任务运行时显示进度、日志、已用时。
 - 任务运行时可点击“停止任务”。
 
@@ -257,8 +258,9 @@ input
 
 翻译引擎：
 
-- `local-transformer`
 - `z-ai`
+- `local-transformer`
+- `local-nllb`
 - `openai`
 
 ```text
@@ -297,16 +299,78 @@ models/ggml-base.bin
 
 如果源字幕识别错，后续翻译质量也会下降。
 
-### 本地中日翻译模型
+Web 页面可以选择 `base`、`small`、`medium` 三档模型：
 
-当前只适合：
+- `base`：速度快，适合快速试跑。
+- `small`：速度和准确率更平衡。
+- `medium`：更准但更慢，对机器性能要求更高。
+
+选择更大的模型前，需要先把对应文件下载到 `models/`，例如 `models/ggml-small.bin` 或 `models/ggml-medium.bin`。
+
+### 本地中/日/英翻译模型
+
+当前本地翻译支持：
 
 ```text
 ja -> zh-CN
 zh / zh-CN -> ja
+ja -> en
+en -> ja
+zh / zh-CN -> en
+en -> zh-CN
 ```
 
-它速度快，但质量不如 z.ai / OpenAI，也不支持越南语、英语、韩语、法语等多语言方向。遇到源字幕质量差时，可能出现重复词、重复句或语义崩坏。
+中日方向继续使用已有小模型。英文方向使用 Helsinki-NLP OPUS-MT 模型：
+
+```text
+Helsinki-NLP/opus-mt-zh-en
+Helsinki-NLP/opus-mt-en-zh
+Helsinki-NLP/opus-mt-ja-en
+Helsinki-NLP/opus-mt-en-jap
+```
+
+这些英文模型需要先下载到 Hugging Face 本地缓存。Web 页面右侧“环境”区会显示每个本地翻译方向是否已安装；未安装时，会直接显示对应下载命令。
+
+也可以手动执行类似命令下载：
+
+```bash
+python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('Helsinki-NLP/opus-mt-zh-en', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('Helsinki-NLP/opus-mt-zh-en')"
+```
+
+### 本地多语言 NLLB 模型
+
+如果需要离线支持更多语言，可以在 Web 页面选择：
+
+```text
+本地多语言模型（NLLB）
+```
+
+当前使用模型：
+
+```text
+facebook/nllb-200-distilled-600M
+```
+
+它支持常用目标语言，例如 `zh-CN`、`zh-TW`、`ja`、`en`、`ko`、`fr`、`de`、`es`、`pt`、`it`、`ru`、`ar`、`th`、`vi`、`id`。
+
+NLLB 模型较大，首次下载会比较慢，CPU 翻译速度也比本地快速模型慢。工具不会自动下载该模型；Web 页面右侧“环境”区会显示是否已安装，并给出下载命令。
+
+手动下载命令示例：
+
+```bash
+python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-600M', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-600M')"
+```
+
+本地快速模型速度快，但质量不如 z.ai / OpenAI，也不支持越南语、韩语、法语等更多语言方向。NLLB 覆盖语言更多，但模型更大、速度更慢。遇到源字幕质量差时，本地模型可能出现重复词、重复句或语义崩坏。
+
+当前版本会对本地翻译结果做基础质量保护：
+
+- 空翻译会失败。
+- 明显过长的翻译会失败。
+- 重复词/重复短语过多会失败，例如 `密かに密かに密かに...`。
+- 目标是日语但输出明显不像日语时会失败。
+
+检测失败时不会继续生成坏字幕视频，日志会提示改用 z.ai / OpenAI 或先改善源字幕。
 
 ### z.ai 翻译
 
@@ -369,11 +433,11 @@ ffprobe -v error -select_streams s -show_entries stream=index,codec_name:stream_
 
 ### 为什么越南语没有输出？
 
-如果使用本地中日翻译模型，越南语不支持。多语言请用 `z-ai` 或 `openai`。
+如果使用本地中/日/英翻译模型，越南语不支持。更多语言请用 `z-ai` 或 `openai`。
 
 ### 为什么本地模型翻译重复很多句？
 
-本地中日模型是小型翻译模型，质量有限。源字幕识别不准时，模型容易输出重复词或重复句。建议改用 z.ai / OpenAI，或者先提高转写质量。
+本地翻译模型是小型翻译模型，质量有限。源字幕识别不准时，模型容易输出重复词或重复句。当前版本会检测明显异常并阻止坏字幕继续输出；仍建议改用 z.ai / OpenAI，或者先提高转写质量。
 
 ### 原视频画面上有中文字幕，工具会读取吗？
 
@@ -392,7 +456,7 @@ ZAI_RATE_LIMIT_RETRY_SECONDS
 
 - 当前只输出 `.srt` 和软字幕 MP4，不做硬字幕烧录。
 - 不做视频画面 OCR，无法直接读取硬字幕文字。
-- 本地中日翻译模型语言方向有限，质量是粗翻级别。
+- 本地中/日/英翻译模型语言方向有限，质量是粗翻级别。
 - 本地 Whisper `base` 模型识别质量有限，必要时可换更大的 whisper.cpp 模型。
 - YouTube 部分视频可能限制匿名下载，仍可能需要用户自行下载。
 - 停止任务是协作式取消，不能瞬间终止正在执行的外部进程或 API 请求。

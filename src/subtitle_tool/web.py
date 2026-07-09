@@ -20,6 +20,7 @@ from urllib.parse import unquote, urlparse
 
 from .env import load_dotenv
 from .errors import CancellationError, SubtitleToolError
+from .local_translate import local_translation_model_statuses, nllb_model_status
 from .pipeline import PipelineOptions, PipelineResult, run_pipeline
 
 
@@ -88,7 +89,7 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         whisper_model=Path(whisper_model_value).expanduser().resolve()
         if whisper_model_value
         else None,
-        translator=str(payload.get("translator") or "local-transformer"),
+        translator=str(payload.get("translator") or "z-ai"),
         embed_subtitles=bool(payload.get("embedSubtitles")),
         avoid_subtitle_overlap=bool(payload.get("avoidSubtitleOverlap")),
     )
@@ -96,17 +97,12 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
 
 def collect_health(project_root: Path | None = None) -> dict[str, object]:
     root = project_root or Path.cwd()
-    model_path = root / "models" / "ggml-base.bin"
     checks = [
         _tool_check("ffmpeg"),
         _tool_check("ffprobe"),
         _tool_check("yt-dlp"),
         _tool_check("whisper-cli"),
-        {
-            "name": "Whisper 模型",
-            "ok": model_path.exists() and model_path.stat().st_size > 0,
-            "detail": str(model_path),
-        },
+        _whisper_models_check(root),
         _python_module_check("openai"),
         _python_module_check("transformers"),
         _python_module_check("torch"),
@@ -117,6 +113,8 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
             "detail": "已配置" if os.environ.get("ZAI_API_KEY") else "未配置",
         },
     ]
+    checks.extend(_local_translation_model_checks())
+    checks.append(_nllb_model_check())
     return {
         "checks": checks,
         "ok": all(check["ok"] for check in checks if not check.get("optional")),
@@ -419,6 +417,57 @@ def _python_module_check(name: str) -> dict[str, object]:
         "name": f"Python: {name}",
         "ok": spec is not None,
         "detail": "可用" if spec is not None else "未安装",
+    }
+
+
+def _whisper_models_check(root: Path) -> dict[str, object]:
+    model_names = ["base", "small", "medium"]
+    statuses = []
+    has_any_model = False
+    for name in model_names:
+        path = root / "models" / f"ggml-{name}.bin"
+        installed = path.exists() and path.stat().st_size > 0
+        has_any_model = has_any_model or installed
+        statuses.append(f"{name}: {'已安装' if installed else '未安装'}")
+    return {
+        "name": "Whisper 模型",
+        "ok": has_any_model,
+        "detail": "；".join(statuses),
+    }
+
+
+def _local_translation_model_checks() -> list[dict[str, object]]:
+    checks = []
+    for status in local_translation_model_statuses():
+        installed = bool(status["installed"])
+        detail = "已安装"
+        if not installed:
+            detail = f"未安装；下载命令：{status['downloadCommand']}"
+        checks.append(
+            {
+                "name": f"本地翻译 {status['label']}",
+                "ok": installed,
+                "optional": True,
+                "detail": detail,
+            }
+        )
+    return checks
+
+
+def _nllb_model_check() -> dict[str, object]:
+    status = nllb_model_status()
+    installed = bool(status["installed"])
+    detail = "已安装"
+    if not installed:
+        detail = (
+            "未安装；模型较大，首次下载较慢；下载命令："
+            f"{status['downloadCommand']}"
+        )
+    return {
+        "name": "本地多语言 NLLB",
+        "ok": installed,
+        "optional": True,
+        "detail": detail,
     }
 
 

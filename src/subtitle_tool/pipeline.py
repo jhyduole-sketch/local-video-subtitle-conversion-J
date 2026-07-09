@@ -9,7 +9,7 @@ import re
 from typing import Callable
 
 from .errors import CancellationError, MediaError, SubtitleToolError
-from .local_translate import translate_segments_locally
+from .local_translate import translate_segments_locally, translate_segments_with_nllb
 from .local_whisper import transcribe_with_whisper_cpp
 from .media import extract_audio, extract_first_subtitle, find_subtitle_streams, mux_subtitle_track
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
@@ -57,8 +57,10 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         raise SubtitleToolError("--source must be one of: auto, embedded, audio.")
     if options.transcriber not in {"openai", "local-whisper"}:
         raise SubtitleToolError("--transcriber must be one of: openai, local-whisper.")
-    if options.translator not in {"openai", "z-ai", "local-transformer"}:
-        raise SubtitleToolError("--translator must be one of: openai, z-ai, local-transformer.")
+    if options.translator not in {"openai", "z-ai", "local-transformer", "local-nllb"}:
+        raise SubtitleToolError(
+            "--translator must be one of: openai, z-ai, local-transformer, local-nllb."
+        )
 
     timestamp = _timestamp_suffix()
     output_stem = _base_output_stem(_input_output_stem(options.input_value), timestamp)
@@ -98,6 +100,10 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             _progress(options, f"开始翻译: {target_lang}", base_percent)
             if options.translator == "local-transformer":
                 translations = translate_segments_locally(
+                    source_segments, options.source_lang, target_lang
+                )
+            elif options.translator == "local-nllb":
+                translations = translate_segments_with_nllb(
                     source_segments, options.source_lang, target_lang
                 )
             elif options.translator == "z-ai":

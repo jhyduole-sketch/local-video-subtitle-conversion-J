@@ -1,6 +1,7 @@
 const form = document.querySelector("#jobForm");
 const runButton = document.querySelector("#runButton");
 const stopButton = document.querySelector("#stopButton");
+const copyLogButton = document.querySelector("#copyLogButton");
 const refreshHealth = document.querySelector("#refreshHealth");
 const healthList = document.querySelector("#healthList");
 const healthSummary = document.querySelector("#healthSummary");
@@ -15,20 +16,32 @@ const progressBar = document.querySelector("#progressBar");
 const progressMessage = document.querySelector("#progressMessage");
 const progressPercent = document.querySelector("#progressPercent");
 const videoFileInput = document.querySelector("#videoFile");
+const whisperPreset = document.querySelector("#whisperPreset");
+const whisperModelInput = document.querySelector("#whisperModel");
+const whisperModelPaths = {
+  base: "models/ggml-base.bin",
+  small: "models/ggml-small.bin",
+  medium: "models/ggml-medium.bin",
+};
 let pollTimer = null;
 let elapsedTimer = null;
 let activeJob = null;
 let currentJobId = "";
+let copyLogResetTimer = null;
 
 refreshHealth.addEventListener("click", loadHealth);
 stopButton.addEventListener("click", cancelCurrentJob);
+copyLogButton.addEventListener("click", copyCurrentLog);
 form.addEventListener("submit", submitJob);
 targetLangsInput.addEventListener("input", syncLanguageButtons);
+whisperPreset.addEventListener("change", applyWhisperPreset);
+whisperModelInput.addEventListener("input", syncWhisperPreset);
 languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
   button.addEventListener("click", () => toggleLanguage(button.dataset.lang || ""));
 });
 
 loadHealth();
+syncWhisperPreset();
 
 async function loadHealth() {
   healthSummary.textContent = "检查中";
@@ -138,6 +151,19 @@ function formPayload() {
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
+}
+
+function applyWhisperPreset() {
+  const path = whisperModelPaths[whisperPreset.value];
+  if (path) {
+    whisperModelInput.value = path;
+  }
+}
+
+function syncWhisperPreset() {
+  const currentPath = whisperModelInput.value.trim();
+  const matched = Object.entries(whisperModelPaths).find(([, path]) => path === currentPath);
+  whisperPreset.value = matched ? matched[0] : "custom";
 }
 
 function toggleLanguage(language) {
@@ -318,6 +344,25 @@ async function copyText(text) {
     document.execCommand("copy");
     input.remove();
   }
+}
+
+async function copyCurrentLog() {
+  const text = logBox.textContent.trim();
+  if (!text) {
+    setCopyLogLabel("暂无日志");
+    return;
+  }
+  await copyText(text);
+  setCopyLogLabel("已复制");
+}
+
+function setCopyLogLabel(label) {
+  const original = "复制日志";
+  copyLogButton.textContent = label;
+  window.clearTimeout(copyLogResetTimer);
+  copyLogResetTimer = window.setTimeout(() => {
+    copyLogButton.textContent = original;
+  }, 1400);
 }
 
 function statusLabel(status) {

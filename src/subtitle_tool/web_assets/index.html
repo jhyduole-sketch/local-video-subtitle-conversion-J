@@ -38,11 +38,12 @@
           <div class="field">
             <label for="sourceLang">原视频语言</label>
             <select id="sourceLang" name="sourceLang">
+              <option value="">自动</option>
               <option value="zh">中文</option>
               <option value="ja">日语</option>
               <option value="en">英语</option>
-              <option value="">自动</option>
             </select>
+            <p class="field-hint">用于语音识别提示；选错会让源字幕先变差。</p>
           </div>
 
           <div class="field">
@@ -70,9 +71,10 @@
           <div class="field">
             <label for="translator">字幕翻译</label>
             <select id="translator" name="translator">
-              <option value="local-transformer">本地翻译模型</option>
-              <option value="z-ai">z.ai 翻译</option>
-              <option value="openai">OpenAI 翻译</option>
+              <option value="z-ai" selected>z.ai 翻译（推荐）</option>
+              <option value="local-transformer">本地快速模型（中/日/英）</option>
+              <option value="local-nllb">本地多语言模型（NLLB）</option>
+              <option value="openai">OpenAI 翻译（高质量备用）</option>
             </select>
           </div>
 
@@ -101,8 +103,19 @@
             <input id="outDir" name="outDir" value="output" />
           </div>
 
-          <div class="field span-all">
-            <label for="whisperModel">Whisper 模型</label>
+          <div class="field">
+            <label for="whisperPreset">Whisper 模型大小</label>
+            <select id="whisperPreset" name="whisperPreset">
+              <option value="base">base 快速</option>
+              <option value="small">small 平衡</option>
+              <option value="medium">medium 更准</option>
+              <option value="custom">自定义路径</option>
+            </select>
+            <p class="field-hint">模型越大越准，但速度更慢，也需要先下载对应文件。</p>
+          </div>
+
+          <div class="field">
+            <label for="whisperModel">Whisper 模型路径</label>
             <input id="whisperModel" name="whisperModel" value="models/ggml-base.bin" />
           </div>
 
@@ -132,7 +145,10 @@
           <section class="panel">
             <div class="panel-title">
               <h2>任务</h2>
-              <span id="activeJobId" class="muted"></span>
+              <div class="panel-tools">
+                <span id="activeJobId" class="muted"></span>
+                <button id="copyLogButton" class="small-button" type="button">复制日志</button>
+              </div>
             </div>
             <div class="progress-wrap">
               <div class="progress-meta">

@@ -67,9 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--translator",
-        choices=["openai", "z-ai", "local-transformer"],
+        choices=["openai", "z-ai", "local-transformer", "local-nllb"],
         default="openai",
-        help="Subtitle translation engine. Use z-ai with ZAI_API_KEY, or local-transformer to avoid API keys.",
+        help="Subtitle translation engine. Use z-ai with ZAI_API_KEY, local-transformer for fast zh/ja/en offline translation, or local-nllb for local multilingual translation.",
     )
     parser.add_argument(
         "--embed-subtitles",

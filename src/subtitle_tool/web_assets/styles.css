@@ -98,6 +98,13 @@ label {
   font-size: 13px;
 }
 
+.field-hint {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 input,
 select,
 textarea {
@@ -243,6 +250,31 @@ textarea:focus {
   font-size: 17px;
   line-height: 1.2;
   letter-spacing: 0;
+}
+
+.panel-tools {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.small-button {
+  min-height: 28px;
+  border: 1px solid #cbd3cc;
+  border-radius: 6px;
+  background: #fbfcfa;
+  color: var(--accent-strong);
+  padding: 0 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.small-button:hover {
+  border-color: var(--accent);
+  background: #eef8f5;
 }
 
 .badge {
