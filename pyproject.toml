@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 subtitle-tool = "subtitle_tool.cli:main"
+subtitle-tool-web = "subtitle_tool.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -21,3 +22,5 @@ where = ["src"]
 [tool.setuptools.package-dir]
 "" = "src"
 
+[tool.setuptools.package-data]
+subtitle_tool = ["web_assets/*"]

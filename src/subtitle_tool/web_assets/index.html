@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>视频字幕转换</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>视频字幕转换</h1>
+          <p>本地控制台</p>
+        </div>
+        <button id="refreshHealth" class="icon-button" type="button" title="刷新环境检查">
+          ↻
+        </button>
+      </header>
+
+      <section class="workspace">
+        <form id="jobForm" class="panel form-panel">
+          <div class="field span-all">
+            <label for="input">视频地址或本地路径</label>
+            <textarea
+              id="input"
+              name="input"
+              rows="3"
+              placeholder="https://www.youtube.com/watch?v=... 或 /Users/.../video.mp4"
+              required
+            ></textarea>
+          </div>
+
+          <div class="field">
+            <label for="sourceLang">原语言</label>
+            <select id="sourceLang" name="sourceLang">
+              <option value="zh">中文</option>
+              <option value="ja">日语</option>
+              <option value="en">英语</option>
+              <option value="">自动</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="targetLangs">目标语言</label>
+            <input id="targetLangs" name="targetLangs" value="ja" />
+          </div>
+
+          <div class="field">
+            <label for="source">字幕来源</label>
+            <select id="source" name="source">
+              <option value="auto">自动</option>
+              <option value="embedded">内置字幕</option>
+              <option value="audio">音频识别</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="transcriber">转写</label>
+            <select id="transcriber" name="transcriber">
+              <option value="local-whisper">本地 Whisper</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="translator">翻译</label>
+            <select id="translator" name="translator">
+              <option value="local-transformer">本地模型</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </div>
+
+          <div class="field">
+            <label for="outDir">输出目录</label>
+            <input id="outDir" name="outDir" value="output" />
+          </div>
+
+          <div class="field span-all">
+            <label for="whisperModel">Whisper 模型</label>
+            <input id="whisperModel" name="whisperModel" value="models/ggml-base.bin" />
+          </div>
+
+          <div class="toggles span-all">
+            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
+            <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
+            <label><input id="downloadOnly" name="downloadOnly" type="checkbox" /> 只下载</label>
+          </div>
+
+          <div class="actions span-all">
+            <button id="runButton" class="primary-button" type="submit">开始转换</button>
+            <span id="jobBadge" class="badge idle">空闲</span>
+          </div>
+        </form>
+
+        <aside class="side-stack">
+          <section class="panel">
+            <div class="panel-title">
+              <h2>环境</h2>
+              <span id="healthSummary" class="badge">检查中</span>
+            </div>
+            <div id="healthList" class="check-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-title">
+              <h2>任务</h2>
+              <span id="activeJobId" class="muted"></span>
+            </div>
+            <div id="logBox" class="log-box">等待任务</div>
+          </section>
+        </aside>
+      </section>
+
+      <section class="panel results-panel">
+        <div class="panel-title">
+          <h2>输出</h2>
+          <span id="resultSummary" class="muted">暂无结果</span>
+        </div>
+        <div id="results" class="results-grid"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

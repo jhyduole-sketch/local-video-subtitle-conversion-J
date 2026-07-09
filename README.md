@@ -132,6 +132,38 @@ cd /Users/duole/DDeveloper/AI/codex-test/project3-codex
 env PYTHONPATH=src
 ```
 
+## 图形界面
+
+可以启动本地网页界面：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.web --host 127.0.0.1 --port 7860
+```
+
+或安装项目后运行：
+
+```bash
+subtitle-tool-web --host 127.0.0.1 --port 7860
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:7860
+```
+
+界面支持：
+
+- 输入本地视频路径、TalkSmith URL 或 YouTube URL
+- 选择原语言和目标语言
+- 选择内置字幕、音频识别或自动模式
+- 选择本地 Whisper / OpenAI 转写
+- 选择本地 Transformer / OpenAI 翻译
+- 只下载视频、重新下载、输出带字幕轨 MP4
+- 查看环境检查、任务日志和输出文件路径
+
+图形界面默认使用本地 Whisper 和本地 Transformer，适合不配置 OpenAI key 的场景。
+
 ## 用法示例
 
 ### 1. 本地视频识别原文字幕
@@ -339,4 +371,3 @@ env PYTHONPATH=src python3 -m subtitle_tool.cli --help
 - Python 缓存和构建产物
 
 这些文件已经在 `.gitignore` 中排除。
-
