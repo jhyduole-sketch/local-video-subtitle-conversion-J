@@ -1,3 +1,4 @@
+from io import BytesIO
 from pathlib import Path
 import sys
 import tempfile
@@ -9,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 from subtitle_tool.pipeline import PipelineOptions, run_pipeline  # noqa: E402
 from subtitle_tool.talksmith import (  # noqa: E402
+    TalkSmithVideo,
+    download_video,
     extract_scenario_id,
     find_available_video,
     is_talksmith_url,
@@ -48,9 +51,21 @@ class TalkSmithTests(unittest.TestCase):
         self.assertEqual(video.scenario_id, "cmd123")
         self.assertEqual(video.video_url, "https://cdn/video")
 
+    def test_download_video_uses_timestamp_suffix(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("subtitle_tool.talksmith.urllib.request.urlopen") as urlopen:
+                urlopen.return_value.__enter__.return_value = BytesIO(b"video")
+                path = download_video(
+                    TalkSmithVideo("cmd123", "https://cdn/video.mp4"),
+                    Path(tmpdir),
+                    timestamp_suffix="202607091530129",
+                )
+
+        self.assertEqual(path.name, "cmd123.202607091530129.mp4")
+
     def test_download_only_skips_subtitle_generation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            video_path = Path(tmpdir) / "downloads" / "cmd123.mp4"
+            video_path = Path(tmpdir) / "cmd123" / "cmd123.202607091530129.mp4"
             video_path.parent.mkdir()
             video_path.write_bytes(b"video")
             with patch(
@@ -78,4 +93,3 @@ class TalkSmithTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

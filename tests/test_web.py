@@ -1,10 +1,21 @@
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from subtitle_tool.web import collect_health, options_from_payload  # noqa: E402
+from subtitle_tool.web import (  # noqa: E402
+    JOBS,
+    JOB_LOCK,
+    JobState,
+    _format_log_line,
+    _job_to_dict,
+    collect_health,
+    options_from_payload,
+    request_job_cancel,
+    safe_upload_filename,
+)
 
 
 class WebTests(unittest.TestCase):
@@ -15,6 +26,7 @@ class WebTests(unittest.TestCase):
                 "sourceLang": "zh",
                 "targetLangs": ["ja", ""],
                 "embedSubtitles": True,
+                "avoidSubtitleOverlap": True,
             }
         )
 
@@ -24,6 +36,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(options.transcriber, "local-whisper")
         self.assertEqual(options.translator, "local-transformer")
         self.assertTrue(options.embed_subtitles)
+        self.assertTrue(options.avoid_subtitle_overlap)
 
     def test_options_from_payload_accepts_comma_targets(self):
         options = options_from_payload(
@@ -44,6 +57,50 @@ class WebTests(unittest.TestCase):
 
         self.assertIn("checks", health)
         self.assertTrue(health["checks"])
+
+    def test_log_line_includes_clock_and_elapsed_time(self):
+        job = JobState(id="abc", created_at=100.0)
+
+        with patch("subtitle_tool.web.time.time", return_value=165.0), patch(
+            "subtitle_tool.web.datetime"
+        ) as datetime:
+            datetime.fromtimestamp.return_value.strftime.return_value = "15:23:08"
+            line = _format_log_line(job, "正在抽取音频")
+
+        self.assertEqual(line, "[15:23:08 +01:05] 正在抽取音频")
+
+    def test_safe_upload_filename_uses_basename(self):
+        self.assertEqual(safe_upload_filename("../movie.mp4"), "movie.mp4")
+        self.assertEqual(safe_upload_filename(""), "uploaded-video.mp4")
+
+    def test_request_job_cancel_marks_running_job(self):
+        job = JobState(id="cancel-me", status="running")
+        with JOB_LOCK:
+            JOBS[job.id] = job
+        try:
+            self.assertTrue(request_job_cancel(job.id))
+            payload = _job_to_dict(job)
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(job.id, None)
+
+        self.assertEqual(job.status, "canceling")
+        self.assertTrue(job.cancel_requested)
+        self.assertTrue(payload["cancelRequested"])
+        self.assertEqual(payload["progressMessage"], "正在停止")
+
+    def test_request_job_cancel_ignores_finished_job(self):
+        job = JobState(id="done-job", status="succeeded")
+        with JOB_LOCK:
+            JOBS[job.id] = job
+        try:
+            self.assertFalse(request_job_cancel(job.id))
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(job.id, None)
+
+        self.assertEqual(job.status, "succeeded")
+        self.assertFalse(job.cancel_requested)
 
 
 if __name__ == "__main__":

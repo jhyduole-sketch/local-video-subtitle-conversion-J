@@ -27,12 +27,16 @@
               name="input"
               rows="3"
               placeholder="https://www.youtube.com/watch?v=... 或 /Users/.../video.mp4"
-              required
             ></textarea>
           </div>
 
+          <div class="field span-all">
+            <label for="videoFile">上传本地视频（优先使用）</label>
+            <input id="videoFile" name="videoFile" type="file" accept="video/*,.mp4,.mov,.mkv,.webm" />
+          </div>
+
           <div class="field">
-            <label for="sourceLang">原语言</label>
+            <label for="sourceLang">原视频语言</label>
             <select id="sourceLang" name="sourceLang">
               <option value="zh">中文</option>
               <option value="ja">日语</option>
@@ -56,19 +60,19 @@
           </div>
 
           <div class="field">
-            <label for="transcriber">转写</label>
+            <label for="transcriber">语音转写</label>
             <select id="transcriber" name="transcriber">
               <option value="local-whisper">本地 Whisper</option>
-              <option value="openai">OpenAI</option>
+              <option value="openai">OpenAI 转写</option>
             </select>
           </div>
 
           <div class="field">
-            <label for="translator">翻译</label>
+            <label for="translator">字幕翻译</label>
             <select id="translator" name="translator">
-              <option value="local-transformer">本地模型</option>
-              <option value="z-ai">z.ai</option>
-              <option value="openai">OpenAI</option>
+              <option value="local-transformer">本地翻译模型</option>
+              <option value="z-ai">z.ai 翻译</option>
+              <option value="openai">OpenAI 翻译</option>
             </select>
           </div>
 
@@ -103,13 +107,15 @@
           </div>
 
           <div class="toggles span-all">
-            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
+            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出软字幕视频</label>
+            <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 避免遮挡原字幕</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
             <label><input id="downloadOnly" name="downloadOnly" type="checkbox" /> 只下载</label>
           </div>
 
           <div class="actions span-all">
             <button id="runButton" class="primary-button" type="submit">开始转换</button>
+            <button id="stopButton" class="secondary-button" type="button" disabled>停止任务</button>
             <span id="jobBadge" class="badge idle">空闲</span>
           </div>
         </form>
@@ -127,6 +133,15 @@
             <div class="panel-title">
               <h2>任务</h2>
               <span id="activeJobId" class="muted"></span>
+            </div>
+            <div class="progress-wrap">
+              <div class="progress-meta">
+                <span id="progressMessage">等待开始</span>
+                <span id="progressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div id="progressBar" class="progress-bar"></div>
+              </div>
             </div>
             <div id="logBox" class="log-box">等待任务</div>
           </section>

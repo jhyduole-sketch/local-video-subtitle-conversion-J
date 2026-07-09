@@ -13,3 +13,6 @@ class MediaError(SubtitleToolError):
 class OpenAIConfigError(SubtitleToolError):
     """Raised when OpenAI configuration is missing or invalid."""
 
+
+class CancellationError(SubtitleToolError):
+    """Raised when a running task is cancelled by the user."""

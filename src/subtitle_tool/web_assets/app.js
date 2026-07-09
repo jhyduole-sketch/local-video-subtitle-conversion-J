@@ -1,5 +1,6 @@
 const form = document.querySelector("#jobForm");
 const runButton = document.querySelector("#runButton");
+const stopButton = document.querySelector("#stopButton");
 const refreshHealth = document.querySelector("#refreshHealth");
 const healthList = document.querySelector("#healthList");
 const healthSummary = document.querySelector("#healthSummary");
@@ -10,9 +11,17 @@ const results = document.querySelector("#results");
 const resultSummary = document.querySelector("#resultSummary");
 const targetLangsInput = document.querySelector("#targetLangs");
 const languagePicker = document.querySelector("#languagePicker");
+const progressBar = document.querySelector("#progressBar");
+const progressMessage = document.querySelector("#progressMessage");
+const progressPercent = document.querySelector("#progressPercent");
+const videoFileInput = document.querySelector("#videoFile");
 let pollTimer = null;
+let elapsedTimer = null;
+let activeJob = null;
+let currentJobId = "";
 
 refreshHealth.addEventListener("click", loadHealth);
+stopButton.addEventListener("click", cancelCurrentJob);
 form.addEventListener("submit", submitJob);
 targetLangsInput.addEventListener("input", syncLanguageButtons);
 languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
@@ -39,9 +48,20 @@ async function submitJob(event) {
   event.preventDefault();
   const payload = formPayload();
   setRunningState(true);
+  updateProgress(0, "提交任务");
   clearResults();
   logBox.textContent = "提交任务...";
   try {
+    if (videoFileInput.files.length > 0) {
+      updateProgress(0, "上传本地视频");
+      logBox.textContent = "上传本地视频...";
+      const upload = await uploadVideo(videoFileInput.files[0]);
+      payload.input = upload.path;
+      logBox.textContent = `已上传: ${upload.filename}\n提交任务...`;
+    }
+    if (!payload.input) {
+      throw new Error("请输入视频地址/本地路径，或上传一个本地视频。");
+    }
     const response = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -51,12 +71,52 @@ async function submitJob(event) {
     if (!response.ok) {
       throw new Error(data.error || "任务提交失败");
     }
+    currentJobId = data.jobId;
     activeJobId.textContent = data.jobId;
+    setRunningState(true, "运行中", "running");
+    startElapsedTimer({ id: data.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0 });
     pollJob(data.jobId);
   } catch (error) {
     setRunningState(false, "失败", "bad");
+    stopElapsedTimer();
     logBox.textContent = error.message;
   }
+}
+
+async function cancelCurrentJob() {
+  if (!currentJobId || stopButton.disabled) return;
+  setRunningState(true, "取消中", "warn");
+  stopButton.disabled = true;
+  updateProgress(progressPercent.textContent.replace("%", ""), "正在停止");
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(currentJobId)}/cancel`, {
+      method: "POST",
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "停止任务失败");
+    }
+    if (data.job) {
+      renderJob(data.job);
+    }
+  } catch (error) {
+    logBox.textContent += `\n停止失败: ${error.message}`;
+    stopButton.disabled = false;
+  }
+}
+
+async function uploadVideo(file) {
+  const data = new FormData();
+  data.append("video", file);
+  const response = await fetch("/api/upload", {
+    method: "POST",
+    body: data,
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "视频上传失败");
+  }
+  return payload;
 }
 
 function formPayload() {
@@ -74,6 +134,7 @@ function formPayload() {
     outDir: String(data.get("outDir") || "output").trim(),
     whisperModel: String(data.get("whisperModel") || "").trim(),
     embedSubtitles: Boolean(data.get("embedSubtitles")),
+    avoidSubtitleOverlap: Boolean(data.get("avoidSubtitleOverlap")),
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
@@ -113,16 +174,19 @@ async function pollJob(jobId) {
       throw new Error(data.error || "任务读取失败");
     }
     renderJob(data);
-    if (data.status === "running" || data.status === "queued") {
+    if (data.status === "running" || data.status === "queued" || data.status === "canceling") {
       pollTimer = window.setTimeout(() => pollJob(jobId), 1500);
     } else {
       setRunningState(false, statusLabel(data.status), statusTone(data.status));
+      currentJobId = "";
+      stopElapsedTimer();
       if (data.result) {
         renderResults(data.result);
       }
     }
   } catch (error) {
     setRunningState(false, "失败", "bad");
+    stopElapsedTimer();
     logBox.textContent = error.message;
   }
 }
@@ -147,11 +211,17 @@ function renderHealth(data) {
 }
 
 function renderJob(job) {
+  activeJob = job;
+  renderElapsed();
   setRunningState(
-    job.status === "running" || job.status === "queued",
+    job.status === "running" || job.status === "queued" || job.status === "canceling",
     statusLabel(job.status),
     statusTone(job.status),
   );
+  if (job.status === "canceling") {
+    stopButton.disabled = true;
+  }
+  updateProgress(job.progress || 0, job.progressMessage || statusLabel(job.status));
   const lines = Array.isArray(job.logs) ? job.logs : [];
   logBox.textContent = lines.length ? lines.join("\n") : "等待日志";
   if (job.error) {
@@ -172,7 +242,7 @@ function renderResults(result) {
     items.push([`字幕 ${lang}`, path]);
   });
   Object.entries(result.subtitledVideoPaths || {}).forEach(([lang, path]) => {
-    items.push([`视频 ${lang}`, path]);
+    items.push([`软字幕视频 ${lang}`, path]);
   });
   Object.entries(result.failedLanguages || {}).forEach(([lang, message]) => {
     items.push([`失败 ${lang}`, message]);
@@ -197,8 +267,39 @@ function resultItem(kind, path) {
 
 function setRunningState(isRunning, label = "运行中", tone = "running") {
   runButton.disabled = isRunning;
+  stopButton.disabled = !isRunning || !currentJobId;
   jobBadge.textContent = label;
   jobBadge.className = `badge ${tone}`;
+}
+
+function startElapsedTimer(job) {
+  activeJob = job;
+  renderElapsed();
+  window.clearInterval(elapsedTimer);
+  elapsedTimer = window.setInterval(renderElapsed, 1000);
+}
+
+function stopElapsedTimer() {
+  renderElapsed();
+  window.clearInterval(elapsedTimer);
+  elapsedTimer = null;
+}
+
+function renderElapsed() {
+  if (!activeJob) return;
+  const startedAt = Number(activeJob.createdAt || 0);
+  const elapsed =
+    startedAt > 0
+      ? Math.max(0, Math.round(Date.now() / 1000 - startedAt))
+      : Number(activeJob.elapsedSeconds || 0);
+  activeJobId.textContent = `${activeJob.id || ""} · 已用时 ${formatDuration(elapsed)}`;
+}
+
+function updateProgress(value, message) {
+  const percent = Math.max(0, Math.min(100, Number(value) || 0));
+  progressBar.style.width = `${percent}%`;
+  progressPercent.textContent = `${percent}%`;
+  progressMessage.textContent = message || "等待开始";
 }
 
 function clearResults() {
@@ -222,6 +323,8 @@ async function copyText(text) {
 function statusLabel(status) {
   if (status === "queued") return "排队";
   if (status === "running") return "运行中";
+  if (status === "canceling") return "取消中";
+  if (status === "canceled") return "已停止";
   if (status === "succeeded") return "完成";
   if (status === "failed") return "失败";
   return "空闲";
@@ -230,8 +333,20 @@ function statusLabel(status) {
 function statusTone(status) {
   if (status === "succeeded") return "ok";
   if (status === "failed") return "bad";
+  if (status === "canceling" || status === "canceled") return "warn";
   if (status === "running" || status === "queued") return "running";
   return "idle";
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) {
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+  return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
 function escapeHtml(value) {

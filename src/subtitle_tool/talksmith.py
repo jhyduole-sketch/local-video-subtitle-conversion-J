@@ -99,10 +99,18 @@ def fetch_talksmith_video(url: str) -> TalkSmithVideo:
     return find_available_video(payload, scenario_id)
 
 
-def download_video(video: TalkSmithVideo, out_dir: Path, force: bool = False) -> Path:
-    downloads_dir = out_dir / "downloads"
+def download_video(
+    video: TalkSmithVideo,
+    out_dir: Path,
+    force: bool = False,
+    timestamp_suffix: str | None = None,
+) -> Path:
+    downloads_dir = out_dir
     downloads_dir.mkdir(parents=True, exist_ok=True)
-    output_path = downloads_dir / f"{video.scenario_id}.mp4"
+    file_stem = (
+        f"{video.scenario_id}.{timestamp_suffix}" if timestamp_suffix else video.scenario_id
+    )
+    output_path = downloads_dir / f"{file_stem}.mp4"
 
     if output_path.exists() and output_path.stat().st_size > 0 and not force:
         return output_path
@@ -129,6 +137,10 @@ def download_video(video: TalkSmithVideo, out_dir: Path, force: bool = False) ->
     return output_path
 
 
-def resolve_talksmith_input(input_value: str, out_dir: Path, force: bool = False) -> Path:
-    return download_video(fetch_talksmith_video(input_value), out_dir, force)
-
+def resolve_talksmith_input(
+    input_value: str,
+    out_dir: Path,
+    force: bool = False,
+    timestamp_suffix: str | None = None,
+) -> Path:
+    return download_video(fetch_talksmith_video(input_value), out_dir, force, timestamp_suffix)
