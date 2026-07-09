@@ -22,10 +22,34 @@ class CliTests(unittest.TestCase):
             run_pipeline.return_value.failed_languages = {}
             run_pipeline.return_value.source_kind = "audio-local-whisper"
             run_pipeline.return_value.downloaded_video_path = None
+            run_pipeline.return_value.subtitled_video_paths = None
             exit_code = main(
                 ["input.mp4", "--source-lang", "ja", "--transcriber", "local-whisper"]
             )
         self.assertEqual(exit_code, 0)
+
+    def test_zai_translator_option_is_passed_to_pipeline(self):
+        with patch("subtitle_tool.cli.run_pipeline") as run_pipeline:
+            run_pipeline.return_value.source_subtitle_path = Path("/tmp/source.zh.srt")
+            run_pipeline.return_value.translated_paths = {"ja": Path("/tmp/subtitles.ja.srt")}
+            run_pipeline.return_value.failed_languages = {}
+            run_pipeline.return_value.source_kind = "audio-local-whisper"
+            run_pipeline.return_value.downloaded_video_path = None
+            run_pipeline.return_value.subtitled_video_paths = None
+            exit_code = main(
+                [
+                    "input.mp4",
+                    "--source-lang",
+                    "zh",
+                    "--target-lang",
+                    "ja",
+                    "--translator",
+                    "z-ai",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_pipeline.call_args.args[0].translator, "z-ai")
 
 
 if __name__ == "__main__":

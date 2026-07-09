@@ -8,7 +8,7 @@ from .errors import MediaError, SubtitleToolError
 from .local_translate import translate_segments_locally
 from .local_whisper import transcribe_with_whisper_cpp
 from .media import extract_audio, extract_first_subtitle, find_subtitle_streams, mux_subtitle_track
-from .openai_client import transcribe_audio, translate_segments
+from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .talksmith import is_talksmith_url, is_url, resolve_talksmith_input
 from .youtube import download_youtube_video, is_youtube_url
@@ -47,8 +47,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         raise SubtitleToolError("--source must be one of: auto, embedded, audio.")
     if options.transcriber not in {"openai", "local-whisper"}:
         raise SubtitleToolError("--transcriber must be one of: openai, local-whisper.")
-    if options.translator not in {"openai", "local-transformer"}:
-        raise SubtitleToolError("--translator must be one of: openai, local-transformer.")
+    if options.translator not in {"openai", "z-ai", "local-transformer"}:
+        raise SubtitleToolError("--translator must be one of: openai, z-ai, local-transformer.")
 
     options.out_dir.mkdir(parents=True, exist_ok=True)
     input_path, downloaded_video_path = _resolve_input(options)
@@ -75,6 +75,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             if options.translator == "local-transformer":
                 translations = translate_segments_locally(
                     source_segments, options.source_lang, target_lang
+                )
+            elif options.translator == "z-ai":
+                translations = translate_segments_with_zai(
+                    source_segments,
+                    target_lang=target_lang,
+                    source_lang=options.source_lang,
                 )
             else:
                 translations = translate_segments(

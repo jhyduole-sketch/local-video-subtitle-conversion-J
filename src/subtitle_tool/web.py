@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import shutil
 import threading
 import time
@@ -102,8 +103,17 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
         _python_module_check("openai"),
         _python_module_check("transformers"),
         _python_module_check("torch"),
+        {
+            "name": "ZAI_API_KEY",
+            "ok": bool(os.environ.get("ZAI_API_KEY")),
+            "optional": True,
+            "detail": "已配置" if os.environ.get("ZAI_API_KEY") else "未配置",
+        },
     ]
-    return {"checks": checks, "ok": all(check["ok"] for check in checks)}
+    return {
+        "checks": checks,
+        "ok": all(check["ok"] for check in checks if not check.get("optional")),
+    }
 
 
 def result_to_dict(result: PipelineResult) -> dict[str, object]:

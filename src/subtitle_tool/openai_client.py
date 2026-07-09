@@ -11,6 +11,8 @@ from .srt import SubtitleSegment
 
 DEFAULT_TRANSCRIBE_MODEL = "whisper-1"
 DEFAULT_TRANSLATE_MODEL = "gpt-4.1-mini"
+DEFAULT_ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+DEFAULT_ZAI_TRANSLATE_MODEL = "glm-4-flash"
 
 
 def build_client() -> Any:
@@ -27,6 +29,25 @@ def build_client() -> Any:
         ) from exc
 
     return OpenAI()
+
+
+def build_zai_client() -> Any:
+    if not os.environ.get("ZAI_API_KEY"):
+        raise OpenAIConfigError(
+            "ZAI_API_KEY is not set. Export it or add it to a .env file in this project."
+        )
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise OpenAIConfigError(
+            "The OpenAI Python package is not installed. Run: pip install -e ."
+        ) from exc
+
+    return OpenAI(
+        api_key=os.environ["ZAI_API_KEY"],
+        base_url=os.environ.get("ZAI_API_BASE", DEFAULT_ZAI_BASE_URL),
+    )
 
 
 def transcribe_audio(
@@ -132,32 +153,40 @@ def translate_segments(
     except Exception as exc:
         raise SubtitleToolError(f"OpenAI translation to {target_lang} failed: {exc}") from exc
 
+    return _parse_translation_json(content, target_lang, segments, "OpenAI")
+
+
+def translate_segments_with_zai(
+    segments: list[SubtitleSegment],
+    target_lang: str,
+    source_lang: str | None = None,
+    model: str | None = None,
+) -> dict[int, str]:
+    client = build_zai_client()
+    translate_model = model or os.environ.get(
+        "ZAI_MODEL", DEFAULT_ZAI_TRANSLATE_MODEL
+    )
+    payload = {
+        "source_language": source_lang or "auto",
+        "target_language": target_lang,
+        "subtitles": [
+            {"index": segment.index, "text": segment.text} for segment in segments
+        ],
+    }
+    system_prompt = (
+        "Translate subtitle text for video subtitles. Preserve meaning, tone, names, "
+        "numbers, and line breaks where helpful. Return valid JSON only, in the shape "
+        '{"items":[{"index":1,"text":"..."}]}. Return exactly one translated item '
+        "for every input index. Do not add commentary."
+    )
+    user_prompt = json.dumps(payload, ensure_ascii=False)
+
     try:
-        parsed = json.loads(content)
-        items = parsed["items"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise SubtitleToolError(
-            f"OpenAI translation to {target_lang} returned invalid JSON."
-        ) from exc
+        content = _chat_json_object(client, translate_model, system_prompt, user_prompt)
+    except Exception as exc:
+        raise SubtitleToolError(f"z.ai translation to {target_lang} failed: {exc}") from exc
 
-    translations: dict[int, str] = {}
-    for item in items:
-        try:
-            index = int(item["index"])
-            text = str(item["text"]).strip()
-        except (KeyError, TypeError, ValueError):
-            continue
-        if text:
-            translations[index] = text
-
-    missing = {segment.index for segment in segments} - set(translations)
-    if missing:
-        missing_list = ", ".join(str(value) for value in sorted(missing)[:10])
-        raise SubtitleToolError(
-            f"OpenAI translation to {target_lang} missed subtitle indexes: {missing_list}"
-        )
-
-    return translations
+    return _parse_translation_json(content, target_lang, segments, "z.ai")
 
 
 def _responses_json(
@@ -205,6 +234,54 @@ def _chat_json(
     return response.choices[0].message.content or "{}"
 
 
+def _chat_json_object(
+    client: Any, model: str, system_prompt: str, user_prompt: str
+) -> str:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content or "{}"
+
+
+def _parse_translation_json(
+    content: str,
+    target_lang: str,
+    segments: list[SubtitleSegment],
+    provider_name: str,
+) -> dict[int, str]:
+    try:
+        parsed = json.loads(content)
+        items = parsed["items"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SubtitleToolError(
+            f"{provider_name} translation to {target_lang} returned invalid JSON."
+        ) from exc
+
+    translations: dict[int, str] = {}
+    for item in items:
+        try:
+            index = int(item["index"])
+            text = str(item["text"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if text:
+            translations[index] = text
+
+    missing = {segment.index for segment in segments} - set(translations)
+    if missing:
+        missing_list = ", ".join(str(value) for value in sorted(missing)[:10])
+        raise SubtitleToolError(
+            f"{provider_name} translation to {target_lang} missed subtitle indexes: {missing_list}"
+        )
+
+    return translations
+
+
 def _get_response_field(response: Any, name: str) -> Any:
     if isinstance(response, dict):
         return response.get(name)
@@ -215,4 +292,3 @@ def _get_mapping_field(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
     return getattr(value, name, default)
-

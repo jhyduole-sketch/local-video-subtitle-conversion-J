@@ -8,10 +8,16 @@ const activeJobId = document.querySelector("#activeJobId");
 const logBox = document.querySelector("#logBox");
 const results = document.querySelector("#results");
 const resultSummary = document.querySelector("#resultSummary");
+const targetLangsInput = document.querySelector("#targetLangs");
+const languagePicker = document.querySelector("#languagePicker");
 let pollTimer = null;
 
 refreshHealth.addEventListener("click", loadHealth);
 form.addEventListener("submit", submitJob);
+targetLangsInput.addEventListener("input", syncLanguageButtons);
+languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
+  button.addEventListener("click", () => toggleLanguage(button.dataset.lang || ""));
+});
 
 loadHealth();
 
@@ -71,6 +77,31 @@ function formPayload() {
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
+}
+
+function toggleLanguage(language) {
+  if (!language) return;
+  const values = selectedTargetLangs();
+  if (values.includes(language)) {
+    targetLangsInput.value = values.filter((item) => item !== language).join(", ");
+  } else {
+    targetLangsInput.value = [...values, language].join(", ");
+  }
+  syncLanguageButtons();
+}
+
+function selectedTargetLangs() {
+  return targetLangsInput.value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function syncLanguageButtons() {
+  const selected = new Set(selectedTargetLangs());
+  languagePicker.querySelectorAll("[data-lang]").forEach((button) => {
+    button.classList.toggle("selected", selected.has(button.dataset.lang));
+  });
 }
 
 async function pollJob(jobId) {

@@ -130,6 +130,33 @@ textarea:focus {
   padding: 2px 0;
 }
 
+.language-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+}
+
+.language-picker button {
+  min-height: 36px;
+  border: 1px solid #cbd3cc;
+  border-radius: 6px;
+  background: #fbfcfa;
+  color: var(--text);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.language-picker button:hover {
+  border-color: var(--accent);
+}
+
+.language-picker button.selected {
+  border-color: var(--accent);
+  background: #e1f2ef;
+  color: var(--accent-strong);
+  font-weight: 650;
+}
+
 .toggles label {
   display: inline-flex;
   align-items: center;

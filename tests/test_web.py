@@ -31,10 +31,12 @@ class WebTests(unittest.TestCase):
                 "input": "input.mp4",
                 "targetLangs": "zh-CN, ja",
                 "downloadOnly": True,
+                "translator": "z-ai",
             }
         )
 
         self.assertEqual(options.target_langs, ["zh-CN", "ja"])
+        self.assertEqual(options.translator, "z-ai")
         self.assertTrue(options.download_only)
 
     def test_collect_health_returns_checks(self):

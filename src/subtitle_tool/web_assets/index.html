@@ -67,8 +67,29 @@
             <label for="translator">翻译</label>
             <select id="translator" name="translator">
               <option value="local-transformer">本地模型</option>
+              <option value="z-ai">z.ai</option>
               <option value="openai">OpenAI</option>
             </select>
+          </div>
+
+          <div class="field span-all">
+            <label>常用目标语言</label>
+            <div id="languagePicker" class="language-picker">
+              <button type="button" data-lang="zh-CN">中文</button>
+              <button type="button" data-lang="ja" class="selected">日语</button>
+              <button type="button" data-lang="en">英语</button>
+              <button type="button" data-lang="ko">韩语</button>
+              <button type="button" data-lang="fr">法语</button>
+              <button type="button" data-lang="de">德语</button>
+              <button type="button" data-lang="es">西班牙语</button>
+              <button type="button" data-lang="pt">葡萄牙语</button>
+              <button type="button" data-lang="it">意大利语</button>
+              <button type="button" data-lang="ru">俄语</button>
+              <button type="button" data-lang="ar">阿拉伯语</button>
+              <button type="button" data-lang="th">泰语</button>
+              <button type="button" data-lang="vi">越南语</button>
+              <button type="button" data-lang="id">印尼语</button>
+            </div>
           </div>
 
           <div class="field">

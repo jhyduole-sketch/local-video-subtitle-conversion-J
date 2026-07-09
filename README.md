@@ -54,9 +54,10 @@ TalkSmith 和 YouTube 输入会先下载视频到 `output/`，再进入字幕处
 
 ### 翻译方式
 
-支持两种翻译引擎：
+支持三种翻译引擎：
 
 - `--translator local-transformer`：使用本地 Hugging Face Transformer 模型，不需要 OpenAI key
+- `--translator z-ai`：使用 z.ai / 智谱 GLM API，需要 `ZAI_API_KEY`
 - `--translator openai`：使用 OpenAI API，需要 `OPENAI_API_KEY`
 
 当前本地翻译已验证的方向：
@@ -158,7 +159,8 @@ http://127.0.0.1:7860
 - 选择原语言和目标语言
 - 选择内置字幕、音频识别或自动模式
 - 选择本地 Whisper / OpenAI 转写
-- 选择本地 Transformer / OpenAI 翻译
+- 选择本地 Transformer / z.ai / OpenAI 翻译
+- 从常用目标语言里多选，或手动填写语言代码
 - 只下载视频、重新下载、输出带字幕轨 MP4
 - 查看环境检查、任务日志和输出文件路径
 
@@ -244,6 +246,27 @@ OPENAI_API_KEY=你的 API key
 env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 --source-lang ja --target-lang zh-CN --transcriber openai --translator openai --out-dir output
 ```
 
+### 6. 使用 z.ai API 翻译
+
+z.ai 当前用于字幕翻译；语音转写仍可继续使用本地 Whisper：
+
+```bash
+export ZAI_API_KEY="你的 z.ai API key"
+```
+
+可选配置：
+
+```bash
+export ZAI_API_BASE="https://open.bigmodel.cn/api/paas/v4/"
+export ZAI_MODEL="glm-4-flash"
+```
+
+然后运行：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 --source-lang zh --target-lang ja --transcriber local-whisper --translator z-ai --embed-subtitles --out-dir output
+```
+
 ## 参数说明
 
 ```text
@@ -308,6 +331,7 @@ input
 翻译引擎：
 
 - `local-transformer`
+- `z-ai`
 - `openai`
 
 ```text
