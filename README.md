@@ -1,94 +1,342 @@
-# subtitle-tool
+# local-video-subtitle-conversion-J
 
-一个本地命令行工具：输入英语或日语视频，或 TalkSmith 分享页 URL，优先读取视频内置字幕；如果没有字幕，就根据音频转写生成源字幕；再翻译成一个或多个目标语言，输出 `.srt` 字幕文件。
+一个本地命令行字幕工具，用来把视频里的语音或已有字幕转成新的字幕语言，并可输出带字幕轨的 MP4 视频。
 
-v1 只输出外挂字幕文件，不把字幕烧录进视频。
+当前版本重点支持：
 
-## Requirements
+- 本地视频文件
+- TalkSmith 分享页 URL
+- YouTube 视频 URL
+- 本地 Whisper 语音识别，不需要 OpenAI key
+- 本地 Transformer 翻译模型，不需要 OpenAI key
+- OpenAI API 转写/翻译作为可选方案
+- 输出 `.srt` 字幕文件
+- 输出带默认软字幕轨的 MP4 视频
 
+> 注意：当前输出的是“软字幕轨”，不是硬烧录到画面像素里的字幕。播放器如果没有自动显示，请手动打开字幕轨。
+
+## 功能概览
+
+### 输入来源
+
+工具的 `input` 参数可以是：
+
+- 本地视频路径，例如 `input.mp4`
+- TalkSmith 链接，例如 `https://service.talk-smith.com/s?id=...`
+- YouTube 链接，例如 `https://www.youtube.com/watch?v=...`
+
+TalkSmith 和 YouTube 输入会先下载视频到 `output/`，再进入字幕处理流程。
+
+### 字幕来源
+
+默认 `--source auto`：
+
+- 优先读取视频内置字幕轨
+- 如果没有字幕轨，则抽取音频并语音识别
+
+也可以指定：
+
+- `--source embedded`：只使用视频内置字幕
+- `--source audio`：强制使用音频识别
+
+### 转写方式
+
+支持两种转写引擎：
+
+- `--transcriber local-whisper`：使用本地 `whisper.cpp`，不需要 OpenAI key
+- `--transcriber openai`：使用 OpenAI API，需要 `OPENAI_API_KEY`
+
+推荐本地优先：
+
+```bash
+--transcriber local-whisper
+```
+
+### 翻译方式
+
+支持两种翻译引擎：
+
+- `--translator local-transformer`：使用本地 Hugging Face Transformer 模型，不需要 OpenAI key
+- `--translator openai`：使用 OpenAI API，需要 `OPENAI_API_KEY`
+
+当前本地翻译已验证的方向：
+
+- `ja -> zh-CN`
+- `zh` / `zh-CN -> ja`
+
+### 输出内容
+
+常见输出文件：
+
+```text
+output/source.zh.srt
+output/source.ja.srt
+output/subtitles.ja.srt
+output/subtitles.zh-CN.srt
+output/<video-id>.<lang>.default-sub.mp4
+```
+
+如果使用 `--embed-subtitles`，会额外输出一个带默认字幕轨的 MP4。
+
+## 环境要求
+
+- macOS
 - Python 3.9+
-- `ffmpeg` 和 `ffprobe`
-- OpenAI API key
+- `ffmpeg` / `ffprobe`
+- `yt-dlp`，处理 YouTube 链接时需要
+- `whisper.cpp`，本地语音识别时需要
+- whisper.cpp GGML 模型文件，例如 `models/ggml-base.bin`
+- 本地翻译模型缓存，使用 `local-transformer` 时需要
 
-macOS 可以用 Homebrew 安装视频工具：
+### 安装系统工具
 
 ```bash
 brew install ffmpeg
+brew install whisper-cpp
+brew install yt-dlp
 ```
 
-## Setup
+### 安装 Python 依赖
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
+python3 -m pip install openai
+python3 -m pip install transformers sentencepiece torch protobuf
+```
+
+如果要使用可选的第三方翻译库：
+
+```bash
+python3 -m pip install deep-translator
+```
+
+### 下载 Whisper 模型
+
+```bash
+mkdir -p models
+curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin -o models/ggml-base.bin
+```
+
+`ggml-base.bin` 速度和体积比较合适，但识别质量只是够用。质量更高可以换 `small` 或 `medium` 模型。
+
+## 基本用法
+
+所有命令建议在项目目录运行：
+
+```bash
+cd /Users/duole/DDeveloper/AI/codex-test/project3-codex
+```
+
+为了直接用源码运行，命令前加：
+
+```bash
+env PYTHONPATH=src
+```
+
+## 用法示例
+
+### 1. 本地视频识别原文字幕
+
+日语视频转日语字幕：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 --source-lang ja --transcriber local-whisper --out-dir output
+```
+
+输出：
+
+```text
+output/source.ja.srt
+```
+
+### 2. TalkSmith 视频转中文字幕
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://service.talk-smith.com/s?id=cmdfs4a5k265w0z1anf9fk08z' --source-lang ja --target-lang zh-CN --transcriber local-whisper --translator local-transformer --embed-subtitles --out-dir output
+```
+
+输出：
+
+```text
+output/downloads/cmdfs4a5k265w0z1anf9fk08z.mp4
+output/source.ja.srt
+output/subtitles.zh-CN.srt
+output/cmdfs4a5k265w0z1anf9fk08z.zh-CN.default-sub.mp4
+```
+
+### 3. YouTube 中文视频转日语字幕视频
+
+```bash
+env PYTHONPATH=src TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v=gaaarGhydLk' --source-lang zh --target-lang ja --transcriber local-whisper --translator local-transformer --embed-subtitles --out-dir output
+```
+
+输出：
+
+```text
+output/youtube/gaaarGhydLk.mp4
+output/source.zh.srt
+output/subtitles.ja.srt
+output/gaaarGhydLk.ja.default-sub.mp4
+```
+
+### 4. 只下载视频
+
+TalkSmith：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://service.talk-smith.com/s?id=cmdfs4a5k265w0z1anf9fk08z' --download-only --out-dir output
+```
+
+YouTube：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v=gaaarGhydLk' --download-only --out-dir output
+```
+
+### 5. 使用 OpenAI API
+
+如果希望使用 OpenAI API 转写/翻译，先设置环境变量：
+
+```bash
 export OPENAI_API_KEY="你的 API key"
 ```
 
-也可以在当前目录创建 `.env`：
+或在项目根目录创建 `.env`：
 
 ```bash
 OPENAI_API_KEY=你的 API key
 ```
 
-## Usage
+然后运行：
 
 ```bash
-subtitle-tool input.mp4 --source-lang en --target-lang zh-CN --target-lang ja --out-dir output
+env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 --source-lang ja --target-lang zh-CN --transcriber openai --translator openai --out-dir output
 ```
 
-也可以直接传 TalkSmith 分享页 URL，工具会先下载视频再转字幕：
-
-```bash
-subtitle-tool 'https://service.talk-smith.com/s?id=cmdfs4a5k265w0z1anf9fk08z' --source-lang ja --target-lang zh-CN --out-dir output
-```
-
-不用 OpenAI key，只生成原文字幕：
-
-```bash
-subtitle-tool input.mp4 --source-lang ja --transcriber local-whisper --out-dir output
-```
-
-只下载视频、不生成字幕：
-
-```bash
-subtitle-tool 'https://service.talk-smith.com/s?id=cmdfs4a5k265w0z1anf9fk08z' --download-only --out-dir output
-```
-
-YouTube 链接也可以处理。下面这个命令会下载视频、用本地 Whisper 识别中文语音、用本地模型翻成日语，并输出带日语字幕轨的视频：
-
-```bash
-subtitle-tool 'https://www.youtube.com/watch?v=gaaarGhydLk' --source-lang zh --target-lang ja --transcriber local-whisper --translator local-transformer --embed-subtitles --out-dir output
-```
-
-常用参数：
-
-- `input`: 视频文件路径、`https://service.talk-smith.com/s?id=...`，或 YouTube 链接
-- `--target-lang`: 目标语言，可重复传入，例如 `zh-CN`, `en`, `ja`；不传则只输出原文字幕
-- `--source-lang`: 源语言，建议传 `en` 或 `ja`
-- `--out-dir`: 输出目录，默认 `./output`
-- `--source`: `auto`, `embedded`, `audio`，默认 `auto`
-- `--format`: v1 只支持 `srt`
-- `--force-download`: TalkSmith 视频已存在时也重新下载
-- `--download-only`: 只下载 TalkSmith 视频，不转写、不翻译
-- `--transcriber`: `openai` 或 `local-whisper`，默认 `openai`
-- `--whisper-model`: whisper.cpp 模型路径，默认 `models/ggml-base.bin`
-- `--translator`: `openai` 或 `local-transformer`，默认 `openai`
-- `--embed-subtitles`: 输出带翻译字幕轨的 MP4 视频
-
-输出示例：
+## 参数说明
 
 ```text
-output/source.en.srt
-output/subtitles.zh-CN.srt
-output/subtitles.ja.srt
-output/downloads/cmdfs4a5k265w0z1anf9fk08z.mp4
+input
 ```
 
-## Notes
+输入视频路径或 URL。支持：
 
-- `auto` 模式会先找视频内置字幕，找不到再抽取音频并调用 OpenAI 转写。
-- 翻译会保留原始字幕时间轴，只替换字幕文本。
-- 可以通过环境变量覆盖模型：
-  - `SUBTITLE_TOOL_TRANSCRIBE_MODEL`，默认 `whisper-1`
-  - `SUBTITLE_TOOL_TRANSLATE_MODEL`，默认 `gpt-4.1-mini`
+- 本地视频
+- TalkSmith 分享 URL
+- YouTube URL
+
+```text
+--source-lang
+```
+
+源语言，例如：
+
+- `ja`
+- `zh`
+- `zh-CN`
+- `en`
+
+本地 Whisper 建议显式传入源语言，识别更稳定。
+
+```text
+--target-lang
+```
+
+目标字幕语言，可重复传入。不传时只输出源语言字幕。
+
+示例：
+
+```bash
+--target-lang ja
+--target-lang zh-CN
+```
+
+```text
+--source
+```
+
+字幕来源策略：
+
+- `auto`：默认，先找内置字幕，没有就听音频
+- `embedded`：只读取内置字幕
+- `audio`：强制听音频识别
+
+```text
+--transcriber
+```
+
+语音识别引擎：
+
+- `local-whisper`
+- `openai`
+
+```text
+--translator
+```
+
+翻译引擎：
+
+- `local-transformer`
+- `openai`
+
+```text
+--embed-subtitles
+```
+
+输出带默认字幕轨的 MP4。
+
+```text
+--download-only
+```
+
+只下载远程视频，不生成字幕。
+
+```text
+--force-download
+```
+
+远程视频已经存在时也重新下载。
+
+```text
+--whisper-model
+```
+
+指定 whisper.cpp 模型路径。默认：
+
+```text
+models/ggml-base.bin
+```
+
+## 当前限制
+
+- YouTube 视频如果匿名下载受限，工具会优先使用可下载的匿名格式；部分视频可能仍需要用户自行下载。
+- 当前 MP4 输出是软字幕轨，不是硬字幕烧录。
+- Homebrew 普通 `ffmpeg` 可能没有 `subtitles` / `drawtext` 滤镜，因此默认不做硬烧录。
+- 本地 Whisper `base` 模型对专有名词、口音、噪声场景会有误识别。
+- 本地翻译模型是粗翻级别，适合快速看效果；专有名词需要人工修正或词表优化。
+- 本地翻译目前主要验证了 `ja -> zh-CN` 和 `zh -> ja`。
+
+## 开发与测试
+
+运行测试：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+运行 CLI 帮助：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli --help
+```
+
+## 文件与仓库说明
+
+不会提交到仓库的内容：
+
+- `output/`
+- `models/*.bin`
+- `.env`
+- Python 缓存和构建产物
+
+这些文件已经在 `.gitignore` 中排除。
+
