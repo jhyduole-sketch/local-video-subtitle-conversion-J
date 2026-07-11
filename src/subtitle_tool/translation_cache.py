@@ -13,6 +13,7 @@ from .srt import SubtitleSegment
 class TranslationCacheEntry:
     translations: dict[int, str]
     engine: str
+    complete: bool
 
 
 class TranslationCache:
@@ -27,22 +28,34 @@ class TranslationCache:
         target_lang: str,
         provider: str,
     ) -> TranslationCacheEntry | None:
+        entry = self.load_partial(segments, source_lang, target_lang, provider)
+        return entry if entry and entry.complete else None
+
+    def load_partial(
+        self,
+        segments: list[SubtitleSegment],
+        source_lang: str | None,
+        target_lang: str,
+        provider: str,
+    ) -> TranslationCacheEntry | None:
         path = self._path(segments, source_lang, target_lang, provider)
         if not path.exists():
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            expected_indexes = {segment.index for segment in segments}
             translations = {
                 int(index): str(text)
                 for index, text in payload["translations"].items()
-                if str(text).strip()
+                if int(index) in expected_indexes and str(text).strip()
             }
-            expected_indexes = {segment.index for segment in segments}
-            if set(translations) != expected_indexes:
+            if not translations:
                 return None
+            complete = set(translations) == expected_indexes
             return TranslationCacheEntry(
                 translations=translations,
                 engine=str(payload["engine"]),
+                complete=complete,
             )
         except (OSError, ValueError, KeyError, TypeError):
             return None
@@ -59,9 +72,60 @@ class TranslationCache:
         expected_indexes = {segment.index for segment in segments}
         if set(translations) != expected_indexes:
             return
+        self._write(
+            segments,
+            source_lang,
+            target_lang,
+            provider,
+            translations,
+            engine,
+            complete=True,
+        )
+
+    def store_partial(
+        self,
+        segments: list[SubtitleSegment],
+        source_lang: str | None,
+        target_lang: str,
+        provider: str,
+        translations: dict[int, str],
+        engine: str,
+    ) -> None:
+        expected_indexes = {segment.index for segment in segments}
+        valid = {
+            index: text
+            for index, text in translations.items()
+            if index in expected_indexes and text.strip()
+        }
+        if not valid:
+            return
+        existing = self.load_partial(segments, source_lang, target_lang, provider)
+        if existing:
+            valid = {**existing.translations, **valid}
+        self._write(
+            segments,
+            source_lang,
+            target_lang,
+            provider,
+            valid,
+            engine,
+            complete=set(valid) == expected_indexes,
+        )
+
+    def _write(
+        self,
+        segments: list[SubtitleSegment],
+        source_lang: str | None,
+        target_lang: str,
+        provider: str,
+        translations: dict[int, str],
+        engine: str,
+        complete: bool,
+    ) -> None:
         path = self._path(segments, source_lang, target_lang, provider)
         payload = {
             "engine": engine,
+            "complete": complete,
             "translations": {
                 str(index): translations[index] for index in sorted(translations)
             },

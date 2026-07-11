@@ -84,10 +84,13 @@ class TalkSmithTests(unittest.TestCase):
                         download_only=True,
                     )
                 )
+                downloaded_name = result.downloaded_video_path.name
+                downloaded_bytes = result.downloaded_video_path.read_bytes()
 
         resolve.assert_called_once()
         load_segments.assert_not_called()
-        self.assertEqual(result.downloaded_video_path, video_path)
+        self.assertRegex(downloaded_name, r"cmd123\.\d{15}\.mp4")
+        self.assertEqual(downloaded_bytes, b"video")
         self.assertIsNone(result.source_subtitle_path)
 
 

@@ -23,6 +23,11 @@ const progressPercent = document.querySelector("#progressPercent");
 const videoFileInput = document.querySelector("#videoFile");
 const whisperPreset = document.querySelector("#whisperPreset");
 const whisperModelInput = document.querySelector("#whisperModel");
+const cacheSummaryLabel = document.querySelector("#cacheSummary");
+const cacheList = document.querySelector("#cacheList");
+const refreshCacheButton = document.querySelector("#refreshCacheButton");
+const historyList = document.querySelector("#historyList");
+const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const whisperModelPaths = {
   base: "models/ggml-base.bin",
   small: "models/ggml-small.bin",
@@ -136,8 +141,12 @@ document.addEventListener("keydown", closeLanguagePickerOnEscape);
 translatorSelect.addEventListener("change", handleTranslatorChange);
 whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
+refreshCacheButton.addEventListener("click", loadCache);
+refreshHistoryButton.addEventListener("click", loadHistory);
 
 loadHealth();
+loadCache();
+loadHistory();
 renderLanguagePicker();
 syncWhisperPreset();
 
@@ -386,6 +395,8 @@ async function pollJob(jobId) {
       if (data.result) {
         renderResults(data.result);
       }
+      loadHistory();
+      loadCache();
     }
   } catch (error) {
     setRunningState(false, "失败", "bad");
@@ -457,6 +468,121 @@ function renderResults(result) {
   results.querySelectorAll("[data-copy]").forEach((button) => {
     button.addEventListener("click", () => copyText(button.dataset.copy || ""));
   });
+}
+
+async function loadCache() {
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  try {
+    const response = await fetch(`/api/cache?outDir=${encodeURIComponent(outDir)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "缓存读取失败");
+    renderCache(data);
+  } catch (error) {
+    cacheSummaryLabel.textContent = "读取失败";
+    cacheList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderCache(data) {
+  const labels = {
+    videos: "视频",
+    audio: "音频",
+    sourceSubtitles: "内置字幕",
+    transcripts: "语音转写",
+    translations: "字幕翻译",
+  };
+  cacheSummaryLabel.textContent = formatBytes(data.totalBytes || 0);
+  cacheList.innerHTML = Object.entries(data.categories || {})
+    .map(([category, detail]) => `
+      <div class="data-row">
+        <div class="row-main">
+          <strong>${escapeHtml(labels[category] || category)}</strong>
+          <span>${detail.files || 0} 个文件 · ${formatBytes(detail.bytes || 0)}</span>
+        </div>
+        <button class="small-button" type="button" data-clear-cache="${escapeAttribute(category)}">清理</button>
+      </div>
+    `)
+    .join("");
+  cacheList.querySelectorAll("[data-clear-cache]").forEach((button) => {
+    button.addEventListener("click", () => clearCacheCategory(button.dataset.clearCache));
+  });
+}
+
+async function clearCacheCategory(category) {
+  if (!category) return;
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  const response = await fetch("/api/cache/clear", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outDir, categories: [category] }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    cacheSummaryLabel.textContent = data.error || "清理失败";
+    return;
+  }
+  renderCache(data);
+}
+
+async function loadHistory() {
+  try {
+    const response = await fetch("/api/jobs");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "历史读取失败");
+    renderHistory(Array.isArray(data.jobs) ? data.jobs : []);
+  } catch (error) {
+    historyList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderHistory(jobs) {
+  if (!jobs.length) {
+    historyList.innerHTML = `<div class="empty-row">暂无历史任务</div>`;
+    return;
+  }
+  historyList.innerHTML = jobs
+    .map((job) => {
+      const canResume = ["failed", "canceled", "interrupted"].includes(job.status);
+      return `
+        <div class="data-row">
+          <div class="row-main">
+            <strong>${escapeHtml(statusLabel(job.status))} · ${escapeHtml(job.id)}</strong>
+            <span>${escapeHtml(formatJobTime(job.createdAt))} · ${job.progress || 0}%</span>
+          </div>
+          <div class="row-actions">
+            <button class="small-button" type="button" data-view-job="${escapeAttribute(job.id)}">查看</button>
+            ${canResume ? `<button class="small-button" type="button" data-resume-job="${escapeAttribute(job.id)}">继续</button>` : ""}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+  historyList.querySelectorAll("[data-view-job]").forEach((button) => {
+    button.addEventListener("click", () => viewHistoryJob(button.dataset.viewJob));
+  });
+  historyList.querySelectorAll("[data-resume-job]").forEach((button) => {
+    button.addEventListener("click", () => resumeHistoryJob(button.dataset.resumeJob));
+  });
+}
+
+async function viewHistoryJob(jobId) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+  const job = await response.json();
+  if (!response.ok) return;
+  renderJob(job);
+  if (job.result) renderResults(job.result);
+}
+
+async function resumeHistoryJob(jobId) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" });
+  const data = await response.json();
+  if (!response.ok) return;
+  currentJobId = data.jobId;
+  activeJobId.textContent = data.jobId;
+  setRunningState(true, "排队", "running");
+  startElapsedTimer({ id: data.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0 });
+  pollJob(data.jobId);
+  loadHistory();
 }
 
 function resultItem(kind, path) {
@@ -551,13 +677,14 @@ function statusLabel(status) {
   if (status === "canceled") return "已停止";
   if (status === "succeeded") return "完成";
   if (status === "failed") return "失败";
+  if (status === "interrupted") return "已中断";
   return "空闲";
 }
 
 function statusTone(status) {
   if (status === "succeeded") return "ok";
   if (status === "failed") return "bad";
-  if (status === "canceling" || status === "canceled") return "warn";
+  if (status === "canceling" || status === "canceled" || status === "interrupted") return "warn";
   if (status === "running" || status === "queued") return "running";
   return "idle";
 }
@@ -571,6 +698,19 @@ function formatDuration(seconds) {
     return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
   }
   return `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+}
+
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function formatJobTime(timestamp) {
+  const value = Number(timestamp || 0);
+  return value > 0 ? new Date(value * 1000).toLocaleString() : "未知时间";
 }
 
 function escapeHtml(value) {

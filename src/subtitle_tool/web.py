@@ -10,17 +10,20 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import util
 from importlib import resources
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .env import load_dotenv
+from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError
 from .local_translate import local_translation_model_statuses, nllb_model_status
+from .job_store import JobStore
 from .pipeline import PipelineOptions, PipelineResult, run_pipeline
 
 
@@ -36,10 +39,21 @@ class JobState:
     cancel_requested: bool = False
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    payload: dict[str, object] = field(default_factory=dict)
+    resumed_from: str | None = None
 
 
 JOBS: dict[str, JobState] = {}
 JOB_LOCK = threading.Lock()
+JOB_STORE: JobStore | None = None
+
+
+def create_job_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="subtitle-job")
+
+
+JOB_EXECUTOR = create_job_executor()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path.cwd() / ".env")
     args = build_parser().parse_args(argv)
+    state_path = Path(
+        os.environ.get(
+            "SUBTITLE_TOOL_STATE_DB",
+            str(Path.cwd() / "output" / ".subtitle-tool-state" / "jobs.sqlite3"),
+        )
+    )
+    configure_job_store(state_path)
     server = ThreadingHTTPServer((args.host, args.port), SubtitleToolHandler)
     print(f"Subtitle tool web UI: http://{args.host}:{args.port}")
     try:
@@ -149,6 +170,14 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self._send_json(collect_health())
             return
+        if parsed.path == "/api/jobs":
+            self._send_json({"jobs": list_job_payloads()})
+            return
+        if parsed.path == "/api/cache":
+            query = parse_qs(parsed.query)
+            out_dir = Path(query.get("outDir", ["output"])[0]).expanduser().resolve()
+            self._send_json(cache_summary(out_dir))
+            return
         if parsed.path.startswith("/api/jobs/"):
             self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
             return
@@ -162,9 +191,26 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         if path == "/api/upload":
             self._handle_upload()
             return
+        if path == "/api/cache/clear":
+            try:
+                payload = self._read_json()
+                out_dir = Path(str(payload.get("outDir") or "output")).expanduser().resolve()
+                categories = [str(item) for item in payload.get("categories", [])]
+                self._send_json(clear_cache(out_dir, categories))
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if path.startswith("/api/jobs/") and path.endswith("/cancel"):
             job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/cancel"))
             self._cancel_job(job_id)
+            return
+        if path.startswith("/api/jobs/") and path.endswith("/resume"):
+            job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/resume"))
+            resumed = resume_job(job_id)
+            if not resumed:
+                self._send_json({"error": "Job cannot be resumed."}, status=409)
+                return
+            self._send_json({"jobId": resumed.id, "status": resumed.status}, status=202)
             return
         if path != "/api/run":
             self.send_error(404, "Not found")
@@ -176,11 +222,11 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
 
-        job = JobState(id=uuid.uuid4().hex[:12])
+        job = JobState(id=uuid.uuid4().hex[:12], payload=payload)
         with JOB_LOCK:
             JOBS[job.id] = job
-        thread = threading.Thread(target=_run_job, args=(job.id, options), daemon=True)
-        thread.start()
+            _persist_job(job)
+        JOB_EXECUTOR.submit(_run_job, job.id, options)
         self._send_json({"jobId": job.id, "status": job.status}, status=202)
 
     def _handle_upload(self) -> None:
@@ -287,10 +333,11 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
 
 
 def _run_job(job_id: str, options: PipelineOptions) -> None:
-    _update_job(job_id, status="running", log="任务已启动", progress=1)
     try:
+        _update_job(job_id, status="running", log="任务已启动", progress=1)
         options = replace(
             options,
+            cancel_check=JOBS[job_id].cancel_event.is_set,
             progress_callback=lambda message, percent: _update_job(
                 job_id,
                 log=message,
@@ -355,10 +402,11 @@ def _update_job(
         if error is not None:
             job.error = error
         if progress is not None:
-            job.progress = max(0, min(100, progress))
+            job.progress = max(job.progress, max(0, min(100, progress)))
         if progress_message is not None:
             job.progress_message = progress_message
         job.updated_at = time.time()
+        _persist_job(job)
 
 
 def request_job_cancel(job_id: str) -> bool:
@@ -370,10 +418,12 @@ def request_job_cancel(job_id: str) -> bool:
             return False
         if not job.cancel_requested:
             job.cancel_requested = True
+            job.cancel_event.set()
             job.status = "canceling"
             job.progress_message = "正在停止"
             job.logs.append(_format_log_line(job, "收到停止请求，当前步骤结束后停止"))
             job.updated_at = time.time()
+            _persist_job(job)
         return True
 
 
@@ -391,8 +441,101 @@ def _job_to_dict(job: JobState | None) -> dict[str, object] | None:
         "error": job.error,
         "createdAt": job.created_at,
         "updatedAt": job.updated_at,
+        "resumedFrom": job.resumed_from,
         "elapsedSeconds": max(0, round(job.updated_at - job.created_at)),
     }
+
+
+def configure_job_store(path: Path) -> JobStore:
+    global JOB_STORE
+    store = JobStore(path)
+    store.mark_inflight_interrupted()
+    restored = [_job_from_record(record) for record in store.list()]
+    with JOB_LOCK:
+        JOBS.clear()
+        JOBS.update({job.id: job for job in restored})
+    JOB_STORE = store
+    return store
+
+
+def list_job_payloads(limit: int = 50) -> list[dict[str, object]]:
+    with JOB_LOCK:
+        jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)
+        return [_job_to_dict(job) for job in jobs[:limit] if job is not None]
+
+
+def cache_summary(out_dir: Path) -> dict[str, object]:
+    return AssetCache(out_dir / ".subtitle-tool-cache").summary()
+
+
+def clear_cache(out_dir: Path, categories: list[str]) -> dict[str, object]:
+    return AssetCache(out_dir / ".subtitle-tool-cache").clear(categories)
+
+
+def resume_job(job_id: str) -> JobState | None:
+    with JOB_LOCK:
+        original = JOBS.get(job_id)
+        if not original or original.status not in {"failed", "canceled", "interrupted"}:
+            return None
+        payload = dict(original.payload)
+    try:
+        options = options_from_payload(payload)
+    except Exception:
+        return None
+    resumed = JobState(
+        id=uuid.uuid4().hex[:12],
+        payload=payload,
+        resumed_from=original.id,
+        logs=[f"继续任务: {original.id}"],
+    )
+    with JOB_LOCK:
+        JOBS[resumed.id] = resumed
+        _persist_job(resumed)
+    JOB_EXECUTOR.submit(_run_job, resumed.id, options)
+    return resumed
+
+
+def _persist_job(job: JobState) -> None:
+    if JOB_STORE:
+        JOB_STORE.save(_job_record(job))
+
+
+def _job_record(job: JobState) -> dict[str, object]:
+    return {
+        "id": job.id,
+        "status": job.status,
+        "logs": list(job.logs),
+        "result": job.result,
+        "error": job.error,
+        "progress": job.progress,
+        "progress_message": job.progress_message,
+        "cancel_requested": job.cancel_requested,
+        "payload": job.payload,
+        "resumed_from": job.resumed_from,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+    }
+
+
+def _job_from_record(record: dict[str, object]) -> JobState:
+    return JobState(
+        id=str(record["id"]),
+        status=str(record["status"]),
+        logs=list(record.get("logs") or []),
+        result=record.get("result") if isinstance(record.get("result"), dict) else None,
+        error=str(record["error"]) if record.get("error") is not None else None,
+        progress=int(record.get("progress") or 0),
+        progress_message=str(record.get("progress_message") or "等待开始"),
+        cancel_requested=bool(record.get("cancel_requested")),
+        created_at=float(record.get("created_at") or time.time()),
+        updated_at=float(record.get("updated_at") or time.time()),
+        payload=dict(record.get("payload") or {}),
+        resumed_from=(
+            str(record["resumed_from"])
+            if record.get("resumed_from") is not None
+            else None
+        ),
+    )
 
 
 def _coerce_target_langs(value: object) -> list[str]:

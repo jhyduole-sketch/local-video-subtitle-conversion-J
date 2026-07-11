@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -9,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import SubtitleToolError
+from .errors import CancellationError, SubtitleToolError
+from .process_control import CancelCheck
 
 
 TALKSMITH_SHARE_HOST = "service.talk-smith.com"
@@ -104,6 +104,7 @@ def download_video(
     out_dir: Path,
     force: bool = False,
     timestamp_suffix: str | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> Path:
     downloads_dir = out_dir
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -120,7 +121,13 @@ def download_video(
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             with temp_path.open("wb") as handle:
-                shutil.copyfileobj(response, handle)
+                while True:
+                    if cancel_check and cancel_check():
+                        raise CancellationError("Task was cancelled by user.")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
     except urllib.error.HTTPError as exc:
         raise SubtitleToolError(
             f"Video download failed with HTTP {exc.code}. The signed URL may have expired; retry with --force-download."
@@ -142,5 +149,12 @@ def resolve_talksmith_input(
     out_dir: Path,
     force: bool = False,
     timestamp_suffix: str | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> Path:
-    return download_video(fetch_talksmith_video(input_value), out_dir, force, timestamp_suffix)
+    return download_video(
+        fetch_talksmith_video(input_value),
+        out_dir,
+        force,
+        timestamp_suffix,
+        cancel_check,
+    )

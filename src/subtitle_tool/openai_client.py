@@ -23,6 +23,7 @@ DEFAULT_ZAI_REQUEST_DELAY_SECONDS = 2.0
 DEFAULT_ZAI_RATE_LIMIT_RETRY_SECONDS = 20.0
 DEFAULT_ZAI_RATE_LIMIT_RETRY_LIMIT = 3
 ProgressCallback = Callable[[str], None]
+CheckpointCallback = Callable[[dict[int, str]], None]
 _ZAI_REQUEST_LOCK = threading.Lock()
 
 
@@ -174,6 +175,8 @@ def translate_segments_with_zai(
     source_lang: str | None = None,
     model: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    initial_translations: dict[int, str] | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> dict[int, str]:
     client = build_zai_client()
     translate_model = model or os.environ.get(
@@ -186,6 +189,8 @@ def translate_segments_with_zai(
         target_lang,
         source_lang,
         progress_callback,
+        initial_translations,
+        checkpoint_callback,
     )
 
 
@@ -196,8 +201,15 @@ def _translate_segments_with_zai_batches(
     target_lang: str,
     source_lang: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    initial_translations: dict[int, str] | None = None,
+    checkpoint_callback: CheckpointCallback | None = None,
 ) -> dict[int, str]:
-    translations: dict[int, str] = {}
+    expected_indexes = {segment.index for segment in segments}
+    translations: dict[int, str] = {
+        index: text
+        for index, text in (initial_translations or {}).items()
+        if index in expected_indexes and text.strip()
+    }
     max_segments = _int_env(
         "ZAI_TRANSLATION_BATCH_SEGMENTS",
         DEFAULT_ZAI_TRANSLATION_BATCH_SEGMENTS,
@@ -208,7 +220,12 @@ def _translate_segments_with_zai_batches(
         DEFAULT_ZAI_TRANSLATION_BATCH_CHARACTERS,
         minimum=1,
     )
-    batches = _chunk_segments_by_budget(segments, max_segments, max_characters)
+    remaining_segments = [
+        segment for segment in segments if segment.index not in translations
+    ]
+    batches = _chunk_segments_by_budget(
+        remaining_segments, max_segments, max_characters
+    )
     for batch_index, batch in enumerate(batches, start=1):
         if batch_index > 1:
             _sleep_between_zai_requests(progress_callback)
@@ -226,6 +243,8 @@ def _translate_segments_with_zai_batches(
                 progress_callback,
             )
         )
+        if checkpoint_callback:
+            checkpoint_callback(dict(translations))
 
     for retry_index in range(1, ZAI_TRANSLATION_RETRY_LIMIT + 1):
         missing_segments = [
@@ -256,6 +275,8 @@ def _translate_segments_with_zai_batches(
                     progress_callback,
                 )
             )
+            if checkpoint_callback:
+                checkpoint_callback(dict(translations))
 
     _raise_if_missing(translations, target_lang, segments, "z.ai")
     return translations

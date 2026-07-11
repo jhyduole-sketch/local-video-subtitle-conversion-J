@@ -302,6 +302,43 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(mux_observed_overlap, [True])
         self.assertEqual(set(result.subtitled_video_paths), {"ja", "fr"})
 
+    def test_second_audio_run_reuses_extracted_audio_and_transcript(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video content")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
+            ]
+
+            def fake_extract(video_path, audio_path, cancel_check=None):
+                audio_path.parent.mkdir(parents=True, exist_ok=True)
+                audio_path.write_bytes(b"audio")
+                return audio_path
+
+            with patch(
+                "subtitle_tool.pipeline.extract_audio", side_effect=fake_extract
+            ) as extract_audio, patch(
+                "subtitle_tool.pipeline.transcribe_with_whisper_cpp",
+                return_value=source_segments,
+            ) as transcribe:
+                options = PipelineOptions(
+                    input_value=str(input_path),
+                    target_langs=[],
+                    source_lang="en",
+                    out_dir=Path(tmpdir) / "output",
+                    source="audio",
+                    output_format="srt",
+                    transcriber="local-whisper",
+                )
+                first = run_pipeline(options)
+                second = run_pipeline(options)
+                first_text = first.source_subtitle_path.read_text(encoding="utf-8")
+                second_text = second.source_subtitle_path.read_text(encoding="utf-8")
+
+        extract_audio.assert_called_once()
+        transcribe.assert_called_once()
+        self.assertEqual(first_text, second_text)
+
 
 if __name__ == "__main__":
     unittest.main()

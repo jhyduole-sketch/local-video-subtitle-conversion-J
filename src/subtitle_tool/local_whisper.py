@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 
 from .errors import DependencyError, SubtitleToolError
+from .process_control import CancelCheck, run_process
 from .srt import SubtitleSegment, read_srt
 
 
@@ -15,6 +15,7 @@ def transcribe_with_whisper_cpp(
     audio_path: Path,
     source_lang: str | None = None,
     model_path: Path | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> list[SubtitleSegment]:
     whisper_cli = shutil.which("whisper-cli")
     if whisper_cli is None:
@@ -46,13 +47,7 @@ def transcribe_with_whisper_cpp(
         str(output_base),
         "-np",
     ]
-    completed = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    completed = run_process(command, cancel_check=cancel_check)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise SubtitleToolError(f"Local Whisper transcription failed: {detail}")

@@ -480,6 +480,56 @@ textarea:focus {
   margin-top: 18px;
 }
 
+.history-panel {
+  margin-top: 18px;
+}
+
+.data-list {
+  display: grid;
+  padding: 6px 16px 12px;
+}
+
+.data-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 9px 0;
+  border-bottom: 1px solid #edf0eb;
+}
+
+.data-row:last-child {
+  border-bottom: 0;
+}
+
+.row-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.row-main strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.row-main span,
+.empty-row {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.empty-row {
+  padding: 14px 0;
+}
+
+.row-actions {
+  display: flex;
+  gap: 7px;
+  flex: 0 0 auto;
+}
+
 .results-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -529,5 +579,9 @@ textarea:focus {
   .app-shell {
     width: min(100vw - 20px, 760px);
     padding-top: 14px;
+  }
+
+  .data-row {
+    align-items: flex-start;
   }
 }

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DependencyError, SubtitleToolError
+from .process_control import CancelCheck, run_process
 
 
 TRAILING_URL_PUNCTUATION = "。．.，,、；;：:！!？?）)]}＞>」』”’\"'"
@@ -64,7 +64,11 @@ def extract_bilibili_id(value: str) -> str:
 
 
 def download_youtube_video(
-    value: str, out_dir: Path, force: bool = False, timestamp_suffix: str | None = None
+    value: str,
+    out_dir: Path,
+    force: bool = False,
+    timestamp_suffix: str | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> YouTubeVideo:
     downloaded = _download_with_ytdlp(
         value=value,
@@ -74,12 +78,17 @@ def download_youtube_video(
         video_id=extract_youtube_id(value),
         clean_value=clean_youtube_url(value),
         label="YouTube",
+        cancel_check=cancel_check,
     )
     return YouTubeVideo(video_id=downloaded.video_id, path=downloaded.path)
 
 
 def download_bilibili_video(
-    value: str, out_dir: Path, force: bool = False, timestamp_suffix: str | None = None
+    value: str,
+    out_dir: Path,
+    force: bool = False,
+    timestamp_suffix: str | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> DownloadedVideo:
     clean_value = clean_video_url(value)
     return _download_with_ytdlp(
@@ -90,6 +99,7 @@ def download_bilibili_video(
         video_id=extract_bilibili_id(clean_value),
         clean_value=clean_value,
         label="Bilibili",
+        cancel_check=cancel_check,
     )
 
 
@@ -102,6 +112,7 @@ def _download_with_ytdlp(
     video_id: str,
     clean_value: str,
     label: str,
+    cancel_check: CancelCheck | None = None,
 ) -> DownloadedVideo:
     yt_dlp = shutil.which("yt-dlp")
     if yt_dlp is None:
@@ -126,13 +137,7 @@ def _download_with_ytdlp(
         output_template,
         clean_value,
     ]
-    completed = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    completed = run_process(command, cancel_check=cancel_check)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise SubtitleToolError(f"{label} download failed: {detail}")

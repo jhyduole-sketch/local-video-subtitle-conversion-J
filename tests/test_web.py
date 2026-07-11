@@ -1,5 +1,8 @@
 from pathlib import Path
 import sys
+import threading
+import time
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,15 +15,96 @@ from subtitle_tool.web import (  # noqa: E402
     JobState,
     _format_log_line,
     _job_to_dict,
+    _update_job,
     collect_health,
+    cache_summary,
+    clear_cache,
+    create_job_executor,
     options_from_payload,
     request_job_cancel,
+    resume_job,
     result_to_dict,
     safe_upload_filename,
 )
 
 
 class WebTests(unittest.TestCase):
+    def test_cache_helpers_report_and_clear_selected_category(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            cached = out_dir / ".subtitle-tool-cache" / "audio" / "audio.mp3"
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(b"audio")
+
+            summary = cache_summary(out_dir)
+            cleared = clear_cache(out_dir, ["audio"])
+
+        self.assertEqual(summary["categories"]["audio"]["files"], 1)
+        self.assertEqual(cleared["cleared"], ["audio"])
+    def test_resume_job_creates_linked_queued_job(self):
+        original = JobState(
+            id="failed-job",
+            status="failed",
+            payload={"input": "video.mp4", "targetLangs": ["ja"]},
+        )
+        with JOB_LOCK:
+            JOBS[original.id] = original
+        try:
+            with patch("subtitle_tool.web.JOB_EXECUTOR.submit") as submit:
+                resumed = resume_job(original.id)
+            self.assertIsNotNone(resumed)
+            self.assertEqual(resumed.status, "queued")
+            self.assertEqual(resumed.resumed_from, original.id)
+            self.assertEqual(resumed.payload, original.payload)
+            submit.assert_called_once()
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(original.id, None)
+                if 'resumed' in locals() and resumed:
+                    JOBS.pop(resumed.id, None)
+
+    def test_job_executor_runs_only_one_job_at_a_time(self):
+        executor = create_job_executor()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+
+        def first_job():
+            first_started.set()
+            release_first.wait(timeout=2)
+
+        def second_job():
+            second_started.set()
+
+        try:
+            first_future = executor.submit(first_job)
+            second_future = executor.submit(second_job)
+            self.assertTrue(first_started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            release_first.set()
+            first_future.result(timeout=1)
+            second_future.result(timeout=1)
+        finally:
+            release_first.set()
+            executor.shutdown(wait=True)
+
+        self.assertTrue(second_started.is_set())
+
+    def test_job_progress_never_moves_backward(self):
+        job = JobState(id="monotonic-progress")
+        with JOB_LOCK:
+            JOBS[job.id] = job
+        try:
+            _update_job(job.id, progress=80, progress_message="翻译")
+            _update_job(job.id, progress=20, progress_message="缓存")
+            payload = _job_to_dict(job)
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(job.id, None)
+
+        self.assertEqual(payload["progress"], 80)
+
     def test_result_payload_includes_translation_engines(self):
         result = PipelineResult(
             source_subtitle_path=Path("/tmp/source.srt"),
@@ -145,6 +229,7 @@ class WebTests(unittest.TestCase):
 
         self.assertEqual(job.status, "canceling")
         self.assertTrue(job.cancel_requested)
+        self.assertTrue(job.cancel_event.is_set())
         self.assertTrue(payload["cancelRequested"])
         self.assertEqual(payload["progressMessage"], "正在停止")
 

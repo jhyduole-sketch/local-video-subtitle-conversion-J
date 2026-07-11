@@ -169,6 +169,40 @@ class OpenAIClientTests(unittest.TestCase):
                 4.5,
             )
 
+    def test_zai_resume_requests_only_missing_indexes_and_checkpoints(self):
+        segments = [
+            SubtitleSegment(index=index, start_ms=0, end_ms=1000, text=f"text {index}")
+            for index in range(1, 4)
+        ]
+        requested_indexes = []
+        checkpoints = []
+
+        def fake_chat(client, model, system_prompt, user_prompt):
+            payload = json.loads(user_prompt)
+            indexes = [item["index"] for item in payload["subtitles"]]
+            requested_indexes.extend(indexes)
+            return json.dumps(
+                {"items": [{"index": index, "text": f"ja {index}"} for index in indexes]}
+            )
+
+        with patch.dict(
+            "subtitle_tool.openai_client.os.environ", {"ZAI_REQUEST_DELAY_SECONDS": "0"}
+        ), patch(
+            "subtitle_tool.openai_client.build_zai_client", return_value=object()
+        ), patch(
+            "subtitle_tool.openai_client._chat_json_object", side_effect=fake_chat
+        ):
+            translations = translate_segments_with_zai(
+                segments,
+                "ja",
+                initial_translations={1: "ja 1"},
+                checkpoint_callback=lambda values: checkpoints.append(dict(values)),
+            )
+
+        self.assertEqual(requested_indexes, [2, 3])
+        self.assertEqual(translations, {1: "ja 1", 2: "ja 2", 3: "ja 3"})
+        self.assertEqual(checkpoints[-1], translations)
+
 
 if __name__ == "__main__":
     unittest.main()

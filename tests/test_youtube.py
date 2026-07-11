@@ -58,7 +58,7 @@ class YouTubeTests(unittest.TestCase):
                 return Completed()
 
             with patch("subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"), patch(
-                "subtitle_tool.youtube.subprocess.run", side_effect=fake_run
+                "subtitle_tool.youtube.run_process", side_effect=fake_run
             ):
                 video = download_youtube_video(
                     "https://www.youtube.com/watch?v=abc123",
@@ -89,7 +89,7 @@ class YouTubeTests(unittest.TestCase):
                 return Completed()
 
             with patch("subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"), patch(
-                "subtitle_tool.youtube.subprocess.run", side_effect=fake_run
+                "subtitle_tool.youtube.run_process", side_effect=fake_run
             ):
                 video = download_bilibili_video(
                     "https://www.bilibili.com/video/BV1rR4y197tP/?spm_id_from=333",

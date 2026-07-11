@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import DependencyError, MediaError
+from .process_control import CancelCheck, run_process
 
 
 @dataclass(frozen=True)
@@ -26,14 +27,10 @@ def ensure_ffmpeg() -> None:
         )
 
 
-def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+def _run(
+    command: list[str], cancel_check: CancelCheck | None = None
+) -> subprocess.CompletedProcess[str]:
+    completed = run_process(command, cancel_check=cancel_check)
     if completed.returncode != 0:
         command_name = command[0]
         detail = completed.stderr.strip() or completed.stdout.strip()
@@ -41,7 +38,9 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     return completed
 
 
-def find_subtitle_streams(video_path: Path) -> list[SubtitleStream]:
+def find_subtitle_streams(
+    video_path: Path, cancel_check: CancelCheck | None = None
+) -> list[SubtitleStream]:
     ensure_ffmpeg()
     completed = _run(
         [
@@ -55,7 +54,8 @@ def find_subtitle_streams(video_path: Path) -> list[SubtitleStream]:
             "-of",
             "json",
             str(video_path),
-        ]
+        ],
+        cancel_check,
     )
     payload = json.loads(completed.stdout or "{}")
     streams = []
@@ -72,7 +72,11 @@ def find_subtitle_streams(video_path: Path) -> list[SubtitleStream]:
     return streams
 
 
-def extract_first_subtitle(video_path: Path, output_path: Path) -> Path:
+def extract_first_subtitle(
+    video_path: Path,
+    output_path: Path,
+    cancel_check: CancelCheck | None = None,
+) -> Path:
     ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _run(
@@ -86,12 +90,17 @@ def extract_first_subtitle(video_path: Path, output_path: Path) -> Path:
             "-map",
             "0:s:0",
             str(output_path),
-        ]
+        ],
+        cancel_check,
     )
     return output_path
 
 
-def extract_audio(video_path: Path, output_path: Path) -> Path:
+def extract_audio(
+    video_path: Path,
+    output_path: Path,
+    cancel_check: CancelCheck | None = None,
+) -> Path:
     ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _run(
@@ -110,13 +119,19 @@ def extract_audio(video_path: Path, output_path: Path) -> Path:
             "-b:a",
             "64k",
             str(output_path),
-        ]
+        ],
+        cancel_check,
     )
     return output_path
 
 
 def mux_subtitle_track(
-    video_path: Path, subtitle_path: Path, output_path: Path, language: str, title: str
+    video_path: Path,
+    subtitle_path: Path,
+    output_path: Path,
+    language: str,
+    title: str,
+    cancel_check: CancelCheck | None = None,
 ) -> Path:
     ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +162,7 @@ def mux_subtitle_track(
             "-disposition:s:0",
             "default",
             str(output_path),
-        ]
+        ],
+        cancel_check,
     )
     return output_path

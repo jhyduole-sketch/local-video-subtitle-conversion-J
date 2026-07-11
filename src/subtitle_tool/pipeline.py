@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,10 +9,12 @@ import re
 from typing import Callable
 
 from .errors import CancellationError, MediaError, SubtitleToolError
+from .asset_cache import AssetCache
 from .local_translate import normalize_lang, translate_segments_locally, translate_segments_with_nllb
 from .local_whisper import transcribe_with_whisper_cpp
 from .media import extract_audio, extract_first_subtitle, find_subtitle_streams, mux_subtitle_track
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
+from .process_control import CancelCheck
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
 from .translation_cache import TranslationCache
@@ -46,6 +47,7 @@ class PipelineOptions:
     embed_subtitles: bool = False
     avoid_subtitle_overlap: bool = False
     progress_callback: ProgressCallback | None = None
+    cancel_check: CancelCheck | None = None
 
 
 @dataclass(frozen=True)
@@ -76,8 +78,11 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     output_stem = _base_output_stem(_input_output_stem(options.input_value), timestamp)
     task_out_dir = options.out_dir / f"{output_stem}.{timestamp}"
     task_out_dir.mkdir(parents=True, exist_ok=True)
+    asset_cache = AssetCache(options.out_dir / ".subtitle-tool-cache")
     _progress(options, "准备输入视频", 5)
-    input_path, downloaded_video_path = _resolve_input(options, task_out_dir, timestamp)
+    input_path, downloaded_video_path = _resolve_input(
+        options, task_out_dir, timestamp, asset_cache
+    )
     _progress(options, f"视频已准备: {input_path.name}", 15)
 
     if options.download_only:
@@ -91,7 +96,9 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         )
 
     _progress(options, "读取字幕来源", 18)
-    source_segments, source_kind = _load_source_segments(options, input_path)
+    source_segments, source_kind = _load_source_segments(
+        options, input_path, asset_cache
+    )
     _progress(options, f"得到源字幕片段: {len(source_segments)} 条", 52)
     lang_suffix = options.source_lang or "auto"
     source_path = task_out_dir / f"{output_stem}.{timestamp}.source.{lang_suffix}.srt"
@@ -126,6 +133,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                     }
                     engine = "源字幕直出"
                 else:
+                    partial = translation_cache.load_partial(
+                        source_segments,
+                        options.source_lang,
+                        target_lang,
+                        options.translator,
+                    )
                     cached = translation_cache.load(
                         source_segments,
                         options.source_lang,
@@ -141,11 +154,32 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                             min(translated_percent - 1, base_percent + 1),
                         )
                     else:
+                        initial_translations = (
+                            partial.translations
+                            if partial and options.translator == "z-ai"
+                            else None
+                        )
+                        if initial_translations:
+                            _progress(
+                                options,
+                                f"恢复翻译断点: {target_lang} · "
+                                f"已完成 {len(initial_translations)}/{len(source_segments)} 条",
+                                min(translated_percent - 1, base_percent + 1),
+                            )
                         translations, engine = _translate_target(
                             options,
                             source_segments,
                             target_lang,
                             min(translated_percent - 1, base_percent + 1),
+                            initial_translations,
+                            lambda values: translation_cache.store_partial(
+                                source_segments,
+                                options.source_lang,
+                                target_lang,
+                                options.translator,
+                                values,
+                                "z.ai",
+                            ),
                         )
                         translation_cache.store(
                             source_segments,
@@ -182,6 +216,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                         video_output_path,
                         _mp4_language_code(target_lang),
                         target_lang,
+                        options.cancel_check,
                     )
                     mux_jobs[target_lang] = (
                         future,
@@ -233,6 +268,8 @@ def _translate_target(
     source_segments: list[SubtitleSegment],
     target_lang: str,
     progress_percent: int,
+    initial_translations: dict[int, str] | None = None,
+    checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
 ) -> tuple[dict[int, str], str]:
     if options.translator == "local-transformer":
         return (
@@ -267,6 +304,8 @@ def _translate_target(
                 progress_callback=lambda message: _progress(
                     options, message, progress_percent
                 ),
+                initial_translations=initial_translations,
+                checkpoint_callback=checkpoint_callback,
             ),
             "z.ai",
         )
@@ -316,28 +355,53 @@ def _translate_target(
 
 
 def _resolve_input(
-    options: PipelineOptions, task_out_dir: Path, timestamp: str
+    options: PipelineOptions,
+    task_out_dir: Path,
+    timestamp: str,
+    asset_cache: AssetCache,
 ) -> tuple[Path, Path | None]:
     if is_talksmith_url(options.input_value):
         _progress(options, "解析 TalkSmith 链接并下载视频", 8)
         downloaded_path = resolve_talksmith_input(
-            options.input_value, task_out_dir, options.force_download, timestamp
+            options.input_value,
+            asset_cache.videos_dir,
+            options.force_download,
+            None,
+            options.cancel_check,
         )
-        return downloaded_path, downloaded_path
+        task_path = asset_cache.materialize_video(
+            downloaded_path,
+            task_out_dir / f"{extract_scenario_id(options.input_value)}.{timestamp}.mp4",
+        )
+        return task_path, task_path
 
     if is_youtube_url(options.input_value):
         _progress(options, "解析 YouTube 链接并下载视频", 8)
         video = download_youtube_video(
-            options.input_value, task_out_dir, options.force_download, timestamp
+            options.input_value,
+            asset_cache.videos_dir,
+            options.force_download,
+            None,
+            options.cancel_check,
         )
-        return video.path, video.path
+        task_path = asset_cache.materialize_video(
+            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
+        )
+        return task_path, task_path
 
     if is_bilibili_url(options.input_value):
         _progress(options, "解析 Bilibili 链接并下载视频", 8)
         video = download_bilibili_video(
-            options.input_value, task_out_dir, options.force_download, timestamp
+            options.input_value,
+            asset_cache.videos_dir,
+            options.force_download,
+            None,
+            options.cancel_check,
         )
-        return video.path, video.path
+        task_path = asset_cache.materialize_video(
+            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
+        )
+        return task_path, task_path
 
     if is_url(options.input_value):
         raise SubtitleToolError(
@@ -352,17 +416,27 @@ def _resolve_input(
 
 
 def _load_source_segments(
-    options: PipelineOptions, input_path: Path
+    options: PipelineOptions, input_path: Path, asset_cache: AssetCache
 ) -> tuple[list[SubtitleSegment], str]:
+    video_fingerprint = asset_cache.file_fingerprint(input_path)
     if options.source in {"auto", "embedded"}:
+        cached_embedded_path = asset_cache.source_subtitle_path(
+            video_fingerprint, "embedded"
+        )
+        if cached_embedded_path.exists():
+            cached_segments = read_srt(cached_embedded_path)
+            if cached_segments:
+                _progress(options, "使用缓存的内置源字幕", 48)
+                return cached_segments, "embedded-cache"
         _progress(options, "检查视频内置字幕轨", 22)
-        streams = find_subtitle_streams(input_path)
+        streams = find_subtitle_streams(input_path, options.cancel_check)
         if streams:
             _progress(options, "发现内置字幕，正在导出", 30)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                extracted_path = Path(tmpdir) / "embedded.srt"
-                extract_first_subtitle(input_path, extracted_path)
-                segments = read_srt(extracted_path)
+            cached_embedded_path.parent.mkdir(parents=True, exist_ok=True)
+            extract_first_subtitle(
+                input_path, cached_embedded_path, options.cancel_check
+            )
+            segments = read_srt(cached_embedded_path)
             if segments:
                 _progress(options, "已使用内置字幕作为源字幕", 48)
                 return segments, "embedded"
@@ -372,20 +446,45 @@ def _load_source_segments(
             raise MediaError("No embedded subtitle stream found in the input video.")
 
     if options.source in {"auto", "audio"}:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = Path(tmpdir) / "audio.mp3"
+        audio_path = asset_cache.audio_path(video_fingerprint)
+        if audio_path.exists() and audio_path.stat().st_size > 0:
+            _progress(options, "使用缓存音频", 34)
+        else:
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
             _progress(options, "正在抽取音频", 28)
-            extract_audio(input_path, audio_path)
+            try:
+                extract_audio(input_path, audio_path, options.cancel_check)
+            except Exception:
+                audio_path.unlink(missing_ok=True)
+                raise
             _progress(options, "音频抽取完成，开始语音转写", 34)
-            if options.transcriber == "local-whisper":
-                segments = transcribe_with_whisper_cpp(
-                    audio_path, options.source_lang, options.whisper_model
-                )
-                _progress(options, "本地 Whisper 转写完成", 48)
-                return segments, "audio-local-whisper"
+        transcript_path = asset_cache.transcript_path(
+            video_fingerprint,
+            options.transcriber,
+            options.source_lang,
+            options.whisper_model,
+        )
+        if transcript_path.exists():
+            segments = read_srt(transcript_path)
+            if segments:
+                _progress(options, "使用缓存的语音转写字幕", 48)
+                return segments, f"audio-{options.transcriber}-cache"
+        if options.transcriber == "local-whisper":
+            segments = transcribe_with_whisper_cpp(
+                audio_path,
+                options.source_lang,
+                options.whisper_model,
+                options.cancel_check,
+            )
+            source_kind = "audio-local-whisper"
+            _progress(options, "本地 Whisper 转写完成", 48)
+        else:
             segments = transcribe_audio(audio_path, options.source_lang)
+            source_kind = "audio"
             _progress(options, "OpenAI 转写完成", 48)
-            return segments, "audio"
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        write_srt(transcript_path, segments)
+        return segments, source_kind
 
     raise MediaError("No usable subtitle source found. Try --source audio.")
 
@@ -412,6 +511,8 @@ def _is_same_language(source_lang: str | None, target_lang: str) -> bool:
 
 
 def _progress(options: PipelineOptions, message: str, percent: int) -> None:
+    if options.cancel_check and options.cancel_check():
+        raise CancellationError("Task was cancelled by user.")
     if options.progress_callback:
         options.progress_callback(message, max(0, min(100, percent)))
 
