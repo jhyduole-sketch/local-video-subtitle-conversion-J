@@ -27,6 +27,7 @@
 - 把中文视频转成日语、英语等字幕。
 - 批量生成不同目标语言的 `.srt` 文件。
 - 给 MP4 添加默认软字幕轨，方便在 IINA / VLC 等播放器里选择字幕。
+- 生成固定位置的硬字幕视频，避开原画面底部字幕。
 - 下载 TalkSmith、YouTube 或 Bilibili 视频后再生成字幕。
 
 ## 重要概念
@@ -39,15 +40,18 @@
 
 ### 硬字幕
 
-硬字幕是画面像素的一部分，播放器不能关闭，也不能直接提取成文本。本项目当前不会 OCR 画面上的硬字幕，也不会把字幕烧录进画面。
+硬字幕是画面像素的一部分，播放器不能关闭，也不能直接提取成文本。选择“稳定硬字幕”后，工具会使用 ASS 样式和 FFmpeg 把新字幕烧录进画面，因此需要重新编码视频。
 
-如果原视频里已经有一行硬字幕，新生成的软字幕可能会在播放器默认位置附近显示。页面里的“避免遮挡原字幕”目前只是记录意图；软字幕实际显示位置主要由播放器控制。
+如果原视频底部已经有硬字幕，推荐选择“稳定硬字幕”和“自动避让”或“原底部字幕上方”。软字幕实际显示位置主要由播放器控制，无法保证在每个播放器里都能避让。
+
+所有目标字幕写出前都会自动整理：按中英文显示宽度换行、尽量保持最多两行、长句按原时间段拆分，并修复相邻字幕时间重叠。字幕文字不会被截断。
 
 ## 环境要求
 
 - macOS
 - Python 3.9+
 - `ffmpeg` / `ffprobe`
+- `ffmpeg-full`，仅固定位置硬字幕模式需要；它提供 `libass` 过滤器
 - `yt-dlp`，处理 YouTube / Bilibili 链接时需要
 - `whisper.cpp`，本地语音识别时需要
 - whisper.cpp GGML 模型文件，例如 `models/ggml-base.bin`
@@ -57,9 +61,12 @@
 
 ```bash
 brew install ffmpeg
+brew install ffmpeg-full
 brew install whisper-cpp
 brew install yt-dlp
 ```
+
+`ffmpeg-full` 是 keg-only，无需替换系统中的普通 `ffmpeg`。本工具会自动使用 `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` 处理硬字幕。
 
 安装 Python 依赖：
 
@@ -141,6 +148,8 @@ Web 页面支持：
 - 选择语音转写：本地 Whisper 或 OpenAI。
 - 选择本地 Whisper 模型大小：`base`、`small`、`medium` 或自定义模型路径。
 - 选择字幕翻译：z.ai、本地快速模型、本地多语言 NLLB、OpenAI。
+- 选择字幕视频模式：软字幕保持原画质，稳定硬字幕固定显示位置。
+- 选择新字幕位置：自动避让、原底部字幕上方、画面底部或画面顶部。
 - 任务运行时显示进度、日志、已用时。
 - 任务运行时可点击“停止任务”。
 - 查看历史任务，并继续失败、取消或因服务重启而中断的任务。
@@ -298,7 +307,33 @@ input
 --embed-subtitles
 ```
 
-输出带默认软字幕轨的 MP4。
+输出字幕视频，默认生成带可开关软字幕轨的 MP4。
+
+```text
+--subtitle-video-mode soft|hard
+```
+
+- `soft`：复制原视频和音频流，速度快、不改变视频清晰度，但字幕位置由播放器控制。
+- `hard`：将字幕烧录进画面，位置稳定，需要重新编码视频。
+
+```text
+--subtitle-position auto|bottom|above-bottom|top
+```
+
+硬字幕位置。`auto` 在启用 `--avoid-subtitle-overlap` 时自动使用 `above-bottom`。
+
+在原底部字幕上方生成稳定英文字幕视频：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
+  --source-lang ja \
+  --target-lang en \
+  --translator z-ai \
+  --embed-subtitles \
+  --avoid-subtitle-overlap \
+  --subtitle-video-mode hard \
+  --subtitle-position above-bottom
+```
 
 ```text
 --download-only
@@ -432,6 +467,7 @@ output/<video-name>.<YYYYMMDDHHMMSSX>/
 <video-name>.<YYYYMMDDHHMMSSX>.source.<source-lang>.srt
 <video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.srt
 <video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.default-sub.mp4
+<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.fixed-sub.mp4
 ```
 
 示例：
@@ -470,6 +506,8 @@ ffprobe -v error -select_streams s -show_entries stream=index,codec_name:stream_
 
 如果能看到 `mov_text` 字幕流，说明软字幕轨已经写入。
 
+`*.fixed-sub.mp4` 的字幕已经成为画面的一部分，不会显示为独立字幕流；直接用 QuickTime、IINA 或 VLC 播放即可验证位置。
+
 ## 常见问题
 
 ### 为什么视频变模糊？
@@ -501,8 +539,9 @@ ZAI_RATE_LIMIT_RETRY_SECONDS
 
 ## 当前限制
 
-- 当前只输出 `.srt` 和软字幕 MP4，不做硬字幕烧录。
+- 硬字幕模式需要重新编码，处理速度慢于软字幕模式，输出文件大小也可能变化。
 - 不做视频画面 OCR，无法直接读取硬字幕文字。
+- 自动避让默认假设原画面字幕位于底部；顶部字幕需要手动选择新字幕位置。
 - 本地中/日/英翻译模型语言方向有限，质量是粗翻级别。
 - 本地 Whisper `base` 模型识别质量有限，必要时可换更大的 whisper.cpp 模型。
 - YouTube / Bilibili 部分视频可能限制匿名下载，仍可能需要用户自行下载。

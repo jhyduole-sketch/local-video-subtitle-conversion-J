@@ -12,10 +12,17 @@ from .errors import CancellationError, MediaError, SubtitleToolError
 from .asset_cache import AssetCache
 from .local_translate import normalize_lang, translate_segments_locally, translate_segments_with_nllb
 from .local_whisper import transcribe_with_whisper_cpp
-from .media import extract_audio, extract_first_subtitle, find_subtitle_streams, mux_subtitle_track
+from .media import (
+    burn_subtitle_track,
+    extract_audio,
+    extract_first_subtitle,
+    find_subtitle_streams,
+    mux_subtitle_track,
+)
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .process_control import CancelCheck
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
+from .subtitle_layout import layout_subtitles, write_ass
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
 from .translation_cache import TranslationCache
 from .youtube import (
@@ -46,6 +53,8 @@ class PipelineOptions:
     translator: str = "openai"
     embed_subtitles: bool = False
     avoid_subtitle_overlap: bool = False
+    subtitle_video_mode: str = "soft"
+    subtitle_position: str = "auto"
     progress_callback: ProgressCallback | None = None
     cancel_check: CancelCheck | None = None
 
@@ -72,6 +81,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     if options.translator not in {"openai", "z-ai", "local-transformer", "local-nllb"}:
         raise SubtitleToolError(
             "--translator must be one of: openai, z-ai, local-transformer, local-nllb."
+        )
+    if options.subtitle_video_mode not in {"soft", "hard"}:
+        raise SubtitleToolError("--subtitle-video-mode must be one of: soft, hard.")
+    if options.subtitle_position not in {"auto", "bottom", "above-bottom", "top"}:
+        raise SubtitleToolError(
+            "--subtitle-position must be one of: auto, bottom, above-bottom, top."
         )
 
     timestamp = _timestamp_suffix()
@@ -191,33 +206,59 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                         )
                 translation_engines[target_lang] = engine
                 _progress(options, f"翻译完成: {target_lang}", translated_percent)
-                translated = replace_text(source_segments, translations)
+                translated = layout_subtitles(
+                    replace_text(source_segments, translations)
+                )
                 output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.srt"
                 write_srt(output_path, translated)
                 translated_paths[target_lang] = output_path
                 _progress(options, f"字幕文件已输出: {output_path.name}", output_percent)
                 if mux_executor:
-                    if options.avoid_subtitle_overlap:
+                    subtitle_position = _resolved_subtitle_position(options)
+                    if options.subtitle_video_mode == "soft":
+                        if options.avoid_subtitle_overlap:
+                            _progress(
+                                options,
+                                "软字幕位置由播放器控制；需要固定避让请改用稳定硬字幕视频",
+                                min(output_percent + 1, 95),
+                            )
+                        video_output_path = task_out_dir / (
+                            f"{output_stem}.{timestamp}.{target_lang}.default-sub.mp4"
+                        )
                         _progress(
                             options,
-                            "已选择避免遮挡原字幕；当前 MP4 软字幕位置仍由播放器控制",
+                            f"后台合成软字幕视频: {target_lang}",
                             min(output_percent + 1, 95),
                         )
-                    video_output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.default-sub.mp4"
-                    _progress(
-                        options,
-                        f"后台合成软字幕视频: {target_lang}",
-                        min(output_percent + 1, 95),
-                    )
-                    future = mux_executor.submit(
-                        mux_subtitle_track,
-                        input_path,
-                        output_path,
-                        video_output_path,
-                        _mp4_language_code(target_lang),
-                        target_lang,
-                        options.cancel_check,
-                    )
+                        future = mux_executor.submit(
+                            mux_subtitle_track,
+                            input_path,
+                            output_path,
+                            video_output_path,
+                            _mp4_language_code(target_lang),
+                            target_lang,
+                            options.cancel_check,
+                        )
+                    else:
+                        ass_path = task_out_dir / (
+                            f"{output_stem}.{timestamp}.{target_lang}.ass"
+                        )
+                        write_ass(ass_path, translated, subtitle_position)
+                        video_output_path = task_out_dir / (
+                            f"{output_stem}.{timestamp}.{target_lang}.fixed-sub.mp4"
+                        )
+                        _progress(
+                            options,
+                            f"后台烧录固定位置字幕: {target_lang} · {subtitle_position}",
+                            min(output_percent + 1, 95),
+                        )
+                        future = mux_executor.submit(
+                            burn_subtitle_track,
+                            input_path,
+                            ass_path,
+                            video_output_path,
+                            options.cancel_check,
+                        )
                     mux_jobs[target_lang] = (
                         future,
                         video_output_path,
@@ -238,7 +279,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             subtitled_video_paths[target_lang] = video_output_path
             _progress(
                 options,
-                f"软字幕视频已输出: {video_output_path.name}",
+                f"字幕视频已输出: {video_output_path.name}",
                 output_percent,
             )
         except Exception as exc:
@@ -261,6 +302,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         downloaded_video_path=downloaded_video_path,
         subtitled_video_paths=subtitled_video_paths,
     )
+
+
+def _resolved_subtitle_position(options: PipelineOptions) -> str:
+    if options.subtitle_position != "auto":
+        return options.subtitle_position
+    return "above-bottom" if options.avoid_subtitle_overlap else "bottom"
 
 
 def _translate_target(

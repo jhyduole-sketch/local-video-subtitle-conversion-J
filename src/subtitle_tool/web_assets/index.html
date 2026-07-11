@@ -118,8 +118,28 @@
             <input id="whisperModel" name="whisperModel" value="models/ggml-base.bin" />
           </div>
 
+          <div class="field">
+            <label for="subtitleVideoMode">字幕视频模式</label>
+            <select id="subtitleVideoMode" name="subtitleVideoMode">
+              <option value="soft">软字幕（保持原画质）</option>
+              <option value="hard">稳定硬字幕（固定位置）</option>
+            </select>
+            <p id="subtitleVideoModeHint" class="field-hint">软字幕可开关，但具体位置由播放器控制。</p>
+          </div>
+
+          <div class="field">
+            <label for="subtitlePosition">新字幕位置</label>
+            <select id="subtitlePosition" name="subtitlePosition">
+              <option value="auto">自动避让</option>
+              <option value="above-bottom">原底部字幕上方</option>
+              <option value="bottom">画面底部</option>
+              <option value="top">画面顶部</option>
+            </select>
+            <p class="field-hint">固定位置仅在稳定硬字幕模式中保证生效。</p>
+          </div>
+
           <div class="toggles span-all">
-            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出软字幕视频</label>
+            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
             <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 避免遮挡原字幕</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
             <label><input id="downloadOnly" name="downloadOnly" type="checkbox" /> 只下载</label>

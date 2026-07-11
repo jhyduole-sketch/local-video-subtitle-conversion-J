@@ -136,6 +136,22 @@ class WebTests(unittest.TestCase):
         self.assertEqual(options.translator, "z-ai")
         self.assertTrue(options.embed_subtitles)
         self.assertTrue(options.avoid_subtitle_overlap)
+        self.assertEqual(options.subtitle_video_mode, "soft")
+        self.assertEqual(options.subtitle_position, "auto")
+
+    def test_options_from_payload_accepts_hard_subtitle_layout(self):
+        options = options_from_payload(
+            {
+                "input": "input.mp4",
+                "targetLangs": ["en"],
+                "embedSubtitles": True,
+                "subtitleVideoMode": "hard",
+                "subtitlePosition": "above-bottom",
+            }
+        )
+
+        self.assertEqual(options.subtitle_video_mode, "hard")
+        self.assertEqual(options.subtitle_position, "above-bottom")
 
     def test_options_from_payload_accepts_comma_targets(self):
         options = options_from_payload(
@@ -156,6 +172,20 @@ class WebTests(unittest.TestCase):
 
         self.assertIn("checks", health)
         self.assertTrue(health["checks"])
+
+    def test_collect_health_reports_fixed_subtitle_ffmpeg(self):
+        with patch(
+            "subtitle_tool.web.ass_ffmpeg_binary",
+            return_value="/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        ):
+            health = collect_health(Path.cwd())
+
+        matching = [
+            check for check in health["checks"] if check["name"] == "固定位置硬字幕"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertTrue(matching[0]["ok"])
+        self.assertIn("ffmpeg-full", matching[0]["detail"])
 
     def test_collect_health_includes_local_translation_models(self):
         statuses = [

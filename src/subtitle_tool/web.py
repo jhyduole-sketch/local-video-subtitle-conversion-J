@@ -24,6 +24,7 @@ from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError
 from .local_translate import local_translation_model_statuses, nllb_model_status
 from .job_store import JobStore
+from .media import ass_ffmpeg_binary
 from .pipeline import PipelineOptions, PipelineResult, run_pipeline
 
 
@@ -113,6 +114,8 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         translator=str(payload.get("translator") or "z-ai"),
         embed_subtitles=bool(payload.get("embedSubtitles")),
         avoid_subtitle_overlap=bool(payload.get("avoidSubtitleOverlap")),
+        subtitle_video_mode=str(payload.get("subtitleVideoMode") or "soft"),
+        subtitle_position=str(payload.get("subtitlePosition") or "auto"),
     )
 
 
@@ -121,6 +124,7 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
     checks = [
         _tool_check("ffmpeg"),
         _tool_check("ffprobe"),
+        _ass_ffmpeg_check(),
         _tool_check("yt-dlp"),
         _tool_check("whisper-cli"),
         _whisper_models_check(root),
@@ -139,6 +143,24 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
     return {
         "checks": checks,
         "ok": all(check["ok"] for check in checks if not check.get("optional")),
+    }
+
+
+def _ass_ffmpeg_check() -> dict[str, object]:
+    try:
+        binary = ass_ffmpeg_binary()
+    except SubtitleToolError:
+        return {
+            "name": "固定位置硬字幕",
+            "ok": False,
+            "optional": True,
+            "detail": "未安装；运行 brew install ffmpeg-full",
+        }
+    return {
+        "name": "固定位置硬字幕",
+        "ok": True,
+        "optional": True,
+        "detail": binary,
     }
 
 

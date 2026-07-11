@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from subtitle_tool.pipeline import PipelineOptions, run_pipeline  # noqa: E402
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
-from subtitle_tool.srt import SubtitleSegment  # noqa: E402
+from subtitle_tool.srt import SubtitleSegment, read_srt  # noqa: E402
 
 
 class PipelineTests(unittest.TestCase):
@@ -301,6 +301,90 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(mux.call_count, 2)
         self.assertEqual(mux_observed_overlap, [True])
         self.assertEqual(set(result.subtitled_video_paths), {"ja", "fr"})
+
+    def test_translated_srt_is_wrapped_and_timing_overlap_is_repaired(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=3000, text="first"),
+                SubtitleSegment(index=2, start_ms=2500, end_ms=5000, text="second"),
+            ]
+            translations = {
+                1: "This translated subtitle is deliberately long enough to wrap across lines",
+                2: "Another translated subtitle",
+            }
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments",
+                return_value=translations,
+            ):
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["en"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="openai",
+                    )
+                )
+                rendered = read_srt(result.translated_paths["en"])
+
+        self.assertTrue(all(len(segment.text.splitlines()) <= 2 for segment in rendered))
+        self.assertTrue(
+            all(
+                previous.end_ms + 40 <= current.start_ms
+                for previous, current in zip(rendered, rendered[1:])
+            )
+        )
+
+    def test_hard_subtitle_mode_writes_ass_and_burns_video(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
+            ]
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments",
+                return_value={1: "Hello"},
+            ), patch(
+                "subtitle_tool.pipeline.write_ass"
+            ) as write_ass, patch(
+                "subtitle_tool.pipeline.burn_subtitle_track"
+            ) as burn, patch(
+                "subtitle_tool.pipeline.mux_subtitle_track"
+            ) as mux:
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["en"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="openai",
+                        embed_subtitles=True,
+                        avoid_subtitle_overlap=True,
+                        subtitle_video_mode="hard",
+                        subtitle_position="auto",
+                    )
+                )
+
+        write_ass.assert_called_once()
+        self.assertEqual(write_ass.call_args.args[2], "above-bottom")
+        burn.assert_called_once()
+        mux.assert_not_called()
+        self.assertRegex(result.subtitled_video_paths["en"].name, r"\.en\.fixed-sub\.mp4$")
 
     def test_second_audio_run_reuses_extracted_audio_and_transcript(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -81,6 +81,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Mark that generated subtitles should avoid original hard subtitles where the output mode supports positioning.",
     )
+    parser.add_argument(
+        "--subtitle-video-mode",
+        choices=["soft", "hard"],
+        default="soft",
+        help="Use soft to preserve the video stream, or hard for stable subtitle positioning.",
+    )
+    parser.add_argument(
+        "--subtitle-position",
+        choices=["auto", "bottom", "above-bottom", "top"],
+        default="auto",
+        help="Subtitle position for hard-subtitle videos. Auto avoids bottom hard subtitles when requested.",
+    )
     return parser
 
 
@@ -105,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
         translator=args.translator,
         embed_subtitles=args.embed_subtitles,
         avoid_subtitle_overlap=args.avoid_subtitle_overlap,
+        subtitle_video_mode=args.subtitle_video_mode,
+        subtitle_position=args.subtitle_position,
     )
 
     try:
@@ -120,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     for language, path in result.translated_paths.items():
         print(f"Translated subtitles [{language}]: {path}")
     for language, path in (result.subtitled_video_paths or {}).items():
-        print(f"Soft-subtitle video [{language}]: {path}")
+        print(f"Subtitle video [{language}]: {path}")
     for language, message in result.failed_languages.items():
         print(f"Translation failed [{language}]: {message}", file=sys.stderr)
     return 0 if not result.failed_languages else 2

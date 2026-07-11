@@ -28,6 +28,9 @@ const cacheList = document.querySelector("#cacheList");
 const refreshCacheButton = document.querySelector("#refreshCacheButton");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
+const subtitleVideoMode = document.querySelector("#subtitleVideoMode");
+const subtitlePosition = document.querySelector("#subtitlePosition");
+const subtitleVideoModeHint = document.querySelector("#subtitleVideoModeHint");
 const whisperModelPaths = {
   base: "models/ggml-base.bin",
   small: "models/ggml-small.bin",
@@ -143,12 +146,20 @@ whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
 refreshCacheButton.addEventListener("click", loadCache);
 refreshHistoryButton.addEventListener("click", loadHistory);
+subtitleVideoMode.addEventListener("change", updateSubtitleVideoModeHint);
 
 loadHealth();
 loadCache();
 loadHistory();
 renderLanguagePicker();
 syncWhisperPreset();
+updateSubtitleVideoModeHint();
+
+function updateSubtitleVideoModeHint() {
+  subtitleVideoModeHint.textContent = subtitleVideoMode.value === "hard"
+    ? "固定位置并在各播放器一致显示；需要重新编码视频，处理时间更长。"
+    : "软字幕可开关并保持原视频流，但具体位置由播放器控制。";
+}
 
 async function loadHealth() {
   healthSummary.textContent = "检查中";
@@ -255,6 +266,8 @@ function formPayload() {
     whisperModel: String(data.get("whisperModel") || "").trim(),
     embedSubtitles: Boolean(data.get("embedSubtitles")),
     avoidSubtitleOverlap: Boolean(data.get("avoidSubtitleOverlap")),
+    subtitleVideoMode: String(data.get("subtitleVideoMode") || "soft"),
+    subtitlePosition: String(data.get("subtitlePosition") || "auto"),
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
@@ -458,7 +471,8 @@ function renderResults(result) {
   });
   Object.entries(result.subtitledVideoPaths || {}).forEach(([lang, path]) => {
     const engine = result.translationEngines?.[lang];
-    items.push([`软字幕视频 ${lang}${engine ? ` · ${engine}` : ""}`, path]);
+    const videoKind = path.endsWith(".fixed-sub.mp4") ? "稳定硬字幕视频" : "软字幕视频";
+    items.push([`${videoKind} ${lang}${engine ? ` · ${engine}` : ""}`, path]);
   });
   Object.entries(result.failedLanguages || {}).forEach(([lang, message]) => {
     items.push([`失败 ${lang}`, message]);

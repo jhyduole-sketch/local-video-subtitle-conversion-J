@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -25,6 +27,43 @@ def ensure_ffmpeg() -> None:
         raise DependencyError(
             f"Missing required video tools: {joined}. Install ffmpeg first, for example: brew install ffmpeg"
         )
+
+
+def ass_ffmpeg_binary() -> str:
+    for binary in _candidate_ffmpeg_binaries():
+        if _ffmpeg_has_filter(binary, "ass"):
+            return binary
+    raise DependencyError(
+        "Stable hard subtitles require an FFmpeg build with the libass filter. "
+        "Install it with: brew install ffmpeg-full. The tool will automatically "
+        "use /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg after installation."
+    )
+
+
+def _candidate_ffmpeg_binaries() -> list[str]:
+    values = [
+        os.environ.get("FFMPEG_FULL_BIN", "").strip(),
+        "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        "/usr/local/opt/ffmpeg-full/bin/ffmpeg",
+        shutil.which("ffmpeg") or "",
+    ]
+    candidates: list[str] = []
+    for value in values:
+        if value and value not in candidates and Path(value).is_file():
+            candidates.append(value)
+    return candidates
+
+
+def _ffmpeg_has_filter(binary: str, filter_name: str) -> bool:
+    completed = subprocess.run(
+        [binary, "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    pattern = rf"^\s*[TSC\.]+\s+{re.escape(filter_name)}\s"
+    return completed.returncode == 0 and re.search(pattern, output, re.MULTILINE) is not None
 
 
 def _run(
@@ -166,3 +205,53 @@ def mux_subtitle_track(
         cancel_check,
     )
     return output_path
+
+
+def burn_subtitle_track(
+    video_path: Path,
+    ass_path: Path,
+    output_path: Path,
+    cancel_check: CancelCheck | None = None,
+) -> Path:
+    ffmpeg_binary = ass_ffmpeg_binary()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ass_filter_path = _escape_filter_path(ass_path)
+    _run(
+        [
+            ffmpeg_binary,
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"ass=filename='{ass_filter_path}'",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "18",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        cancel_check,
+    )
+    return output_path
+
+
+def _escape_filter_path(path: Path) -> str:
+    return (
+        str(path)
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
