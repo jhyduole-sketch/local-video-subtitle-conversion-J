@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from .srt import SubtitleSegment
 
 
 NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE = 8
 
 NLLB_LANG_CODES = {
     "zh": "zho_Hans",
@@ -101,14 +103,17 @@ def translate_segments_locally(
     translations: dict[int, str] = {}
     model.eval()
     with torch.no_grad():
-        for segment in segments:
-            text = segment.text.replace("\n", " ").strip()
-            prompt = f"{prompt_prefix}{text}"
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256)
-            outputs = model.generate(**inputs, max_new_tokens=128, num_beams=4)
-            translated = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-            _validate_local_translation(segment, translated, target)
-            translations[segment.index] = translated or text
+        translations.update(
+            _translate_batches(
+                segments,
+                tokenizer,
+                model,
+                torch,
+                target,
+                lambda text: f"{prompt_prefix}{text}",
+                {"max_new_tokens": 128, "num_beams": 4},
+            )
+        )
     return translations
 
 
@@ -130,19 +135,100 @@ def translate_segments_with_nllb(
     if forced_bos_token_id is None or forced_bos_token_id < 0:
         raise SubtitleToolError(f"NLLB target language is not available: {target}.")
     with torch.no_grad():
-        for segment in segments:
-            text = segment.text.replace("\n", " ").strip()
-            inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
-            outputs = model.generate(
-                **inputs,
-                forced_bos_token_id=forced_bos_token_id,
-                max_new_tokens=160,
-                num_beams=4,
+        translations.update(
+            _translate_batches(
+                segments,
+                tokenizer,
+                model,
+                torch,
+                target,
+                lambda text: text,
+                {
+                    "forced_bos_token_id": forced_bos_token_id,
+                    "max_new_tokens": 160,
+                    "num_beams": 4,
+                },
             )
-            translated = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-            _validate_local_translation(segment, translated, target)
-            translations[segment.index] = translated or text
+        )
     return translations
+
+
+def _translate_batches(
+    segments: list[SubtitleSegment],
+    tokenizer: Any,
+    model: Any,
+    torch: Any,
+    target_lang: str,
+    prompt_builder: Any,
+    generation_options: dict[str, Any],
+) -> dict[int, str]:
+    translations: dict[int, str] = {}
+    batch_size = _local_translation_batch_size()
+    for offset in range(0, len(segments), batch_size):
+        batch = segments[offset : offset + batch_size]
+        source_texts = [segment.text.replace("\n", " ").strip() for segment in batch]
+        prompts = [prompt_builder(text) for text in source_texts]
+        inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=256,
+        )
+        outputs = _generate_local_batch(
+            model, inputs, torch, generation_options
+        )
+        translated_texts = tokenizer.batch_decode(
+            outputs, skip_special_tokens=True
+        )
+        if len(translated_texts) != len(batch):
+            raise SubtitleToolError(
+                "Local translation returned an unexpected number of subtitles."
+            )
+        for segment, source_text, translated in zip(
+            batch, source_texts, translated_texts
+        ):
+            translated = translated.strip()
+            _validate_local_translation(segment, translated, target_lang)
+            translations[segment.index] = translated or source_text
+    return translations
+
+
+def _generate_local_batch(
+    model: Any,
+    inputs: dict[str, Any],
+    torch: Any,
+    generation_options: dict[str, Any],
+) -> Any:
+    requested_device = os.environ.get("LOCAL_TRANSLATION_DEVICE", "cpu").strip().lower()
+    if requested_device != "mps":
+        return model.generate(**inputs, **generation_options)
+
+    mps_available = bool(
+        getattr(getattr(torch, "backends", None), "mps", None)
+        and torch.backends.mps.is_available()
+    )
+    if not mps_available:
+        return model.generate(**inputs, **generation_options)
+
+    try:
+        model.to("mps")
+        device_inputs = {
+            name: value.to("mps") if hasattr(value, "to") else value
+            for name, value in inputs.items()
+        }
+        return model.generate(**device_inputs, **generation_options)
+    except Exception:
+        model.to("cpu")
+        return model.generate(**inputs, **generation_options)
+
+
+def _local_translation_batch_size() -> int:
+    value = os.environ.get("LOCAL_TRANSLATION_BATCH_SIZE", "").strip()
+    try:
+        return max(1, int(value)) if value else DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE
+    except ValueError:
+        return DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE
 
 
 def normalize_lang(value: str | None) -> str:
@@ -242,6 +328,16 @@ def _validate_local_translation(
     if not text:
         raise SubtitleToolError(
             f"Local translation produced empty text at subtitle index {segment.index}."
+        )
+
+    invalid_control = any(
+        ord(character) < 32 and character not in {"\n", "\r", "\t"}
+        for character in text
+    )
+    if "\ufffd" in text or invalid_control:
+        raise SubtitleToolError(
+            "Local translation output contains invalid characters at subtitle index "
+            f"{segment.index}. Try OpenAI or improve the local model."
         )
 
     source_text = segment.text.replace("\n", " ").strip()

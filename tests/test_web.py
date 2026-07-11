@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from subtitle_tool.pipeline import PipelineResult  # noqa: E402
 from subtitle_tool.web import (  # noqa: E402
     JOBS,
     JOB_LOCK,
@@ -14,11 +15,25 @@ from subtitle_tool.web import (  # noqa: E402
     collect_health,
     options_from_payload,
     request_job_cancel,
+    result_to_dict,
     safe_upload_filename,
 )
 
 
 class WebTests(unittest.TestCase):
+    def test_result_payload_includes_translation_engines(self):
+        result = PipelineResult(
+            source_subtitle_path=Path("/tmp/source.srt"),
+            translated_paths={"ja": Path("/tmp/ja.srt")},
+            failed_languages={},
+            source_kind="audio-local-whisper",
+            translation_engines={"ja": "本地模型"},
+        )
+
+        payload = result_to_dict(result)
+
+        self.assertEqual(payload["translationEngines"], {"ja": "本地模型"})
+
     def test_options_from_payload_uses_local_defaults(self):
         options = options_from_payload(
             {

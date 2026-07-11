@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,13 +10,21 @@ import re
 from typing import Callable
 
 from .errors import CancellationError, MediaError, SubtitleToolError
-from .local_translate import translate_segments_locally, translate_segments_with_nllb
+from .local_translate import normalize_lang, translate_segments_locally, translate_segments_with_nllb
 from .local_whisper import transcribe_with_whisper_cpp
 from .media import extract_audio, extract_first_subtitle, find_subtitle_streams, mux_subtitle_track
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
-from .youtube import download_youtube_video, extract_youtube_id, is_youtube_url
+from .translation_cache import TranslationCache
+from .youtube import (
+    download_bilibili_video,
+    download_youtube_video,
+    extract_bilibili_id,
+    extract_youtube_id,
+    is_bilibili_url,
+    is_youtube_url,
+)
 
 
 ProgressCallback = Callable[[str, int], None]
@@ -45,6 +54,7 @@ class PipelineResult:
     translated_paths: dict[str, Path]
     failed_languages: dict[str, str]
     source_kind: str
+    translation_engines: dict[str, str] | None = None
     downloaded_video_path: Path | None = None
     subtitled_video_paths: dict[str, Path] | None = None
 
@@ -64,7 +74,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
 
     timestamp = _timestamp_suffix()
     output_stem = _base_output_stem(_input_output_stem(options.input_value), timestamp)
-    task_out_dir = options.out_dir / output_stem
+    task_out_dir = options.out_dir / f"{output_stem}.{timestamp}"
     task_out_dir.mkdir(parents=True, exist_ok=True)
     _progress(options, "准备输入视频", 5)
     input_path, downloaded_video_path = _resolve_input(options, task_out_dir, timestamp)
@@ -91,65 +101,114 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     translated_paths: dict[str, Path] = {}
     subtitled_video_paths: dict[str, Path] = {}
     failed_languages: dict[str, str] = {}
+    translation_engines: dict[str, str] = {}
+    translation_cache = TranslationCache(
+        options.out_dir / ".subtitle-tool-cache" / "translations"
+    )
+    mux_executor = ThreadPoolExecutor(max_workers=1) if options.embed_subtitles else None
+    mux_jobs: dict[str, tuple[Future[Path], Path, int]] = {}
     total_targets = max(len(options.target_langs), 1)
-    for target_index, target_lang in enumerate(options.target_langs, start=1):
-        try:
-            base_percent = 56 + round((target_index - 1) * 36 / total_targets)
-            translated_percent = 56 + round((target_index - 0.45) * 36 / total_targets)
-            output_percent = 56 + round(target_index * 36 / total_targets)
-            _progress(options, f"开始翻译: {target_lang}", base_percent)
-            if options.translator == "local-transformer":
-                translations = translate_segments_locally(
-                    source_segments, options.source_lang, target_lang
-                )
-            elif options.translator == "local-nllb":
-                translations = translate_segments_with_nllb(
-                    source_segments, options.source_lang, target_lang
-                )
-            elif options.translator == "z-ai":
-                translations = translate_segments_with_zai(
-                    source_segments,
-                    target_lang=target_lang,
-                    source_lang=options.source_lang,
-                    progress_callback=lambda message: _progress(
-                        options, message, min(translated_percent - 1, base_percent + 1)
-                    ),
-                )
-            else:
-                translations = translate_segments(
-                    source_segments,
-                    target_lang=target_lang,
-                    source_lang=options.source_lang,
-                )
-            _progress(options, f"翻译完成: {target_lang}", translated_percent)
-            translated = replace_text(source_segments, translations)
-            output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.srt"
-            write_srt(output_path, translated)
-            translated_paths[target_lang] = output_path
-            _progress(options, f"字幕文件已输出: {output_path.name}", output_percent)
-            if options.embed_subtitles:
-                if options.avoid_subtitle_overlap:
+    try:
+        for target_index, target_lang in enumerate(options.target_langs, start=1):
+            try:
+                base_percent = 56 + round((target_index - 1) * 36 / total_targets)
+                translated_percent = 56 + round((target_index - 0.45) * 36 / total_targets)
+                output_percent = 56 + round(target_index * 36 / total_targets)
+                _progress(options, f"开始翻译: {target_lang}", base_percent)
+                if _is_same_language(options.source_lang, target_lang):
                     _progress(
                         options,
-                        "已选择避免遮挡原字幕；当前 MP4 软字幕位置仍由播放器控制",
+                        f"目标语言 {target_lang} 与原视频语言一致，直接输出源字幕",
+                        translated_percent,
+                    )
+                    translations = {
+                        segment.index: segment.text for segment in source_segments
+                    }
+                    engine = "源字幕直出"
+                else:
+                    cached = translation_cache.load(
+                        source_segments,
+                        options.source_lang,
+                        target_lang,
+                        options.translator,
+                    )
+                    if cached:
+                        translations = cached.translations
+                        engine = f"{cached.engine}（缓存）"
+                        _progress(
+                            options,
+                            f"使用翻译缓存: {target_lang} · {cached.engine}",
+                            min(translated_percent - 1, base_percent + 1),
+                        )
+                    else:
+                        translations, engine = _translate_target(
+                            options,
+                            source_segments,
+                            target_lang,
+                            min(translated_percent - 1, base_percent + 1),
+                        )
+                        translation_cache.store(
+                            source_segments,
+                            options.source_lang,
+                            target_lang,
+                            options.translator,
+                            translations,
+                            engine,
+                        )
+                translation_engines[target_lang] = engine
+                _progress(options, f"翻译完成: {target_lang}", translated_percent)
+                translated = replace_text(source_segments, translations)
+                output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.srt"
+                write_srt(output_path, translated)
+                translated_paths[target_lang] = output_path
+                _progress(options, f"字幕文件已输出: {output_path.name}", output_percent)
+                if mux_executor:
+                    if options.avoid_subtitle_overlap:
+                        _progress(
+                            options,
+                            "已选择避免遮挡原字幕；当前 MP4 软字幕位置仍由播放器控制",
+                            min(output_percent + 1, 95),
+                        )
+                    video_output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.default-sub.mp4"
+                    _progress(
+                        options,
+                        f"后台合成软字幕视频: {target_lang}",
                         min(output_percent + 1, 95),
                     )
-                video_output_path = task_out_dir / f"{output_stem}.{timestamp}.{target_lang}.default-sub.mp4"
-                _progress(options, f"开始合成软字幕视频: {target_lang}", min(output_percent + 1, 95))
-                mux_subtitle_track(
-                    input_path,
-                    output_path,
-                    video_output_path,
-                    _mp4_language_code(target_lang),
-                    target_lang,
-                )
-                subtitled_video_paths[target_lang] = video_output_path
-                _progress(options, f"软字幕视频已输出: {video_output_path.name}", min(output_percent + 3, 96))
-        except CancellationError:
-            raise
+                    future = mux_executor.submit(
+                        mux_subtitle_track,
+                        input_path,
+                        output_path,
+                        video_output_path,
+                        _mp4_language_code(target_lang),
+                        target_lang,
+                    )
+                    mux_jobs[target_lang] = (
+                        future,
+                        video_output_path,
+                        min(output_percent + 3, 96),
+                    )
+            except CancellationError:
+                raise
+            except Exception as exc:
+                failed_languages[target_lang] = str(exc)
+                _progress(options, f"翻译失败: {target_lang}: {exc}", 92)
+    finally:
+        if mux_executor:
+            mux_executor.shutdown(wait=True)
+
+    for target_lang, (future, video_output_path, output_percent) in mux_jobs.items():
+        try:
+            future.result()
+            subtitled_video_paths[target_lang] = video_output_path
+            _progress(
+                options,
+                f"软字幕视频已输出: {video_output_path.name}",
+                output_percent,
+            )
         except Exception as exc:
-            failed_languages[target_lang] = str(exc)
-            _progress(options, f"翻译失败: {target_lang}: {exc}", 92)
+            failed_languages[f"video:{target_lang}"] = str(exc)
+            _progress(options, f"视频封装失败: {target_lang}: {exc}", 96)
 
     if not translated_paths and failed_languages:
         details = "; ".join(
@@ -163,8 +222,96 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         translated_paths=translated_paths,
         failed_languages=failed_languages,
         source_kind=source_kind,
+        translation_engines=translation_engines,
         downloaded_video_path=downloaded_video_path,
         subtitled_video_paths=subtitled_video_paths,
+    )
+
+
+def _translate_target(
+    options: PipelineOptions,
+    source_segments: list[SubtitleSegment],
+    target_lang: str,
+    progress_percent: int,
+) -> tuple[dict[int, str], str]:
+    if options.translator == "local-transformer":
+        return (
+            translate_segments_locally(
+                source_segments, options.source_lang, target_lang
+            ),
+            "本地快速模型",
+        )
+    if options.translator == "local-nllb":
+        return (
+            translate_segments_with_nllb(
+                source_segments, options.source_lang, target_lang
+            ),
+            "本地 NLLB",
+        )
+    if options.translator == "openai":
+        return (
+            translate_segments(
+                source_segments,
+                target_lang=target_lang,
+                source_lang=options.source_lang,
+            ),
+            "OpenAI",
+        )
+
+    try:
+        return (
+            translate_segments_with_zai(
+                source_segments,
+                target_lang=target_lang,
+                source_lang=options.source_lang,
+                progress_callback=lambda message: _progress(
+                    options, message, progress_percent
+                ),
+            ),
+            "z.ai",
+        )
+    except Exception as zai_error:
+        _progress(
+            options,
+            f"z.ai 翻译未完成，已自动切换本地模型: {zai_error}",
+            progress_percent,
+        )
+
+    local_errors: list[str] = []
+    try:
+        translations = translate_segments_locally(
+            source_segments, options.source_lang, target_lang
+        )
+        return translations, "本地模型"
+    except Exception as local_error:
+        local_errors.append(str(local_error))
+        _progress(
+            options,
+            f"本地快速模型未完成，尝试本地 NLLB: {local_error}",
+            progress_percent,
+        )
+
+    try:
+        translations = translate_segments_with_nllb(
+            source_segments, options.source_lang, target_lang
+        )
+        return translations, "本地模型"
+    except Exception as nllb_error:
+        local_errors.append(str(nllb_error))
+
+    _progress(
+        options,
+        "本地翻译未通过质量检查或不可用，已自动切换 OpenAI: "
+        + " | ".join(local_errors),
+        progress_percent,
+    )
+    return (
+        translate_segments(
+            source_segments,
+            target_lang=target_lang,
+            source_lang=options.source_lang,
+        ),
+        "OpenAI",
     )
 
 
@@ -185,9 +332,16 @@ def _resolve_input(
         )
         return video.path, video.path
 
+    if is_bilibili_url(options.input_value):
+        _progress(options, "解析 Bilibili 链接并下载视频", 8)
+        video = download_bilibili_video(
+            options.input_value, task_out_dir, options.force_download, timestamp
+        )
+        return video.path, video.path
+
     if is_url(options.input_value):
         raise SubtitleToolError(
-            "Unsupported URL. v1 supports TalkSmith share URLs and YouTube URLs."
+            "Unsupported URL. v1 supports TalkSmith share URLs, YouTube URLs, and Bilibili URLs."
         )
 
     input_path = Path(options.input_value).expanduser().resolve()
@@ -247,6 +401,16 @@ def _mp4_language_code(language: str) -> str:
     return language[:3]
 
 
+def _is_same_language(source_lang: str | None, target_lang: str) -> bool:
+    source = normalize_lang(source_lang)
+    target = normalize_lang(target_lang)
+    if source == "auto" or target == "auto":
+        return False
+    if source.startswith("zh") and target.startswith("zh"):
+        return True
+    return source == target
+
+
 def _progress(options: PipelineOptions, message: str, percent: int) -> None:
     if options.progress_callback:
         options.progress_callback(message, max(0, min(100, percent)))
@@ -265,6 +429,8 @@ def _base_output_stem(stem: str, timestamp: str) -> str:
 def _input_output_stem(input_value: str) -> str:
     if is_youtube_url(input_value):
         return extract_youtube_id(input_value)
+    if is_bilibili_url(input_value):
+        return extract_bilibili_id(input_value)
     if is_talksmith_url(input_value):
         return extract_scenario_id(input_value)
     return Path(input_value).expanduser().stem or "video"

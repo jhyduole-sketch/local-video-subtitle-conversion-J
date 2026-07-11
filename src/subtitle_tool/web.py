@@ -128,6 +128,7 @@ def result_to_dict(result: PipelineResult) -> dict[str, object]:
             language: str(path) for language, path in result.translated_paths.items()
         },
         "failedLanguages": result.failed_languages,
+        "translationEngines": result.translation_engines or {},
         "sourceKind": result.source_kind,
         "downloadedVideoPath": _path_or_none(result.downloaded_video_path),
         "subtitledVideoPaths": {

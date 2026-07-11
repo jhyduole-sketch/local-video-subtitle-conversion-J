@@ -14,5 +14,13 @@ class OpenAIConfigError(SubtitleToolError):
     """Raised when OpenAI configuration is missing or invalid."""
 
 
+class ProviderRateLimitError(SubtitleToolError):
+    """Raised after a translation provider exhausts rate-limit retries."""
+
+    def __init__(self, provider: str, message: str):
+        super().__init__(message)
+        self.provider = provider
+
+
 class CancellationError(SubtitleToolError):
     """Raised when a running task is cancelled by the user."""

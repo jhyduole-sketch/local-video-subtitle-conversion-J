@@ -442,10 +442,12 @@ function renderResults(result) {
     items.push([`源字幕 (${result.sourceKind || "source"})`, result.sourceSubtitlePath]);
   }
   Object.entries(result.translatedPaths || {}).forEach(([lang, path]) => {
-    items.push([`字幕 ${lang}`, path]);
+    const engine = result.translationEngines?.[lang];
+    items.push([`字幕 ${lang}${engine ? ` · ${engine}` : ""}`, path]);
   });
   Object.entries(result.subtitledVideoPaths || {}).forEach(([lang, path]) => {
-    items.push([`软字幕视频 ${lang}`, path]);
+    const engine = result.translationEngines?.[lang];
+    items.push([`软字幕视频 ${lang}${engine ? ` · ${engine}` : ""}`, path]);
   });
   Object.entries(result.failedLanguages || {}).forEach(([lang, message]) => {
     items.push([`失败 ${lang}`, message]);

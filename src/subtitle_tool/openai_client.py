@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import OpenAIConfigError, SubtitleToolError
+from .errors import OpenAIConfigError, ProviderRateLimitError, SubtitleToolError
 from .srt import SubtitleSegment
 
 
@@ -14,13 +15,15 @@ DEFAULT_TRANSCRIBE_MODEL = "whisper-1"
 DEFAULT_TRANSLATE_MODEL = "gpt-4.1-mini"
 DEFAULT_ZAI_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
 DEFAULT_ZAI_TRANSLATE_MODEL = "glm-4.7-flash"
-ZAI_TRANSLATION_BATCH_SIZE = 12
+DEFAULT_ZAI_TRANSLATION_BATCH_SEGMENTS = 24
+DEFAULT_ZAI_TRANSLATION_BATCH_CHARACTERS = 4000
 ZAI_TRANSLATION_RETRY_LIMIT = 2
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 DEFAULT_ZAI_REQUEST_DELAY_SECONDS = 2.0
 DEFAULT_ZAI_RATE_LIMIT_RETRY_SECONDS = 20.0
 DEFAULT_ZAI_RATE_LIMIT_RETRY_LIMIT = 3
 ProgressCallback = Callable[[str], None]
+_ZAI_REQUEST_LOCK = threading.Lock()
 
 
 def build_client() -> Any:
@@ -195,7 +198,17 @@ def _translate_segments_with_zai_batches(
     progress_callback: ProgressCallback | None = None,
 ) -> dict[int, str]:
     translations: dict[int, str] = {}
-    batches = _chunk_segments(segments, ZAI_TRANSLATION_BATCH_SIZE)
+    max_segments = _int_env(
+        "ZAI_TRANSLATION_BATCH_SEGMENTS",
+        DEFAULT_ZAI_TRANSLATION_BATCH_SEGMENTS,
+        minimum=1,
+    )
+    max_characters = _int_env(
+        "ZAI_TRANSLATION_BATCH_CHARACTERS",
+        DEFAULT_ZAI_TRANSLATION_BATCH_CHARACTERS,
+        minimum=1,
+    )
+    batches = _chunk_segments_by_budget(segments, max_segments, max_characters)
     for batch_index, batch in enumerate(batches, start=1):
         if batch_index > 1:
             _sleep_between_zai_requests(progress_callback)
@@ -227,8 +240,10 @@ def _translate_segments_with_zai_batches(
             progress_callback(
                 f"z.ai 补翻 {target_lang}: 第 {retry_index} 次，缺失 {missing_preview}"
             )
-        for batch in _chunk_segments(
-            missing_segments, max(1, ZAI_TRANSLATION_BATCH_SIZE // 2)
+        for batch in _chunk_segments_by_budget(
+            missing_segments,
+            max(1, max_segments // 2),
+            max(1, max_characters // 2),
         ):
             _sleep_between_zai_requests(progress_callback)
             translations.update(
@@ -269,14 +284,15 @@ def _translate_zai_batch(
     )
     user_prompt = json.dumps(payload, ensure_ascii=False)
 
-    content = _chat_json_object_with_rate_limit_retry(
-        client,
-        translate_model,
-        system_prompt,
-        user_prompt,
-        target_lang,
-        progress_callback,
-    )
+    with _ZAI_REQUEST_LOCK:
+        content = _chat_json_object_with_rate_limit_retry(
+            client,
+            translate_model,
+            system_prompt,
+            user_prompt,
+            target_lang,
+            progress_callback,
+        )
 
     translations = _parse_translation_items(content, target_lang, "z.ai")
     requested_indexes = {segment.index for segment in segments}
@@ -361,9 +377,16 @@ def _chat_json_object_with_rate_limit_retry(
         try:
             return _chat_json_object(client, model, system_prompt, user_prompt)
         except Exception as exc:
-            if not _is_rate_limit_error(exc) or attempt >= retry_limit:
+            is_rate_limit = _is_rate_limit_error(exc)
+            if not is_rate_limit:
                 raise SubtitleToolError(
                     f"z.ai translation to {target_lang} failed: {exc}"
+                ) from exc
+            if attempt >= retry_limit:
+                raise ProviderRateLimitError(
+                    "z.ai",
+                    f"z.ai translation to {target_lang} failed after "
+                    f"{retry_limit} rate-limit retries: {exc}",
                 ) from exc
             delay = _zai_rate_limit_retry_seconds(attempt)
             if progress_callback:
@@ -431,6 +454,31 @@ def _chunk_segments(
     size: int,
 ) -> list[list[SubtitleSegment]]:
     return [segments[index : index + size] for index in range(0, len(segments), size)]
+
+
+def _chunk_segments_by_budget(
+    segments: list[SubtitleSegment],
+    max_segments: int,
+    max_characters: int,
+) -> list[list[SubtitleSegment]]:
+    batches: list[list[SubtitleSegment]] = []
+    current: list[SubtitleSegment] = []
+    current_characters = 0
+    for segment in segments:
+        segment_characters = len(segment.text)
+        exceeds_count = len(current) >= max_segments
+        exceeds_characters = (
+            bool(current) and current_characters + segment_characters > max_characters
+        )
+        if exceeds_count or exceeds_characters:
+            batches.append(current)
+            current = []
+            current_characters = 0
+        current.append(segment)
+        current_characters += segment_characters
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _api_timeout_seconds(env_name: str) -> float:

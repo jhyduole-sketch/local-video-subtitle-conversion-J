@@ -10,6 +10,7 @@ from subtitle_tool.openai_client import (  # noqa: E402
     DEFAULT_API_TIMEOUT_SECONDS,
     DEFAULT_ZAI_REQUEST_DELAY_SECONDS,
     _api_timeout_seconds,
+    _chunk_segments_by_budget,
     _float_env,
     _parse_translation_json,
     translate_segments_with_zai,
@@ -18,6 +19,22 @@ from subtitle_tool.srt import SubtitleSegment  # noqa: E402
 
 
 class OpenAIClientTests(unittest.TestCase):
+    def test_dynamic_zai_batches_respect_count_and_character_budgets(self):
+        segments = [
+            SubtitleSegment(index=index, start_ms=0, end_ms=1000, text="x" * 30)
+            for index in range(1, 9)
+        ]
+
+        batches = _chunk_segments_by_budget(
+            segments, max_segments=4, max_characters=90
+        )
+
+        self.assertEqual([len(batch) for batch in batches], [3, 3, 2])
+        self.assertTrue(all(len(batch) <= 4 for batch in batches))
+        self.assertTrue(
+            all(sum(len(segment.text) for segment in batch) <= 90 for batch in batches)
+        )
+
     def test_parse_translation_json_returns_indexed_text(self):
         segments = [
             SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="你好"),
@@ -68,7 +85,7 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual(len(translations), 30)
         self.assertEqual(translations[25], "ja 25")
         self.assertGreater(call_count, 3)
-        self.assertIn("z.ai 翻译 ja: 第 1/3 批", progress_messages)
+        self.assertIn("z.ai 翻译 ja: 第 1/2 批", progress_messages)
         self.assertTrue(
             any(message.startswith("z.ai 补翻 ja:") for message in progress_messages)
         )
@@ -118,6 +135,28 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertTrue(
             any(message.startswith("z.ai 触发限流") for message in progress_messages)
         )
+
+    def test_zai_translation_raises_typed_error_after_rate_limit_retries(self):
+        segments = [
+            SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
+        ]
+
+        with patch.dict(
+            "subtitle_tool.openai_client.os.environ",
+            {
+                "ZAI_RATE_LIMIT_RETRY_SECONDS": "0.01",
+                "ZAI_RATE_LIMIT_RETRY_LIMIT": "1",
+            },
+        ), patch(
+            "subtitle_tool.openai_client.build_zai_client", return_value=object()
+        ), patch(
+            "subtitle_tool.openai_client._chat_json_object",
+            side_effect=RuntimeError("Error code: 429 - code 1302 速率限制"),
+        ), patch("subtitle_tool.openai_client.time.sleep"):
+            with self.assertRaises(Exception) as raised:
+                translate_segments_with_zai(segments, "ja")
+
+        self.assertEqual(type(raised.exception).__name__, "ProviderRateLimitError")
 
     def test_zai_request_delay_reads_env_value(self):
         with patch.dict("subtitle_tool.openai_client.os.environ", {"ZAI_REQUEST_DELAY_SECONDS": "4.5"}):

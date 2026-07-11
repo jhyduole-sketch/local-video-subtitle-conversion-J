@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 import unittest
+from contextlib import nullcontext
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -18,11 +20,56 @@ from subtitle_tool.local_translate import (  # noqa: E402
     _resolve_model,
     _repeated_unit,
     _validate_local_translation,
+    translate_segments_locally,
 )
 from subtitle_tool.srt import SubtitleSegment  # noqa: E402
 
 
 class LocalTranslateQualityTests(unittest.TestCase):
+    def test_local_translation_batches_multiple_segments_per_tokenizer_call(self):
+        class FakeTokenizer:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, texts, **kwargs):
+                self.calls.append(texts)
+                return {"input_ids": texts}
+
+            def decode(self, output, **kwargs):
+                return output
+
+            def batch_decode(self, outputs, **kwargs):
+                return outputs
+
+        class FakeModel:
+            def eval(self):
+                return None
+
+            def generate(self, input_ids, **kwargs):
+                count = len(input_ids) if isinstance(input_ids, list) else 1
+                return ["こんにちは"] * count
+
+        class FakeTorch:
+            @staticmethod
+            def no_grad():
+                return nullcontext()
+
+        tokenizer = FakeTokenizer()
+        segments = [
+            SubtitleSegment(index=index, start_ms=0, end_ms=1000, text=f"句子 {index}")
+            for index in range(1, 4)
+        ]
+
+        with patch(
+            "subtitle_tool.local_translate._load_model",
+            return_value=(tokenizer, FakeModel(), FakeTorch()),
+        ):
+            translations = translate_segments_locally(segments, "zh", "ja")
+
+        self.assertEqual(len(tokenizer.calls), 1)
+        self.assertIsInstance(tokenizer.calls[0], list)
+        self.assertEqual(translations, {1: "こんにちは", 2: "こんにちは", 3: "こんにちは"})
+
     def test_detects_repeated_phrase(self):
         self.assertEqual(_repeated_unit("密かに" * 12), "密かに")
 
@@ -118,6 +165,12 @@ class LocalTranslateQualityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(SubtitleToolError, "too long"):
             _validate_local_translation(segment, "これはとても長いです" * 80, "ja")
+
+    def test_rejects_unicode_replacement_character(self):
+        segment = SubtitleSegment(index=3, start_ms=0, end_ms=1000, text="hello")
+
+        with self.assertRaisesRegex(SubtitleToolError, "invalid characters"):
+            _validate_local_translation(segment, "hel\ufffdlo", "en")
 
     def test_length_guard_only_flags_extreme_outputs(self):
         self.assertFalse(_looks_unreasonably_long("你好", "これは自然な長さです" * 12))
