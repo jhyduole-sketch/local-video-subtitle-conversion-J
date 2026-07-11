@@ -12,6 +12,7 @@ from subtitle_tool.media import (  # noqa: E402
     ass_ffmpeg_binary,
     burn_subtitle_track,
     extract_audio,
+    sample_video_edge_frames,
 )
 
 
@@ -67,6 +68,34 @@ class MediaTests(unittest.TestCase):
                 ass_ffmpeg_binary()
 
         self.assertIn("brew install ffmpeg-full", str(raised.exception))
+
+    def test_sample_video_edge_frames_uses_duration_and_cancellable_ffmpeg(self):
+        cancel_check = lambda: False
+        commands = []
+
+        def fake_run(command, cancel_check=None):
+            commands.append(command)
+            if command[0] == "ffprobe":
+                return subprocess.CompletedProcess(command, 0, "12.0\n", "")
+            output_pattern = Path(command[-1])
+            (output_pattern.parent / "frame-01.pgm").write_bytes(b"P5\n1 1\n255\n\0")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.media.ensure_ffmpeg"
+        ), patch("subtitle_tool.media._run", side_effect=fake_run):
+            frames = sample_video_edge_frames(
+                Path(tmpdir) / "video.mp4",
+                Path(tmpdir) / "frames",
+                sample_count=6,
+                cancel_check=cancel_check,
+            )
+
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0][0], "ffprobe")
+        self.assertEqual(commands[1][0], "ffmpeg")
+        self.assertIn("edgedetect", " ".join(commands[1]))
+        self.assertEqual([path.name for path in frames], ["frame-01.pgm"])
 
 
 if __name__ == "__main__":

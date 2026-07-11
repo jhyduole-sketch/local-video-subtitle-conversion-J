@@ -84,29 +84,37 @@ class JobStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    logs_json TEXT NOT NULL,
-                    result_json TEXT,
-                    error TEXT,
-                    progress INTEGER NOT NULL,
-                    progress_message TEXT NOT NULL,
-                    cancel_requested INTEGER NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    resumed_from TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                )
-                """
-            )
+            self._create_table(connection)
 
     def _connect(self) -> sqlite3.Connection:
+        database_missing = not self.path.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(str(self.path), timeout=10)
         connection.row_factory = sqlite3.Row
+        if database_missing:
+            self._create_table(connection)
         return connection
+
+    @staticmethod
+    def _create_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                logs_json TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                progress INTEGER NOT NULL,
+                progress_message TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                resumed_from TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
 
 
 def _json_or_none(value: Any) -> str | None:

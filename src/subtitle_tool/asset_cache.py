@@ -14,6 +14,7 @@ class AssetCache:
         "sourceSubtitles": "source-subtitles",
         "transcripts": "transcripts",
         "translations": "translations",
+        "analysis": "analysis",
     }
 
     def __init__(self, root: Path):
@@ -67,6 +68,26 @@ class AssetCache:
         except OSError:
             shutil.copy2(cached_path, target_path)
         return target_path
+
+    def load_subtitle_detection(self, video_fingerprint: str) -> dict[str, object] | None:
+        path = self.root / "analysis" / f"{video_fingerprint}.subtitle-region.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def store_subtitle_detection(
+        self, video_fingerprint: str, payload: dict[str, object]
+    ) -> Path:
+        path = self.root / "analysis" / f"{video_fingerprint}.subtitle-region.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+        return path
 
     def summary(self) -> dict[str, object]:
         categories: dict[str, dict[str, int]] = {}

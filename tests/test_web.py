@@ -20,19 +20,66 @@ from subtitle_tool.web import (  # noqa: E402
     cache_summary,
     clear_cache,
     create_job_executor,
+    create_subtitle_render_job,
     options_from_payload,
     request_job_cancel,
     resume_job,
     result_to_dict,
     safe_upload_filename,
+    subtitle_document_payload,
+    save_subtitle_payload,
 )
 
 
 class WebTests(unittest.TestCase):
+    def test_subtitle_api_helpers_load_and_save_document(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "output"
+            path = out_dir / "task" / "subtitles.en.srt"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
+            )
+
+            loaded = subtitle_document_payload(str(out_dir), str(path))
+            saved = save_subtitle_payload(
+                {
+                    "outDir": str(out_dir),
+                    "path": str(path),
+                    "segments": [
+                        {
+                            "start": "00:00:00,100",
+                            "end": "00:00:01,200",
+                            "text": "Edited",
+                        }
+                    ],
+                }
+            )
+
+        self.assertEqual(len(loaded["segments"]), 1)
+        self.assertEqual(saved["count"], 1)
+
+    def test_create_subtitle_render_job_queues_linked_render(self):
+        payload = {
+            "outDir": "/tmp/output",
+            "videoPath": "/tmp/output/task/video.mp4",
+            "subtitlePath": "/tmp/output/task/subtitle.en.srt",
+            "mode": "hard",
+            "position": "above-bottom",
+        }
+        with patch("subtitle_tool.web.JOB_EXECUTOR.submit") as submit:
+            job = create_subtitle_render_job(payload)
+        try:
+            self.assertEqual(job.status, "queued")
+            self.assertEqual(job.payload["operation"], "render-edited-subtitles")
+            submit.assert_called_once()
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(job.id, None)
     def test_cache_helpers_report_and_clear_selected_category(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            out_dir = Path(tmpdir)
-            cached = out_dir / ".subtitle-tool-cache" / "audio" / "audio.mp3"
+            out_dir = Path(tmpdir) / "output"
+            cached = Path(tmpdir) / ".subtitle-tool-cache" / "audio" / "audio.mp3"
             cached.parent.mkdir(parents=True)
             cached.write_bytes(b"audio")
 
@@ -40,6 +87,7 @@ class WebTests(unittest.TestCase):
             cleared = clear_cache(out_dir, ["audio"])
 
         self.assertEqual(summary["categories"]["audio"]["files"], 1)
+        self.assertEqual(summary["root"], str(Path(tmpdir) / ".subtitle-tool-cache"))
         self.assertEqual(cleared["cleared"], ["audio"])
     def test_resume_job_creates_linked_queued_job(self):
         original = JobState(
@@ -57,6 +105,30 @@ class WebTests(unittest.TestCase):
             self.assertEqual(resumed.resumed_from, original.id)
             self.assertEqual(resumed.payload, original.payload)
             submit.assert_called_once()
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(original.id, None)
+                if 'resumed' in locals() and resumed:
+                    JOBS.pop(resumed.id, None)
+
+    def test_resume_render_job_uses_render_worker(self):
+        original = JobState(
+            id="failed-render",
+            status="failed",
+            payload={
+                "operation": "render-edited-subtitles",
+                "outDir": "/tmp/output",
+                "videoPath": "/tmp/output/video.mp4",
+                "subtitlePath": "/tmp/output/subtitle.srt",
+            },
+        )
+        with JOB_LOCK:
+            JOBS[original.id] = original
+        try:
+            with patch("subtitle_tool.web.JOB_EXECUTOR.submit") as submit:
+                resumed = resume_job(original.id)
+            self.assertIsNotNone(resumed)
+            self.assertIs(submit.call_args.args[0], __import__("subtitle_tool.web", fromlist=["_run_subtitle_render_job"])._run_subtitle_render_job)
         finally:
             with JOB_LOCK:
                 JOBS.pop(original.id, None)
@@ -136,7 +208,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(options.translator, "z-ai")
         self.assertTrue(options.embed_subtitles)
         self.assertTrue(options.avoid_subtitle_overlap)
-        self.assertEqual(options.subtitle_video_mode, "soft")
+        self.assertEqual(options.subtitle_video_mode, "hard")
         self.assertEqual(options.subtitle_position, "auto")
 
     def test_options_from_payload_accepts_hard_subtitle_layout(self):

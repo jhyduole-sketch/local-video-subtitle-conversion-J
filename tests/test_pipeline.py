@@ -7,9 +7,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from subtitle_tool.pipeline import PipelineOptions, run_pipeline  # noqa: E402
+from subtitle_tool.pipeline import (  # noqa: E402
+    PipelineOptions,
+    render_edited_subtitle_video,
+    run_pipeline,
+)
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 from subtitle_tool.srt import SubtitleSegment, read_srt  # noqa: E402
+from subtitle_tool.video_subtitle_detection import SubtitleRegionDetection  # noqa: E402
 
 
 class PipelineTests(unittest.TestCase):
@@ -386,6 +391,95 @@ class PipelineTests(unittest.TestCase):
         mux.assert_not_called()
         self.assertRegex(result.subtitled_video_paths["en"].name, r"\.en\.fixed-sub\.mp4$")
 
+    def test_avoid_overlap_promotes_soft_video_to_stable_hard_subtitles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
+            ]
+            progress_messages = []
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments",
+                return_value={1: "Hello"},
+            ), patch(
+                "subtitle_tool.pipeline.write_ass"
+            ), patch(
+                "subtitle_tool.pipeline.burn_subtitle_track"
+            ) as burn, patch(
+                "subtitle_tool.pipeline.mux_subtitle_track"
+            ) as mux:
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["en"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="openai",
+                        embed_subtitles=True,
+                        avoid_subtitle_overlap=True,
+                        subtitle_video_mode="soft",
+                        subtitle_position="auto",
+                        progress_callback=lambda message, percent: progress_messages.append(message),
+                    )
+                )
+
+        burn.assert_called_once()
+        mux.assert_not_called()
+        self.assertTrue(any("自动切换稳定硬字幕" in item for item in progress_messages))
+        self.assertTrue(
+            any(
+                "实际字幕模式: 稳定硬字幕 · 原底部字幕上方" in item
+                for item in progress_messages
+            )
+        )
+        self.assertTrue(result.subtitled_video_paths["en"].name.endswith(".fixed-sub.mp4"))
+
+    def test_auto_position_uses_video_detection_and_avoids_top_subtitles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [SubtitleSegment(1, 0, 1000, "hello")]
+            detection = SubtitleRegionDetection("top", 0.91, 8, 0.2, 0.01)
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments", return_value={1: "Hello"}
+            ), patch(
+                "subtitle_tool.pipeline.detect_video_subtitle_region",
+                return_value=detection,
+            ) as detect, patch(
+                "subtitle_tool.pipeline.write_ass"
+            ) as write_ass, patch(
+                "subtitle_tool.pipeline.burn_subtitle_track"
+            ):
+                run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["en"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir) / "output",
+                        source="audio",
+                        output_format="srt",
+                        translator="openai",
+                        embed_subtitles=True,
+                        avoid_subtitle_overlap=True,
+                        subtitle_video_mode="hard",
+                        subtitle_position="auto",
+                    )
+                )
+
+        detect.assert_called_once()
+        self.assertEqual(write_ass.call_args.args[2], "bottom")
+
     def test_second_audio_run_reuses_extracted_audio_and_transcript(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "input.mp4"
@@ -422,6 +516,27 @@ class PipelineTests(unittest.TestCase):
         extract_audio.assert_called_once()
         transcribe.assert_called_once()
         self.assertEqual(first_text, second_text)
+
+    def test_render_edited_hard_subtitle_video_uses_saved_srt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            subtitle = root / "subtitle.en.srt"
+            output = root / "subtitle.en.edited.fixed-sub.mp4"
+            video.write_bytes(b"video")
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nEdited\n", encoding="utf-8"
+            )
+            with patch("subtitle_tool.pipeline.write_ass") as write_ass, patch(
+                "subtitle_tool.pipeline.burn_subtitle_track", return_value=output
+            ) as burn:
+                result = render_edited_subtitle_video(
+                    video, subtitle, output, "hard", "above-bottom"
+                )
+
+        write_ass.assert_called_once()
+        burn.assert_called_once()
+        self.assertEqual(result, output)
 
 
 if __name__ == "__main__":

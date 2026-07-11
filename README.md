@@ -44,6 +44,10 @@
 
 如果原视频底部已经有硬字幕，推荐选择“稳定硬字幕”和“自动避让”或“原底部字幕上方”。软字幕实际显示位置主要由播放器控制，无法保证在每个播放器里都能避让。
 
+页面勾选“自动避让原字幕”时会强制使用稳定硬字幕，避免出现“勾选了避让、实际却仍输出软字幕”的冲突。任务日志会显示最终采用的字幕模式和位置。主动切换回软字幕时，页面会自动关闭避让选项。
+
+自动避让会从视频时间轴均匀抽取最多 8 帧，分析顶部和底部反复出现的文字边缘。检测到底部硬字幕时，新字幕放到原字幕上方；检测到顶部硬字幕时，新字幕放到底部。检测结果带置信度并缓存在 `.subtitle-tool-cache/analysis/`。置信度不足时采用保守的底部上方位置，不擦除原画面。
+
 所有目标字幕写出前都会自动整理：按中英文显示宽度换行、尽量保持最多两行、长句按原时间段拆分，并修复相邻字幕时间重叠。字幕文字不会被截断。
 
 ## 环境要求
@@ -154,12 +158,14 @@ Web 页面支持：
 - 任务运行时可点击“停止任务”。
 - 查看历史任务，并继续失败、取消或因服务重启而中断的任务。
 - 查看缓存占用，并按视频、音频、源字幕、转写或翻译类别清理缓存。
+- 在输出区点击“编辑字幕”，修改字幕文字与开始/结束时间。
+- 保存字幕时自动创建 `.backup.srt`；可保存后直接提交重新生成视频任务。
 
 Web 服务同一时间只执行一个任务，后提交的任务会进入队列。这样速度未必最快，但能避免 Whisper、ffmpeg 和本地翻译模型互相争抢内存与 CPU。
 
 点击“停止任务”后，工具会终止当前 `ffmpeg`、`yt-dlp` 或 `whisper-cli` 子进程。正在等待的云端 API 请求仍需等该请求返回或超时，然后任务才会完全停止。
 
-任务记录保存在 `output/.subtitle-tool-state/jobs.sqlite3`。继续任务会创建一个新的关联任务，并复用已完成的下载、音频、转写及翻译批次，不会覆盖原任务记录。
+任务记录保存在项目根目录的 `.subtitle-tool-state/jobs.sqlite3`。继续任务会创建一个新的关联任务，并复用已完成的下载、音频、转写及翻译批次，不会覆盖原任务记录。`output/` 只保存下载视频、字幕和成品视频。
 
 ## 命令行用法
 
@@ -321,6 +327,7 @@ input
 ```
 
 硬字幕位置。`auto` 在启用 `--avoid-subtitle-overlap` 时自动使用 `above-bottom`。
+为了保证避让真实生效，只要同时启用 `--embed-subtitles` 和 `--avoid-subtitle-overlap`，后端就会自动使用硬字幕模式，即使传入的 `--subtitle-video-mode` 是 `soft`。
 
 在原底部字幕上方生成稳定英文字幕视频：
 
@@ -468,6 +475,7 @@ output/<video-name>.<YYYYMMDDHHMMSSX>/
 <video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.srt
 <video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.default-sub.mp4
 <video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.fixed-sub.mp4
+<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.edited.fixed-sub.mp4
 ```
 
 示例：
@@ -480,9 +488,9 @@ output/ftWe_pVrtho.202607091516421/
   ftWe_pVrtho.202607091516421.ja.default-sub.mp4
 ```
 
-同一个视频再次运行会创建新的时间戳目录。相同字幕翻译会从 `output/.subtitle-tool-cache/translations/` 复用缓存，但输出文件仍会放在本次任务目录，避免与旧结果混在一起。
+同一个视频再次运行会创建新的时间戳目录。相同字幕翻译会从 `.subtitle-tool-cache/translations/` 复用缓存，但输出文件仍会放在本次任务目录，避免与旧结果混在一起。
 
-稳定缓存位于 `output/.subtitle-tool-cache/`，包括：
+稳定缓存位于项目根目录的 `.subtitle-tool-cache/`，包括：
 
 ```text
 videos/              下载的视频
@@ -490,9 +498,12 @@ audio/               已抽取音频
 source-subtitles/    内置源字幕
 transcripts/         Whisper 转写结果
 translations/        完整及分批翻译结果
+analysis/            画面硬字幕位置检测
 ```
 
 清理缓存不会删除已经生成的时间戳任务目录。z.ai 分批翻译中断后，已成功的批次也会保留；继续任务时只请求尚未完成的字幕片段。
+
+旧版本保存在 `output/.subtitle-tool-state/` 和 `output/.subtitle-tool-cache/` 的数据会在服务启动或首次使用缓存时自动迁移到项目根目录。也可以分别使用 `SUBTITLE_TOOL_STATE_DB` 和 `SUBTITLE_TOOL_CACHE_DIR` 环境变量指定其它位置。
 
 ## 验证字幕
 
@@ -541,7 +552,8 @@ ZAI_RATE_LIMIT_RETRY_SECONDS
 
 - 硬字幕模式需要重新编码，处理速度慢于软字幕模式，输出文件大小也可能变化。
 - 不做视频画面 OCR，无法直接读取硬字幕文字。
-- 自动避让默认假设原画面字幕位于底部；顶部字幕需要手动选择新字幕位置。
+- 自动检测置信度不足时会保守假设原字幕位于底部；可在页面手动覆盖新字幕位置。
+- 画面字幕检测是多帧视觉启发式判断，不是 OCR；复杂台标、弹幕或大段画面文字可能降低置信度，此时可手动指定位置。
 - 本地中/日/英翻译模型语言方向有限，质量是粗翻级别。
 - 本地 Whisper `base` 模型识别质量有限，必要时可换更大的 whisper.cpp 模型。
 - YouTube / Bilibili 部分视频可能限制匿名下载，仍可能需要用户自行下载。

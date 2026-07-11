@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 output/
+.subtitle-tool-state/
+.subtitle-tool-cache/
 models/*.bin
 dist/
 build/

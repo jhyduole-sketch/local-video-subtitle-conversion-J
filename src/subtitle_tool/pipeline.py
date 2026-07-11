@@ -21,10 +21,15 @@ from .media import (
 )
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .process_control import CancelCheck
+from .runtime_paths import cache_root
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .subtitle_layout import layout_subtitles, write_ass
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
 from .translation_cache import TranslationCache
+from .video_subtitle_detection import (
+    SubtitleRegionDetection,
+    detect_video_subtitle_region,
+)
 from .youtube import (
     download_bilibili_video,
     download_youtube_video,
@@ -68,6 +73,7 @@ class PipelineResult:
     translation_engines: dict[str, str] | None = None
     downloaded_video_path: Path | None = None
     subtitled_video_paths: dict[str, Path] | None = None
+    input_video_path: Path | None = None
 
 
 def run_pipeline(options: PipelineOptions) -> PipelineResult:
@@ -93,11 +99,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     output_stem = _base_output_stem(_input_output_stem(options.input_value), timestamp)
     task_out_dir = options.out_dir / f"{output_stem}.{timestamp}"
     task_out_dir.mkdir(parents=True, exist_ok=True)
-    asset_cache = AssetCache(options.out_dir / ".subtitle-tool-cache")
+    asset_cache = AssetCache(cache_root(options.out_dir))
     _progress(options, "准备输入视频", 5)
     input_path, downloaded_video_path = _resolve_input(
         options, task_out_dir, timestamp, asset_cache
     )
+    video_fingerprint = asset_cache.file_fingerprint(input_path)
     _progress(options, f"视频已准备: {input_path.name}", 15)
 
     if options.download_only:
@@ -108,6 +115,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             failed_languages={},
             source_kind="download",
             downloaded_video_path=downloaded_video_path or input_path,
+            input_video_path=input_path,
         )
 
     _progress(options, "读取字幕来源", 18)
@@ -124,9 +132,37 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     subtitled_video_paths: dict[str, Path] = {}
     failed_languages: dict[str, str] = {}
     translation_engines: dict[str, str] = {}
-    translation_cache = TranslationCache(
-        options.out_dir / ".subtitle-tool-cache" / "translations"
+    translation_cache = TranslationCache(asset_cache.root / "translations")
+    subtitle_video_mode = _resolved_subtitle_video_mode(options)
+    if (
+        options.embed_subtitles
+        and subtitle_video_mode == "hard"
+        and options.subtitle_video_mode == "soft"
+    ):
+        _progress(
+            options,
+            "检测到避免遮挡与软字幕冲突，已自动切换稳定硬字幕",
+            57,
+        )
+    subtitle_position = _resolve_effective_subtitle_position(
+        options,
+        input_path,
+        video_fingerprint,
+        asset_cache,
+        task_out_dir,
     )
+    if options.embed_subtitles:
+        position_label = {
+            "bottom": "画面底部",
+            "above-bottom": "原底部字幕上方",
+            "top": "画面顶部",
+        }[subtitle_position]
+        mode_label = "稳定硬字幕" if subtitle_video_mode == "hard" else "软字幕"
+        _progress(
+            options,
+            f"实际字幕模式: {mode_label} · {position_label}",
+            57,
+        )
     mux_executor = ThreadPoolExecutor(max_workers=1) if options.embed_subtitles else None
     mux_jobs: dict[str, tuple[Future[Path], Path, int]] = {}
     total_targets = max(len(options.target_langs), 1)
@@ -214,8 +250,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                 translated_paths[target_lang] = output_path
                 _progress(options, f"字幕文件已输出: {output_path.name}", output_percent)
                 if mux_executor:
-                    subtitle_position = _resolved_subtitle_position(options)
-                    if options.subtitle_video_mode == "soft":
+                    if subtitle_video_mode == "soft":
                         if options.avoid_subtitle_overlap:
                             _progress(
                                 options,
@@ -301,6 +336,37 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         translation_engines=translation_engines,
         downloaded_video_path=downloaded_video_path,
         subtitled_video_paths=subtitled_video_paths,
+        input_video_path=input_path,
+    )
+
+
+def render_edited_subtitle_video(
+    video_path: Path,
+    subtitle_path: Path,
+    output_path: Path,
+    mode: str,
+    position: str,
+    cancel_check: CancelCheck | None = None,
+) -> Path:
+    if mode not in {"soft", "hard"}:
+        raise SubtitleToolError("Edited subtitle video mode must be soft or hard.")
+    if position not in {"bottom", "above-bottom", "top"}:
+        raise SubtitleToolError("Edited subtitle position is invalid.")
+    segments = layout_subtitles(read_srt(subtitle_path))
+    write_srt(subtitle_path, segments)
+    if mode == "hard":
+        ass_path = output_path.with_suffix(".ass")
+        write_ass(ass_path, segments, position)
+        return burn_subtitle_track(
+            video_path, ass_path, output_path, cancel_check
+        )
+    return mux_subtitle_track(
+        video_path,
+        subtitle_path,
+        output_path,
+        "und",
+        "edited",
+        cancel_check,
     )
 
 
@@ -308,6 +374,85 @@ def _resolved_subtitle_position(options: PipelineOptions) -> str:
     if options.subtitle_position != "auto":
         return options.subtitle_position
     return "above-bottom" if options.avoid_subtitle_overlap else "bottom"
+
+
+def _resolved_subtitle_video_mode(options: PipelineOptions) -> str:
+    if options.embed_subtitles and options.avoid_subtitle_overlap:
+        return "hard"
+    return options.subtitle_video_mode
+
+
+def _resolve_effective_subtitle_position(
+    options: PipelineOptions,
+    input_path: Path,
+    video_fingerprint: str,
+    asset_cache: AssetCache,
+    task_out_dir: Path,
+) -> str:
+    fallback = _resolved_subtitle_position(options)
+    if not (
+        options.embed_subtitles
+        and options.avoid_subtitle_overlap
+        and options.subtitle_position == "auto"
+        and _resolved_subtitle_video_mode(options) == "hard"
+    ):
+        return fallback
+
+    cached = asset_cache.load_subtitle_detection(video_fingerprint)
+    try:
+        if cached:
+            detection = _detection_from_payload(cached)
+            _progress(options, "使用缓存的画面字幕位置检测", 55)
+        else:
+            _progress(options, "正在抽帧检测原画面字幕位置", 55)
+            detection = detect_video_subtitle_region(
+                input_path,
+                task_out_dir / ".subtitle-detection",
+                options.cancel_check,
+            )
+            asset_cache.store_subtitle_detection(
+                video_fingerprint, _detection_to_payload(detection)
+            )
+    except CancellationError:
+        raise
+    except Exception as exc:
+        _progress(options, f"画面字幕检测未完成，使用保守避让: {exc}", 55)
+        return "above-bottom"
+
+    target_position = {
+        "top": "bottom",
+        "bottom": "above-bottom",
+        "none": "bottom",
+        "unknown": "above-bottom",
+    }.get(detection.position, "above-bottom")
+    _progress(
+        options,
+        "画面字幕检测: "
+        f"{detection.position} · 置信度 {round(detection.confidence * 100)}% · "
+        f"新字幕位置 {target_position}",
+        55,
+    )
+    return target_position
+
+
+def _detection_to_payload(detection: SubtitleRegionDetection) -> dict[str, object]:
+    return {
+        "position": detection.position,
+        "confidence": detection.confidence,
+        "sampledFrames": detection.sampled_frames,
+        "topScore": detection.top_score,
+        "bottomScore": detection.bottom_score,
+    }
+
+
+def _detection_from_payload(payload: dict[str, object]) -> SubtitleRegionDetection:
+    return SubtitleRegionDetection(
+        position=str(payload.get("position") or "unknown"),
+        confidence=float(payload.get("confidence") or 0.0),
+        sampled_frames=int(payload.get("sampledFrames") or 0),
+        top_score=float(payload.get("topScore") or 0.0),
+        bottom_score=float(payload.get("bottomScore") or 0.0),
+    )
 
 
 def _translate_target(
@@ -459,7 +604,8 @@ def _resolve_input(
     _progress(options, "检查本地视频文件", 8)
     if not input_path.exists():
         raise SubtitleToolError(f"Input video does not exist: {input_path}")
-    return input_path, None
+    task_path = asset_cache.materialize_video(input_path, task_out_dir / input_path.name)
+    return task_path, None
 
 
 def _load_source_segments(

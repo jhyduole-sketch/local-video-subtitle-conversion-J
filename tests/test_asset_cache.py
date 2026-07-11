@@ -59,6 +59,22 @@ class AssetCacheTests(unittest.TestCase):
             self.assertTrue(transcript.exists())
             self.assertEqual(output.read_bytes(), b"finished")
 
+    def test_subtitle_detection_cache_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = AssetCache(Path(tmpdir) / "cache")
+            payload = {
+                "position": "bottom",
+                "confidence": 0.88,
+                "sampledFrames": 8,
+                "topScore": 0.02,
+                "bottomScore": 0.2,
+            }
+
+            cache.store_subtitle_detection("video-fingerprint", payload)
+            loaded = cache.load_subtitle_detection("video-fingerprint")
+
+        self.assertEqual(loaded, payload)
+
 
 if __name__ == "__main__":
     unittest.main()

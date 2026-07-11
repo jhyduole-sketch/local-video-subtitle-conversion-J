@@ -122,7 +122,7 @@
             <label for="subtitleVideoMode">字幕视频模式</label>
             <select id="subtitleVideoMode" name="subtitleVideoMode">
               <option value="soft">软字幕（保持原画质）</option>
-              <option value="hard">稳定硬字幕（固定位置）</option>
+              <option value="hard" selected>稳定硬字幕（固定位置）</option>
             </select>
             <p id="subtitleVideoModeHint" class="field-hint">软字幕可开关，但具体位置由播放器控制。</p>
           </div>
@@ -140,7 +140,7 @@
 
           <div class="toggles span-all">
             <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
-            <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 避免遮挡原字幕</label>
+            <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 自动避让原字幕（使用稳定硬字幕）</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
             <label><input id="downloadOnly" name="downloadOnly" type="checkbox" /> 只下载</label>
           </div>
@@ -209,6 +209,25 @@
         </div>
         <div id="historyList" class="data-list"></div>
       </section>
+
+      <dialog id="subtitleEditorDialog" class="subtitle-editor-dialog">
+        <div class="editor-header">
+          <div>
+            <h2>字幕编辑</h2>
+            <p id="subtitleEditorPath" class="muted"></p>
+          </div>
+          <button id="closeSubtitleEditorButton" class="icon-button" type="button" title="关闭">×</button>
+        </div>
+        <div id="subtitleEditorMessage" class="editor-message"></div>
+        <div class="subtitle-editor-columns" aria-hidden="true">
+          <span>序号</span><span>开始</span><span>结束</span><span>字幕文字</span>
+        </div>
+        <div id="subtitleEditorRows" class="subtitle-editor-rows"></div>
+        <div class="editor-actions">
+          <button id="saveSubtitleButton" class="secondary-button" type="button">保存字幕</button>
+          <button id="saveRenderSubtitleButton" class="primary-button" type="button">保存并重新生成视频</button>
+        </div>
+      </dialog>
     </main>
 
     <script src="/app.js"></script>

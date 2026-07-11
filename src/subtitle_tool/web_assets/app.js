@@ -31,6 +31,14 @@ const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const subtitleVideoMode = document.querySelector("#subtitleVideoMode");
 const subtitlePosition = document.querySelector("#subtitlePosition");
 const subtitleVideoModeHint = document.querySelector("#subtitleVideoModeHint");
+const avoidSubtitleOverlap = document.querySelector("#avoidSubtitleOverlap");
+const subtitleEditorDialog = document.querySelector("#subtitleEditorDialog");
+const subtitleEditorPath = document.querySelector("#subtitleEditorPath");
+const subtitleEditorRows = document.querySelector("#subtitleEditorRows");
+const subtitleEditorMessage = document.querySelector("#subtitleEditorMessage");
+const closeSubtitleEditorButton = document.querySelector("#closeSubtitleEditorButton");
+const saveSubtitleButton = document.querySelector("#saveSubtitleButton");
+const saveRenderSubtitleButton = document.querySelector("#saveRenderSubtitleButton");
 const whisperModelPaths = {
   base: "models/ggml-base.bin",
   small: "models/ggml-small.bin",
@@ -131,6 +139,9 @@ let elapsedTimer = null;
 let activeJob = null;
 let currentJobId = "";
 let copyLogResetTimer = null;
+let editingSubtitlePath = "";
+let editingVideoPath = "";
+let lastResult = null;
 
 refreshHealth.addEventListener("click", loadHealth);
 stopButton.addEventListener("click", cancelCurrentJob);
@@ -146,7 +157,11 @@ whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
 refreshCacheButton.addEventListener("click", loadCache);
 refreshHistoryButton.addEventListener("click", loadHistory);
-subtitleVideoMode.addEventListener("change", updateSubtitleVideoModeHint);
+subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
+avoidSubtitleOverlap.addEventListener("change", handleAvoidOverlapChange);
+closeSubtitleEditorButton.addEventListener("click", () => subtitleEditorDialog.close());
+saveSubtitleButton.addEventListener("click", () => saveEditedSubtitles(false));
+saveRenderSubtitleButton.addEventListener("click", () => saveEditedSubtitles(true));
 
 loadHealth();
 loadCache();
@@ -159,6 +174,20 @@ function updateSubtitleVideoModeHint() {
   subtitleVideoModeHint.textContent = subtitleVideoMode.value === "hard"
     ? "固定位置并在各播放器一致显示；需要重新编码视频，处理时间更长。"
     : "软字幕可开关并保持原视频流，但具体位置由播放器控制。";
+}
+
+function handleSubtitleVideoModeChange() {
+  if (subtitleVideoMode.value === "soft") {
+    avoidSubtitleOverlap.checked = false;
+  }
+  updateSubtitleVideoModeHint();
+}
+
+function handleAvoidOverlapChange() {
+  if (avoidSubtitleOverlap.checked) {
+    subtitleVideoMode.value = "hard";
+  }
+  updateSubtitleVideoModeHint();
 }
 
 async function loadHealth() {
@@ -458,6 +487,7 @@ function renderJob(job) {
 }
 
 function renderResults(result) {
+  lastResult = result;
   const items = [];
   if (result.downloadedVideoPath) {
     items.push(["下载视频", result.downloadedVideoPath]);
@@ -467,7 +497,7 @@ function renderResults(result) {
   }
   Object.entries(result.translatedPaths || {}).forEach(([lang, path]) => {
     const engine = result.translationEngines?.[lang];
-    items.push([`字幕 ${lang}${engine ? ` · ${engine}` : ""}`, path]);
+    items.push([`字幕 ${lang}${engine ? ` · ${engine}` : ""}`, path, "edit"]);
   });
   Object.entries(result.subtitledVideoPaths || {}).forEach(([lang, path]) => {
     const engine = result.translationEngines?.[lang];
@@ -478,10 +508,98 @@ function renderResults(result) {
     items.push([`失败 ${lang}`, message]);
   });
   resultSummary.textContent = items.length ? `${items.length} 个结果` : "暂无结果";
-  results.innerHTML = items.map(([kind, path]) => resultItem(kind, path)).join("");
+  results.innerHTML = items.map(([kind, path, action]) => resultItem(kind, path, action)).join("");
   results.querySelectorAll("[data-copy]").forEach((button) => {
     button.addEventListener("click", () => copyText(button.dataset.copy || ""));
   });
+  results.querySelectorAll("[data-edit-subtitle]").forEach((button) => {
+    button.addEventListener("click", () => openSubtitleEditor(button.dataset.editSubtitle || ""));
+  });
+}
+
+async function openSubtitleEditor(path) {
+  if (!path) return;
+  editingSubtitlePath = path;
+  editingVideoPath = String(lastResult?.inputVideoPath || lastResult?.downloadedVideoPath || "");
+  subtitleEditorPath.textContent = path;
+  subtitleEditorMessage.textContent = "读取字幕...";
+  subtitleEditorRows.innerHTML = "";
+  subtitleEditorDialog.showModal();
+  try {
+    const outDir = String(document.querySelector("#outDir").value || "output").trim();
+    const response = await fetch(`/api/subtitles?outDir=${encodeURIComponent(outDir)}&path=${encodeURIComponent(path)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "字幕读取失败");
+    subtitleEditorRows.innerHTML = data.segments.map(subtitleEditorRow).join("");
+    subtitleEditorMessage.textContent = `${data.segments.length} 条字幕`;
+    saveRenderSubtitleButton.disabled = !editingVideoPath;
+  } catch (error) {
+    subtitleEditorMessage.textContent = error.message;
+  }
+}
+
+function subtitleEditorRow(segment) {
+  return `
+    <div class="subtitle-edit-row">
+      <span class="subtitle-edit-index">${Number(segment.index) || ""}</span>
+      <input data-subtitle-start value="${escapeAttribute(segment.start || "")}" aria-label="开始时间" />
+      <input data-subtitle-end value="${escapeAttribute(segment.end || "")}" aria-label="结束时间" />
+      <textarea data-subtitle-text rows="2" aria-label="字幕文字">${escapeHtml(segment.text || "")}</textarea>
+    </div>
+  `;
+}
+
+function collectEditedSegments() {
+  return Array.from(subtitleEditorRows.querySelectorAll(".subtitle-edit-row")).map((row) => ({
+    start: row.querySelector("[data-subtitle-start]").value.trim(),
+    end: row.querySelector("[data-subtitle-end]").value.trim(),
+    text: row.querySelector("[data-subtitle-text]").value.trim(),
+  }));
+}
+
+async function saveEditedSubtitles(regenerate) {
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  subtitleEditorMessage.textContent = "保存字幕...";
+  saveSubtitleButton.disabled = true;
+  saveRenderSubtitleButton.disabled = true;
+  try {
+    const response = await fetch("/api/subtitles", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({outDir, path: editingSubtitlePath, segments: collectEditedSegments()}),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "字幕保存失败");
+    subtitleEditorMessage.textContent = `已保存 ${data.count} 条字幕，原文件已备份`;
+    if (regenerate) {
+      if (!editingVideoPath) throw new Error("当前任务没有可用于重新生成的视频路径");
+      const selectedPosition = subtitlePosition.value === "auto" ? "above-bottom" : subtitlePosition.value;
+      const renderResponse = await fetch("/api/subtitles/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          outDir,
+          videoPath: editingVideoPath,
+          subtitlePath: editingSubtitlePath,
+          mode: subtitleVideoMode.value,
+          position: selectedPosition,
+        }),
+      });
+      const renderData = await renderResponse.json();
+      if (!renderResponse.ok) throw new Error(renderData.error || "重新生成任务提交失败");
+      subtitleEditorDialog.close();
+      currentJobId = renderData.jobId;
+      activeJobId.textContent = renderData.jobId;
+      setRunningState(true, "排队", "running");
+      startElapsedTimer({id: renderData.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0});
+      pollJob(renderData.jobId);
+    }
+  } catch (error) {
+    subtitleEditorMessage.textContent = error.message;
+  } finally {
+    saveSubtitleButton.disabled = false;
+    saveRenderSubtitleButton.disabled = !editingVideoPath;
+  }
 }
 
 async function loadCache() {
@@ -504,6 +622,7 @@ function renderCache(data) {
     sourceSubtitles: "内置字幕",
     transcripts: "语音转写",
     translations: "字幕翻译",
+    analysis: "画面字幕检测",
   };
   cacheSummaryLabel.textContent = formatBytes(data.totalBytes || 0);
   cacheList.innerHTML = Object.entries(data.categories || {})
@@ -599,13 +718,16 @@ async function resumeHistoryJob(jobId) {
   loadHistory();
 }
 
-function resultItem(kind, path) {
+function resultItem(kind, path, action = "") {
   const safePath = escapeHtml(path);
   return `
     <article class="result-item">
       <div class="result-kind">${escapeHtml(kind)}</div>
       <div class="result-path">${safePath}</div>
-      <button class="copy-button" type="button" data-copy="${escapeAttribute(path)}">复制路径</button>
+      <div class="row-actions">
+        ${action === "edit" ? `<button class="small-button" type="button" data-edit-subtitle="${escapeAttribute(path)}">编辑字幕</button>` : ""}
+        <button class="copy-button" type="button" data-copy="${escapeAttribute(path)}">复制路径</button>
+      </div>
     </article>
   `;
 }

@@ -164,6 +164,55 @@ def extract_audio(
     return output_path
 
 
+def sample_video_edge_frames(
+    video_path: Path,
+    output_dir: Path,
+    sample_count: int = 8,
+    cancel_check: CancelCheck | None = None,
+) -> list[Path]:
+    ensure_ffmpeg()
+    duration_result = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ],
+        cancel_check,
+    )
+    try:
+        duration = max(float(duration_result.stdout.strip()), 0.1)
+    except ValueError as exc:
+        raise MediaError("Unable to read video duration for subtitle detection.") from exc
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for existing in output_dir.glob("frame-*.pgm"):
+        existing.unlink()
+    interval = max(duration / max(sample_count, 1), 0.25)
+    output_pattern = output_dir / "frame-%02d.pgm"
+    _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"fps=1/{interval:.3f},scale=640:-2,format=gray,"
+            "edgedetect=low=0.08:high=0.2",
+            "-frames:v",
+            str(sample_count),
+            str(output_pattern),
+        ],
+        cancel_check,
+    )
+    return sorted(output_dir.glob("frame-*.pgm"))
+
+
 def mux_subtitle_track(
     video_path: Path,
     subtitle_path: Path,

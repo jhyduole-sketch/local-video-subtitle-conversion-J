@@ -24,8 +24,19 @@ from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError
 from .local_translate import local_translation_model_statuses, nllb_model_status
 from .job_store import JobStore
+from .runtime_paths import cache_root, state_database_path
 from .media import ass_ffmpeg_binary
-from .pipeline import PipelineOptions, PipelineResult, run_pipeline
+from .pipeline import (
+    PipelineOptions,
+    PipelineResult,
+    render_edited_subtitle_video,
+    run_pipeline,
+)
+from .subtitle_editor import (
+    load_subtitle_document,
+    safe_output_path,
+    save_subtitle_document,
+)
 
 
 @dataclass
@@ -70,12 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path.cwd() / ".env")
     args = build_parser().parse_args(argv)
-    state_path = Path(
-        os.environ.get(
-            "SUBTITLE_TOOL_STATE_DB",
-            str(Path.cwd() / "output" / ".subtitle-tool-state" / "jobs.sqlite3"),
-        )
-    )
+    project_root = Path.cwd()
+    state_path = state_database_path(project_root, project_root / "output")
     configure_job_store(state_path)
     server = ThreadingHTTPServer((args.host, args.port), SubtitleToolHandler)
     print(f"Subtitle tool web UI: http://{args.host}:{args.port}")
@@ -97,6 +104,11 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
     out_dir = Path(str(payload.get("outDir") or "output")).expanduser().resolve()
     whisper_model_value = str(payload.get("whisperModel") or "").strip()
     source_lang = str(payload.get("sourceLang") or "").strip() or None
+    embed_subtitles = bool(payload.get("embedSubtitles"))
+    avoid_subtitle_overlap = bool(payload.get("avoidSubtitleOverlap"))
+    subtitle_video_mode = str(payload.get("subtitleVideoMode") or "soft")
+    if embed_subtitles and avoid_subtitle_overlap:
+        subtitle_video_mode = "hard"
 
     return PipelineOptions(
         input_value=input_value,
@@ -112,9 +124,9 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         if whisper_model_value
         else None,
         translator=str(payload.get("translator") or "z-ai"),
-        embed_subtitles=bool(payload.get("embedSubtitles")),
-        avoid_subtitle_overlap=bool(payload.get("avoidSubtitleOverlap")),
-        subtitle_video_mode=str(payload.get("subtitleVideoMode") or "soft"),
+        embed_subtitles=embed_subtitles,
+        avoid_subtitle_overlap=avoid_subtitle_overlap,
+        subtitle_video_mode=subtitle_video_mode,
         subtitle_position=str(payload.get("subtitlePosition") or "auto"),
     )
 
@@ -178,7 +190,36 @@ def result_to_dict(result: PipelineResult) -> dict[str, object]:
             language: str(path)
             for language, path in (result.subtitled_video_paths or {}).items()
         },
+        "inputVideoPath": _path_or_none(result.input_video_path),
     }
+
+
+def subtitle_document_payload(out_dir_value: str, path_value: str) -> dict[str, object]:
+    return load_subtitle_document(
+        Path(out_dir_value or "output"), Path(path_value)
+    )
+
+
+def save_subtitle_payload(payload: dict[str, object]) -> dict[str, object]:
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        raise SubtitleToolError("字幕内容格式无效。")
+    return save_subtitle_document(
+        Path(str(payload.get("outDir") or "output")),
+        Path(str(payload.get("path") or "")),
+        segments,
+    )
+
+
+def create_subtitle_render_job(payload: dict[str, object]) -> JobState:
+    render_payload = dict(payload)
+    render_payload["operation"] = "render-edited-subtitles"
+    job = JobState(id=uuid.uuid4().hex[:12], payload=render_payload)
+    with JOB_LOCK:
+        JOBS[job.id] = job
+        _persist_job(job)
+    JOB_EXECUTOR.submit(_run_subtitle_render_job, job.id, render_payload)
+    return job
 
 
 class SubtitleToolHandler(BaseHTTPRequestHandler):
@@ -200,6 +241,17 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             out_dir = Path(query.get("outDir", ["output"])[0]).expanduser().resolve()
             self._send_json(cache_summary(out_dir))
             return
+        if parsed.path == "/api/subtitles":
+            query = parse_qs(parsed.query)
+            try:
+                payload = subtitle_document_payload(
+                    query.get("outDir", ["output"])[0],
+                    query.get("path", [""])[0],
+                )
+                self._send_json(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if parsed.path.startswith("/api/jobs/"):
             self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
             return
@@ -210,6 +262,13 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/subtitles/render":
+            try:
+                job = create_subtitle_render_job(self._read_json())
+                self._send_json({"jobId": job.id, "status": job.status}, status=202)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if path == "/api/upload":
             self._handle_upload()
             return
@@ -250,6 +309,17 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             _persist_job(job)
         JOB_EXECUTOR.submit(_run_job, job.id, options)
         self._send_json({"jobId": job.id, "status": job.status}, status=202)
+
+    def do_PUT(self) -> None:
+        path = urlparse(self.path).path
+        if path != "/api/subtitles":
+            self.send_error(404, "Not found")
+            return
+        try:
+            payload = save_subtitle_payload(self._read_json())
+            self._send_json(payload)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=400)
 
     def _handle_upload(self) -> None:
         try:
@@ -352,6 +422,62 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
+    try:
+        _update_job(job_id, status="running", log="字幕视频重新生成任务已启动", progress=5)
+        out_dir = Path(str(payload.get("outDir") or "output"))
+        video_path = safe_output_path(
+            out_dir, Path(str(payload.get("videoPath") or "")), ".mp4"
+        )
+        subtitle_path = safe_output_path(
+            out_dir, Path(str(payload.get("subtitlePath") or "")), ".srt"
+        )
+        mode = str(payload.get("mode") or "hard")
+        position = str(payload.get("position") or "above-bottom")
+        suffix = "fixed-sub" if mode == "hard" else "default-sub"
+        output_path = subtitle_path.with_name(
+            f"{subtitle_path.stem}.edited.{suffix}.mp4"
+        )
+        _update_job(job_id, log=f"读取已编辑字幕: {subtitle_path.name}", progress=20)
+        result_path = render_edited_subtitle_video(
+            video_path,
+            subtitle_path,
+            output_path,
+            mode,
+            position,
+            JOBS[job_id].cancel_event.is_set,
+        )
+    except CancellationError:
+        _update_job(job_id, status="canceled", log="任务已停止", progress_message="已停止")
+        return
+    except Exception as exc:
+        _update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            log=f"重新生成失败: {exc}",
+            progress_message="任务失败",
+        )
+        return
+    _update_job(
+        job_id,
+        status="succeeded",
+        result={
+            "sourceSubtitlePath": str(subtitle_path),
+            "translatedPaths": {},
+            "failedLanguages": {},
+            "translationEngines": {},
+            "sourceKind": "edited",
+            "downloadedVideoPath": None,
+            "inputVideoPath": str(video_path),
+            "subtitledVideoPaths": {"edited": str(result_path)},
+        },
+        log=f"编辑后字幕视频已输出: {result_path.name}",
+        progress=100,
+        progress_message="任务完成",
+    )
 
 
 def _run_job(job_id: str, options: PipelineOptions) -> None:
@@ -487,11 +613,11 @@ def list_job_payloads(limit: int = 50) -> list[dict[str, object]]:
 
 
 def cache_summary(out_dir: Path) -> dict[str, object]:
-    return AssetCache(out_dir / ".subtitle-tool-cache").summary()
+    return AssetCache(cache_root(out_dir)).summary()
 
 
 def clear_cache(out_dir: Path, categories: list[str]) -> dict[str, object]:
-    return AssetCache(out_dir / ".subtitle-tool-cache").clear(categories)
+    return AssetCache(cache_root(out_dir)).clear(categories)
 
 
 def resume_job(job_id: str) -> JobState | None:
@@ -500,10 +626,12 @@ def resume_job(job_id: str) -> JobState | None:
         if not original or original.status not in {"failed", "canceled", "interrupted"}:
             return None
         payload = dict(original.payload)
-    try:
-        options = options_from_payload(payload)
-    except Exception:
-        return None
+    is_render_job = payload.get("operation") == "render-edited-subtitles"
+    if not is_render_job:
+        try:
+            options = options_from_payload(payload)
+        except Exception:
+            return None
     resumed = JobState(
         id=uuid.uuid4().hex[:12],
         payload=payload,
@@ -513,7 +641,10 @@ def resume_job(job_id: str) -> JobState | None:
     with JOB_LOCK:
         JOBS[resumed.id] = resumed
         _persist_job(resumed)
-    JOB_EXECUTOR.submit(_run_job, resumed.id, options)
+    if is_render_job:
+        JOB_EXECUTOR.submit(_run_subtitle_render_job, resumed.id, payload)
+    else:
+        JOB_EXECUTOR.submit(_run_job, resumed.id, options)
     return resumed
 
 
