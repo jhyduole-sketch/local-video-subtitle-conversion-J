@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from random import randint
 import re
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from .errors import CancellationError, MediaError, SubtitleToolError
@@ -405,11 +406,12 @@ def _resolve_effective_subtitle_position(
             _progress(options, "使用缓存的画面字幕位置检测", 55)
         else:
             _progress(options, "正在抽帧检测原画面字幕位置", 55)
-            detection = detect_video_subtitle_region(
-                input_path,
-                task_out_dir / ".subtitle-detection",
-                options.cancel_check,
-            )
+            with TemporaryDirectory(prefix="subtitle-detection-") as temporary_dir:
+                detection = detect_video_subtitle_region(
+                    input_path,
+                    Path(temporary_dir),
+                    options.cancel_check,
+                )
             asset_cache.store_subtitle_detection(
                 video_fingerprint, _detection_to_payload(detection)
             )

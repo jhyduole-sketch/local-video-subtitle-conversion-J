@@ -19,7 +19,8 @@
       </header>
 
       <section class="workspace">
-        <form id="jobForm" class="panel form-panel">
+        <div class="primary-stack">
+          <form id="jobForm" class="panel form-panel">
           <div class="field span-all">
             <label for="input">视频地址或本地路径</label>
             <textarea
@@ -150,7 +151,24 @@
             <button id="stopButton" class="secondary-button" type="button" disabled>停止任务</button>
             <span id="jobBadge" class="badge idle">空闲</span>
           </div>
-        </form>
+          </form>
+
+          <section class="panel results-panel">
+            <div class="panel-title">
+              <h2>输出与字幕校对</h2>
+              <span id="resultSummary" class="muted">暂无结果</span>
+            </div>
+            <div id="results" class="results-grid"></div>
+          </section>
+
+          <section class="panel history-panel">
+            <div class="panel-title">
+              <h2>任务历史</h2>
+              <button id="refreshHistoryButton" class="small-button" type="button">刷新</button>
+            </div>
+            <div id="historyList" class="data-list"></div>
+          </section>
+        </div>
 
         <aside class="side-stack">
           <section class="panel">
@@ -194,22 +212,6 @@
         </aside>
       </section>
 
-      <section class="panel results-panel">
-        <div class="panel-title">
-          <h2>输出</h2>
-          <span id="resultSummary" class="muted">暂无结果</span>
-        </div>
-        <div id="results" class="results-grid"></div>
-      </section>
-
-      <section class="panel history-panel">
-        <div class="panel-title">
-          <h2>任务历史</h2>
-          <button id="refreshHistoryButton" class="small-button" type="button">刷新</button>
-        </div>
-        <div id="historyList" class="data-list"></div>
-      </section>
-
       <dialog id="subtitleEditorDialog" class="subtitle-editor-dialog">
         <div class="editor-header">
           <div>
@@ -219,10 +221,29 @@
           <button id="closeSubtitleEditorButton" class="icon-button" type="button" title="关闭">×</button>
         </div>
         <div id="subtitleEditorMessage" class="editor-message"></div>
-        <div class="subtitle-editor-columns" aria-hidden="true">
-          <span>序号</span><span>开始</span><span>结束</span><span>字幕文字</span>
+        <div class="subtitle-editor-workspace">
+          <section id="subtitlePreviewPane" class="subtitle-preview-pane">
+            <div class="subtitle-preview-stage">
+              <video id="subtitlePreviewVideo" controls preload="metadata"></video>
+              <div id="subtitlePreviewOverlay" class="subtitle-preview-overlay above-bottom" hidden></div>
+            </div>
+            <div class="subtitle-preview-controls">
+              <label for="subtitlePreviewPosition">预览位置</label>
+              <select id="subtitlePreviewPosition">
+                <option value="above-bottom">原底部字幕上方</option>
+                <option value="bottom">画面底部</option>
+                <option value="top">画面顶部</option>
+              </select>
+              <span id="subtitlePreviewTime" class="muted">00:00 / 00:00</span>
+            </div>
+          </section>
+          <section class="subtitle-list-pane">
+            <div class="subtitle-editor-columns" aria-hidden="true">
+              <span>序号</span><span>开始</span><span>结束</span><span>字幕文字</span>
+            </div>
+            <div id="subtitleEditorRows" class="subtitle-editor-rows"></div>
+          </section>
         </div>
-        <div id="subtitleEditorRows" class="subtitle-editor-rows"></div>
         <div class="editor-actions">
           <button id="saveSubtitleButton" class="secondary-button" type="button">保存字幕</button>
           <button id="saveRenderSubtitleButton" class="primary-button" type="button">保存并重新生成视频</button>

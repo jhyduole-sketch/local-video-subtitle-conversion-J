@@ -478,6 +478,7 @@ class PipelineTests(unittest.TestCase):
                 )
 
         detect.assert_called_once()
+        self.assertNotIn(str(Path(tmpdir) / "output"), str(detect.call_args.args[1]))
         self.assertEqual(write_ass.call_args.args[2], "bottom")
 
     def test_second_audio_run_reuses_extracted_audio_and_transcript(self):

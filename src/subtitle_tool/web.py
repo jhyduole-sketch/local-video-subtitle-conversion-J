@@ -26,6 +26,7 @@ from .local_translate import local_translation_model_statuses, nllb_model_status
 from .job_store import JobStore
 from .runtime_paths import cache_root, state_database_path
 from .media import ass_ffmpeg_binary
+from .media_preview import build_media_response
 from .pipeline import (
     PipelineOptions,
     PipelineResult,
@@ -252,11 +253,21 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
+        if parsed.path == "/api/media":
+            self._serve_media(parsed)
+            return
         if parsed.path.startswith("/api/jobs/"):
             self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
             return
         if parsed.path in {"/app.js", "/styles.css"}:
             self._serve_asset(parsed.path.lstrip("/"))
+            return
+        self.send_error(404, "Not found")
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/media":
+            self._serve_media(parsed, include_body=False)
             return
         self.send_error(404, "Not found")
 
@@ -342,6 +353,38 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
                 "size": output_path.stat().st_size,
             }
         )
+
+    def _serve_media(self, parsed, include_body: bool = True) -> None:
+        query = parse_qs(parsed.query)
+        try:
+            out_dir = Path(query.get("outDir", ["output"])[0]).expanduser().resolve()
+            path = Path(query.get("path", [""])[0])
+            response = build_media_response(out_dir, path, self.headers.get("Range"))
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+
+        self.send_response(response.status)
+        self.send_header("Content-Type", response.content_type)
+        self.send_header("Content-Length", str(response.length))
+        self.send_header("Accept-Ranges", "bytes")
+        if response.content_range:
+            self.send_header("Content-Range", response.content_range)
+        self.end_headers()
+        if not include_body:
+            return
+        try:
+            with response.path.open("rb") as handle:
+                handle.seek(response.start)
+                remaining = response.length
+                while remaining > 0:
+                    chunk = handle.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[web] {self.address_string()} - {format % args}")

@@ -10,6 +10,7 @@ const activeJobId = document.querySelector("#activeJobId");
 const logBox = document.querySelector("#logBox");
 const results = document.querySelector("#results");
 const resultSummary = document.querySelector("#resultSummary");
+const resultsPanel = document.querySelector(".results-panel");
 const targetLangsInput = document.querySelector("#targetLangs");
 const languagePicker = document.querySelector("#languagePicker");
 const languagePickerToggle = document.querySelector("#languagePickerToggle");
@@ -39,6 +40,11 @@ const subtitleEditorMessage = document.querySelector("#subtitleEditorMessage");
 const closeSubtitleEditorButton = document.querySelector("#closeSubtitleEditorButton");
 const saveSubtitleButton = document.querySelector("#saveSubtitleButton");
 const saveRenderSubtitleButton = document.querySelector("#saveRenderSubtitleButton");
+const subtitlePreviewPane = document.querySelector("#subtitlePreviewPane");
+const subtitlePreviewVideo = document.querySelector("#subtitlePreviewVideo");
+const subtitlePreviewOverlay = document.querySelector("#subtitlePreviewOverlay");
+const subtitlePreviewPosition = document.querySelector("#subtitlePreviewPosition");
+const subtitlePreviewTime = document.querySelector("#subtitlePreviewTime");
 const whisperModelPaths = {
   base: "models/ggml-base.bin",
   small: "models/ggml-small.bin",
@@ -159,9 +165,16 @@ refreshCacheButton.addEventListener("click", loadCache);
 refreshHistoryButton.addEventListener("click", loadHistory);
 subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
 avoidSubtitleOverlap.addEventListener("change", handleAvoidOverlapChange);
-closeSubtitleEditorButton.addEventListener("click", () => subtitleEditorDialog.close());
+closeSubtitleEditorButton.addEventListener("click", closeSubtitleEditor);
 saveSubtitleButton.addEventListener("click", () => saveEditedSubtitles(false));
 saveRenderSubtitleButton.addEventListener("click", () => saveEditedSubtitles(true));
+subtitlePreviewVideo.addEventListener("timeupdate", syncSubtitlePreview);
+subtitlePreviewVideo.addEventListener("loadedmetadata", syncSubtitlePreview);
+subtitlePreviewVideo.addEventListener("error", handleSubtitlePreviewError);
+subtitlePreviewPosition.addEventListener("change", updateSubtitlePreviewPosition);
+subtitleEditorRows.addEventListener("click", handleSubtitleRowClick);
+subtitleEditorRows.addEventListener("input", syncSubtitlePreview);
+subtitleEditorDialog.addEventListener("close", releaseSubtitlePreview);
 
 loadHealth();
 loadCache();
@@ -436,6 +449,7 @@ async function pollJob(jobId) {
       stopElapsedTimer();
       if (data.result) {
         renderResults(data.result);
+        resultsPanel.scrollIntoView({ behavior: "smooth", block: "start" });
       }
       loadHistory();
       loadCache();
@@ -524,6 +538,7 @@ async function openSubtitleEditor(path) {
   subtitleEditorPath.textContent = path;
   subtitleEditorMessage.textContent = "读取字幕...";
   subtitleEditorRows.innerHTML = "";
+  configureSubtitlePreview();
   subtitleEditorDialog.showModal();
   try {
     const outDir = String(document.querySelector("#outDir").value || "output").trim();
@@ -533,9 +548,90 @@ async function openSubtitleEditor(path) {
     subtitleEditorRows.innerHTML = data.segments.map(subtitleEditorRow).join("");
     subtitleEditorMessage.textContent = `${data.segments.length} 条字幕`;
     saveRenderSubtitleButton.disabled = !editingVideoPath;
+    syncSubtitlePreview();
   } catch (error) {
     subtitleEditorMessage.textContent = error.message;
   }
+}
+
+function configureSubtitlePreview() {
+  const selectedPosition = subtitlePosition.value === "auto" ? "above-bottom" : subtitlePosition.value;
+  subtitlePreviewPosition.value = selectedPosition;
+  updateSubtitlePreviewPosition();
+  subtitlePreviewOverlay.hidden = true;
+  subtitlePreviewTime.textContent = "00:00 / 00:00";
+  subtitlePreviewPane.hidden = !editingVideoPath;
+  if (!editingVideoPath) return;
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  subtitlePreviewVideo.src = `/api/media?outDir=${encodeURIComponent(outDir)}&path=${encodeURIComponent(editingVideoPath)}`;
+  subtitlePreviewVideo.load();
+}
+
+function closeSubtitleEditor() {
+  subtitleEditorDialog.close();
+}
+
+function releaseSubtitlePreview() {
+  subtitlePreviewVideo.pause();
+  subtitlePreviewVideo.removeAttribute("src");
+  subtitlePreviewVideo.load();
+  subtitlePreviewOverlay.hidden = true;
+}
+
+function handleSubtitlePreviewError() {
+  if (!editingVideoPath) return;
+  subtitleEditorMessage.textContent = "浏览器无法播放该视频格式，但仍可编辑字幕并重新生成视频";
+}
+
+function updateSubtitlePreviewPosition() {
+  subtitlePreviewOverlay.className = `subtitle-preview-overlay ${subtitlePreviewPosition.value}`;
+}
+
+function handleSubtitleRowClick(event) {
+  if (event.target.closest("input, textarea")) return;
+  const row = event.target.closest(".subtitle-edit-row");
+  if (!row || !editingVideoPath) return;
+  const startMs = parseSubtitleTimestamp(row.querySelector("[data-subtitle-start]").value);
+  if (startMs === null) return;
+  subtitlePreviewVideo.currentTime = startMs / 1000;
+  renderSubtitlePreviewRow(row);
+}
+
+function syncSubtitlePreview() {
+  const currentMs = Math.round((subtitlePreviewVideo.currentTime || 0) * 1000);
+  const duration = Number.isFinite(subtitlePreviewVideo.duration) ? subtitlePreviewVideo.duration : 0;
+  subtitlePreviewTime.textContent = `${formatPreviewTime(currentMs / 1000)} / ${formatPreviewTime(duration)}`;
+  const row = Array.from(subtitleEditorRows.querySelectorAll(".subtitle-edit-row")).find((item) => {
+    const start = parseSubtitleTimestamp(item.querySelector("[data-subtitle-start]").value);
+    const end = parseSubtitleTimestamp(item.querySelector("[data-subtitle-end]").value);
+    return start !== null && end !== null && currentMs >= start && currentMs < end;
+  });
+  renderSubtitlePreviewRow(row || null);
+}
+
+function renderSubtitlePreviewRow(row) {
+  subtitleEditorRows.querySelectorAll(".subtitle-edit-row.is-active").forEach((item) => {
+    item.classList.remove("is-active");
+  });
+  const text = row?.querySelector("[data-subtitle-text]")?.value.trim() || "";
+  if (row) row.classList.add("is-active");
+  subtitlePreviewOverlay.textContent = text;
+  subtitlePreviewOverlay.hidden = !text;
+}
+
+function parseSubtitleTimestamp(value) {
+  const match = String(value || "").trim().match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
+  if (!match) return null;
+  const [, hours, minutes, seconds, milliseconds] = match.map(Number);
+  if (minutes > 59 || seconds > 59) return null;
+  return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds;
+}
+
+function formatPreviewTime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const remainder = total % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
 }
 
 function subtitleEditorRow(segment) {
@@ -573,7 +669,7 @@ async function saveEditedSubtitles(regenerate) {
     subtitleEditorMessage.textContent = `已保存 ${data.count} 条字幕，原文件已备份`;
     if (regenerate) {
       if (!editingVideoPath) throw new Error("当前任务没有可用于重新生成的视频路径");
-      const selectedPosition = subtitlePosition.value === "auto" ? "above-bottom" : subtitlePosition.value;
+      const selectedPosition = subtitlePreviewPosition.value;
       const renderResponse = await fetch("/api/subtitles/render", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -725,7 +821,7 @@ function resultItem(kind, path, action = "") {
       <div class="result-kind">${escapeHtml(kind)}</div>
       <div class="result-path">${safePath}</div>
       <div class="row-actions">
-        ${action === "edit" ? `<button class="small-button" type="button" data-edit-subtitle="${escapeAttribute(path)}">编辑字幕</button>` : ""}
+        ${action === "edit" ? `<button class="preview-subtitle-button" type="button" data-edit-subtitle="${escapeAttribute(path)}">预览并校对字幕</button>` : ""}
         <button class="copy-button" type="button" data-copy="${escapeAttribute(path)}">复制路径</button>
       </div>
     </article>
