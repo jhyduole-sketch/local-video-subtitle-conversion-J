@@ -78,7 +78,7 @@ def parse_srt(content: str) -> list[SubtitleSegment]:
 
 
 def read_srt(path: Path) -> list[SubtitleSegment]:
-    return parse_srt(path.read_text(encoding="utf-8-sig"))
+    return parse_srt(path.read_text(encoding="utf-8-sig", errors="replace"))
 
 
 def render_srt(segments: list[SubtitleSegment]) -> str:
@@ -116,4 +116,3 @@ def replace_text(
             )
         )
     return translated_segments
-

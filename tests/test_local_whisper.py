@@ -43,3 +43,5 @@ class LocalWhisperTests(unittest.TestCase):
 
         self.assertEqual(segments[0].text, "hello")
         self.assertIs(run_process.call_args.kwargs["cancel_check"], cancel_check)
+        command = run_process.call_args.args[0]
+        self.assertEqual(command[command.index("-ml") + 1], "80")

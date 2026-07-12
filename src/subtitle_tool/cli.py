@@ -14,7 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="subtitle-tool",
         description="Generate translated SRT subtitles from embedded subtitles or video audio.",
     )
-    parser.add_argument("input", help="Input video path or TalkSmith share URL.")
+    parser.add_argument(
+        "input",
+        help="Local video path or public video URL. Unknown sites are tried with yt-dlp.",
+    )
     parser.add_argument(
         "--target-lang",
         action="append",
@@ -47,12 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force-download",
         action="store_true",
-        help="Re-download TalkSmith videos even when a cached file exists.",
+        help="Re-download URL videos even when a cached file exists.",
     )
     parser.add_argument(
         "--download-only",
         action="store_true",
-        help="Download the TalkSmith video and skip subtitle generation.",
+        help="Download the URL video and skip subtitle generation.",
     )
     parser.add_argument(
         "--transcriber",
@@ -67,9 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--translator",
-        choices=["openai", "z-ai", "local-transformer", "local-nllb"],
+        choices=[
+            "openai",
+            "z-ai",
+            "local-transformer",
+            "local-nllb",
+            "local-nllb-quality",
+        ],
         default="openai",
-        help="Subtitle translation engine. Use z-ai with ZAI_API_KEY, local-transformer for fast zh/ja/en offline translation, or local-nllb for local multilingual translation.",
+        help="Subtitle translation engine. Use local-nllb for NLLB 600M fast mode or local-nllb-quality for NLLB 1.3B quality mode.",
     )
     parser.add_argument(
         "--embed-subtitles",

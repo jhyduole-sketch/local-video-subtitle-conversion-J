@@ -3,13 +3,18 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .errors import DependencyError, SubtitleToolError
 from .srt import SubtitleSegment
 
 
 NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+NLLB_QUALITY_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
+NLLB_MODEL_VARIANTS = (
+    ("NLLB 600M（快速）", NLLB_MODEL_NAME),
+    ("NLLB 1.3B（质量）", NLLB_QUALITY_MODEL_NAME),
+)
 DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE = 8
 
 NLLB_LANG_CODES = {
@@ -118,7 +123,11 @@ def translate_segments_locally(
 
 
 def translate_segments_with_nllb(
-    segments: list[SubtitleSegment], source_lang: str | None, target_lang: str
+    segments: list[SubtitleSegment],
+    source_lang: str | None,
+    target_lang: str,
+    model_name: str = NLLB_MODEL_NAME,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> dict[int, str]:
     source = normalize_lang(source_lang)
     target = normalize_lang(target_lang)
@@ -126,7 +135,8 @@ def translate_segments_with_nllb(
         source = _infer_source_lang_from_segments(segments, target)
     source_code = _nllb_lang_code(source)
     target_code = _nllb_lang_code(target)
-    tokenizer, model, torch = _load_model(NLLB_MODEL_NAME)
+    tokenizer, model, torch = _load_model(model_name)
+    model_label = _nllb_model_label(model_name)
 
     translations: dict[int, str] = {}
     model.eval()
@@ -148,6 +158,16 @@ def translate_segments_with_nllb(
                     "max_new_tokens": 160,
                     "num_beams": 4,
                 },
+                progress_callback=progress_callback,
+                model_label=model_label,
+                retry_generation_options={
+                    "forced_bos_token_id": forced_bos_token_id,
+                    "max_new_tokens": 96,
+                    "num_beams": 2,
+                    "no_repeat_ngram_size": 3,
+                    "repetition_penalty": 1.15,
+                    "early_stopping": True,
+                },
             )
         )
     return translations
@@ -161,11 +181,21 @@ def _translate_batches(
     target_lang: str,
     prompt_builder: Any,
     generation_options: dict[str, Any],
+    progress_callback: Callable[[str], None] | None = None,
+    model_label: str = "本地模型",
+    retry_generation_options: dict[str, Any] | None = None,
 ) -> dict[int, str]:
     translations: dict[int, str] = {}
     batch_size = _local_translation_batch_size()
+    total_batches = max(1, (len(segments) + batch_size - 1) // batch_size)
     for offset in range(0, len(segments), batch_size):
         batch = segments[offset : offset + batch_size]
+        batch_number = offset // batch_size + 1
+        if progress_callback:
+            progress_callback(
+                f"{model_label} 翻译第 {batch_number}/{total_batches} 批 "
+                f"（{offset + 1}-{offset + len(batch)}/{len(segments)}）"
+            )
         source_texts = [segment.text.replace("\n", " ").strip() for segment in batch]
         prompts = [prompt_builder(text) for text in source_texts]
         inputs = tokenizer(
@@ -189,9 +219,68 @@ def _translate_batches(
             batch, source_texts, translated_texts
         ):
             translated = translated.strip()
-            _validate_local_translation(segment, translated, target_lang)
+            try:
+                _validate_local_translation(segment, translated, target_lang)
+            except SubtitleToolError as first_error:
+                if retry_generation_options is None:
+                    raise
+                if progress_callback:
+                    progress_callback(
+                        f"{model_label} 第 {segment.index} 条质量异常，正在单句重试："
+                        f"{first_error}"
+                    )
+                try:
+                    retry_inputs = tokenizer(
+                        [prompt_builder(source_text)],
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=256,
+                    )
+                    retry_outputs = _generate_local_batch(
+                        model,
+                        retry_inputs,
+                        torch,
+                        _retry_options_for_text(
+                            retry_generation_options, source_text
+                        ),
+                    )
+                    retry_texts = tokenizer.batch_decode(
+                        retry_outputs, skip_special_tokens=True
+                    )
+                    if len(retry_texts) != 1:
+                        raise SubtitleToolError(
+                            "Local translation retry returned an unexpected result."
+                        )
+                    translated = retry_texts[0].strip()
+                    _validate_local_translation(segment, translated, target_lang)
+                except Exception as retry_error:
+                    if progress_callback:
+                        progress_callback(
+                            f"{model_label} 第 {segment.index} 条单句重试失败："
+                            f"{retry_error}"
+                        )
+                    raise SubtitleToolError(
+                        f"{model_label} single-subtitle retry failed at index "
+                        f"{segment.index}: {retry_error}"
+                    ) from retry_error
+                if progress_callback:
+                    progress_callback(
+                        f"{model_label} 第 {segment.index} 条单句重试成功"
+                    )
             translations[segment.index] = translated or source_text
     return translations
+
+
+def _retry_options_for_text(
+    options: dict[str, Any], source_text: str
+) -> dict[str, Any]:
+    retry_options = dict(options)
+    retry_options["max_new_tokens"] = min(
+        int(retry_options.get("max_new_tokens", 96)),
+        max(16, len(source_text) * 4 + 12),
+    )
+    return retry_options
 
 
 def _generate_local_batch(
@@ -409,13 +498,37 @@ def local_translation_model_statuses(
     ]
 
 
-def nllb_model_status(cache_root: Path | None = None) -> dict[str, object]:
+def nllb_model_status(
+    cache_root: Path | None = None,
+    model_name: str = NLLB_MODEL_NAME,
+) -> dict[str, object]:
     return {
-        "label": "NLLB 本地多语言",
-        "model": NLLB_MODEL_NAME,
-        "installed": _is_model_cached(NLLB_MODEL_NAME, cache_root),
-        "downloadCommand": _download_command(NLLB_MODEL_NAME),
+        "label": _nllb_model_label(model_name),
+        "model": model_name,
+        "installed": _is_model_cached(model_name, cache_root),
+        "downloadCommand": _download_command(model_name),
     }
+
+
+def nllb_model_statuses(
+    cache_root: Path | None = None,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "label": label,
+            "model": model_name,
+            "installed": _is_model_cached(model_name, cache_root),
+            "downloadCommand": _download_command(model_name),
+        }
+        for label, model_name in NLLB_MODEL_VARIANTS
+    ]
+
+
+def _nllb_model_label(model_name: str) -> str:
+    for label, candidate in NLLB_MODEL_VARIANTS:
+        if candidate == model_name:
+            return label
+    return f"NLLB（{model_name}）"
 
 
 def _nllb_lang_code(language: str) -> str:

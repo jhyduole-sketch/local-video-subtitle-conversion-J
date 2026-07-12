@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -9,12 +10,22 @@ from subtitle_tool.srt import (  # noqa: E402
     format_timestamp,
     parse_srt,
     parse_timestamp,
+    read_srt,
     render_srt,
     replace_text,
 )
 
 
 class SrtTests(unittest.TestCase):
+    def test_read_srt_replaces_invalid_utf8_bytes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "invalid.srt"
+            path.write_bytes(b"1\n00:00:00,000 --> 00:00:01,000\nhello\xffworld\n")
+
+            segments = read_srt(path)
+
+        self.assertEqual(segments[0].text, "hello\ufffdworld")
+
     def test_timestamp_round_trip(self):
         value = "01:02:03,456"
         self.assertEqual(format_timestamp(parse_timestamp(value)), value)
@@ -45,4 +56,3 @@ Bye
 
 if __name__ == "__main__":
     unittest.main()
-

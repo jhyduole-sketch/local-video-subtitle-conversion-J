@@ -9,15 +9,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from subtitle_tool.pipeline import (  # noqa: E402
     PipelineOptions,
+    _resolve_input,
     render_edited_subtitle_video,
     run_pipeline,
 )
+from subtitle_tool.asset_cache import AssetCache  # noqa: E402
+from subtitle_tool.youtube import DownloadedVideo  # noqa: E402
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 from subtitle_tool.srt import SubtitleSegment, read_srt  # noqa: E402
 from subtitle_tool.video_subtitle_detection import SubtitleRegionDetection  # noqa: E402
 
 
 class PipelineTests(unittest.TestCase):
+    def test_unknown_https_url_uses_generic_downloader(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cached_video = root / "cache" / "videos" / "clip-42.mp4"
+            cached_video.parent.mkdir(parents=True)
+            cached_video.write_bytes(b"video")
+            task_dir = root / "output" / "task"
+            options = PipelineOptions(
+                input_value="https://media.example/videos/42",
+                target_langs=[],
+                source_lang=None,
+                out_dir=root / "output",
+                source="auto",
+                output_format="srt",
+                download_only=True,
+            )
+
+            with patch(
+                "subtitle_tool.pipeline.download_generic_video",
+                return_value=DownloadedVideo("clip-42", cached_video),
+            ) as download_generic:
+                input_path, downloaded_path = _resolve_input(
+                    options,
+                    task_dir,
+                    "202607121200001",
+                    AssetCache(root / "cache"),
+                )
+
+        download_generic.assert_called_once()
+        self.assertEqual(input_path.name, "clip-42.202607121200001.mp4")
+        self.assertEqual(downloaded_path, input_path)
+
     def test_generated_files_include_timestamp_suffix(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "input.mp4"
@@ -79,6 +114,44 @@ class PipelineTests(unittest.TestCase):
 
         translate_segments_with_nllb.assert_called_once()
         self.assertIn("vi", result.translated_paths)
+
+    def test_local_nllb_quality_routes_to_1_3b_with_progress_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            progress_messages = []
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(
+                    [SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="こんにちは")],
+                    "audio-local-whisper",
+                ),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments_with_nllb",
+                return_value={1: "你好"},
+            ) as translate_segments_with_nllb:
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["zh-CN"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="local-nllb-quality",
+                        progress_callback=lambda message, percent: progress_messages.append(message),
+                    )
+                )
+
+        self.assertIn("zh-CN", result.translated_paths)
+        self.assertEqual(
+            translate_segments_with_nllb.call_args.kwargs["model_name"],
+            "facebook/nllb-200-distilled-1.3B",
+        )
+        self.assertIsNotNone(
+            translate_segments_with_nllb.call_args.kwargs["progress_callback"]
+        )
 
     def test_same_source_and_target_language_reuses_source_subtitles(self):
         with tempfile.TemporaryDirectory() as tmpdir:

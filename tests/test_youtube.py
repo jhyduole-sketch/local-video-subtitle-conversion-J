@@ -14,6 +14,8 @@ from subtitle_tool.youtube import (  # noqa: E402
     is_bilibili_url,
     is_youtube_url,
 )
+from subtitle_tool import youtube  # noqa: E402
+from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 
 
 class YouTubeTests(unittest.TestCase):
@@ -99,3 +101,66 @@ class YouTubeTests(unittest.TestCase):
 
         self.assertEqual(video.path.name, "BV1rR4y197tP.202607091530129.mp4")
         self.assertIn("https://www.bilibili.com/video/BV1rR4y197tP/?spm_id_from=333", commands[0])
+
+    def test_generic_download_probes_and_downloads_single_video(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            output_path = out_dir / "clip-42.mp4"
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+
+                class Completed:
+                    returncode = 0
+                    stderr = ""
+                    stdout = '{"id":"clip-42","title":"Example","live_status":"not_live"}'
+
+                if "--skip-download" not in command:
+                    output_path.write_bytes(b"video")
+                    Completed.stdout = ""
+                return Completed()
+
+            with patch("subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"), patch(
+                "subtitle_tool.youtube.run_process", side_effect=fake_run
+            ):
+                video = youtube.download_generic_video(
+                    "https://media.example/videos/42",
+                    out_dir,
+                )
+
+        self.assertEqual(video.video_id, "clip-42")
+        self.assertEqual(video.path.name, "clip-42.mp4")
+        self.assertIn("--dump-single-json", commands[0])
+        self.assertIn("--skip-download", commands[0])
+        self.assertIn("--no-playlist", commands[1])
+
+    def test_generic_download_rejects_playlist_metadata(self):
+        class Completed:
+            returncode = 0
+            stderr = ""
+            stdout = '{"id":"list-1","_type":"playlist","entries":[{"id":"a"}]}'
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"
+        ), patch("subtitle_tool.youtube.run_process", return_value=Completed()):
+            with self.assertRaisesRegex(SubtitleToolError, "播放列表"):
+                youtube.download_generic_video(
+                    "https://media.example/playlist/1",
+                    Path(tmpdir),
+                )
+
+    def test_generic_download_explains_login_required(self):
+        class Completed:
+            returncode = 1
+            stdout = ""
+            stderr = "ERROR: Sign in to confirm your age. Use --cookies-from-browser"
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"
+        ), patch("subtitle_tool.youtube.run_process", return_value=Completed()):
+            with self.assertRaisesRegex(SubtitleToolError, "需要登录"):
+                youtube.download_generic_video(
+                    "https://media.example/private/1",
+                    Path(tmpdir),
+                )

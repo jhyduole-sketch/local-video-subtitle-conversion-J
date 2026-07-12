@@ -41,6 +41,8 @@ def transcribe_with_whisper_cpp(
         str(audio_path),
         "-l",
         source_lang or "auto",
+        "-ml",
+        "80",
         "-ng",
         "-osrt",
         "-of",

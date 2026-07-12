@@ -303,6 +303,15 @@ class WebTests(unittest.TestCase):
         self.assertTrue(matching[0]["optional"])
         self.assertIn("模型较大", matching[0]["detail"])
 
+        quality = [
+            check
+            for check in health["checks"]
+            if check["name"] == "本地多语言 NLLB 1.3B（质量）"
+        ]
+        self.assertEqual(len(quality), 1)
+        self.assertFalse(quality[0]["ok"])
+        self.assertIn("下载命令", quality[0]["detail"])
+
     def test_log_line_includes_clock_and_elapsed_time(self):
         job = JobState(id="abc", created_at=100.0)
 

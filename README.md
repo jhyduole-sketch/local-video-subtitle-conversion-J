@@ -1,12 +1,13 @@
 # local-video-subtitle-conversion-J
 
-本项目是一个本地视频字幕转换工具：输入本地视频、TalkSmith 分享链接、YouTube 或 Bilibili 链接，生成目标语言 `.srt` 字幕，并可输出带默认软字幕轨的 MP4 视频。
+本项目是一个本地视频字幕转换工具：输入本地视频或公开视频网址，生成目标语言 `.srt` 字幕，并可输出带字幕轨或固定硬字幕的 MP4 视频。
 
 当前版本重点做的是“稳定产出外挂字幕和软字幕视频”，不是把字幕硬烧录进画面像素里。
 
 ## 功能要点
 
-- 支持本地视频路径、网页上传视频、TalkSmith URL、YouTube URL、Bilibili URL。
+- 支持本地视频路径、网页上传视频、TalkSmith URL、YouTube URL、Bilibili URL，以及其他公开单视频网址的通用尝试下载。
+- TalkSmith、YouTube 和 Bilibili 使用专用处理逻辑；其他 HTTP/HTTPS 地址使用 `yt-dlp` 匿名探测，成功后自动进入字幕流程。
 - YouTube 默认优先下载高清视频，不再优先使用低清 360p 格式。
 - 字幕来源支持自动判断：优先读视频内置字幕，没有内置字幕时再抽音频语音识别。
 - 语音转写支持本地 Whisper 和 OpenAI。
@@ -28,7 +29,7 @@
 - 批量生成不同目标语言的 `.srt` 文件。
 - 给 MP4 添加默认软字幕轨，方便在 IINA / VLC 等播放器里选择字幕。
 - 生成固定位置的硬字幕视频，避开原画面底部字幕。
-- 下载 TalkSmith、YouTube 或 Bilibili 视频后再生成字幕。
+- 下载 TalkSmith、YouTube、Bilibili 或其他受 `yt-dlp` 支持的公开视频后再生成字幕。
 
 ## 重要概念
 
@@ -56,7 +57,7 @@
 - Python 3.9+
 - `ffmpeg` / `ffprobe`
 - `ffmpeg-full`，仅固定位置硬字幕模式需要；它提供 `libass` 过滤器
-- `yt-dlp`，处理 YouTube / Bilibili 链接时需要
+- `yt-dlp`，处理 YouTube、Bilibili 和通用视频网址时需要
 - `whisper.cpp`，本地语音识别时需要
 - whisper.cpp GGML 模型文件，例如 `models/ggml-base.bin`
 - 本地翻译模型缓存，使用本地翻译时需要
@@ -142,7 +143,7 @@ http://127.0.0.1:7860
 
 Web 页面支持：
 
-- 输入 YouTube / Bilibili / TalkSmith URL。
+- 输入 YouTube / Bilibili / TalkSmith URL，或尝试其他公开单视频网址。
 - 输入本地视频路径。
 - 上传本地视频文件。上传视频优先级高于文本框里的 URL 或路径。
 - 选择原视频语言和目标语言。
@@ -267,7 +268,9 @@ env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v
 input
 ```
 
-输入视频路径或 URL。支持本地视频、TalkSmith 分享 URL、YouTube URL、Bilibili URL。
+输入视频路径或 URL。TalkSmith、YouTube 和 Bilibili 优先使用专用逻辑；其他 HTTP/HTTPS 地址会尝试由 `yt-dlp` 匿名解析和下载。
+
+通用下载 v1 只处理公开的单个点播视频，不自动读取浏览器 Cookie，也不支持需要登录、DRM、直播或播放列表。网站不受支持、触发 `403/429`、存在地区限制或网络超时时，页面和任务日志会显示对应原因。通用解析是尽力尝试，不代表所有视频网站都保证可下载。
 
 ```text
 --source-lang
@@ -309,6 +312,7 @@ input
 - `z-ai`
 - `local-transformer`
 - `local-nllb`
+- `local-nllb-quality`
 - `openai`
 
 ```text
@@ -417,23 +421,26 @@ python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoT
 如果需要离线支持更多语言，可以在 Web 页面选择：
 
 ```text
-本地多语言模型（NLLB）
+本地多语言 NLLB 600M（快速）
+本地多语言 NLLB 1.3B（质量）
 ```
 
-当前使用模型：
+两个档位分别使用：
 
 ```text
 facebook/nllb-200-distilled-600M
+facebook/nllb-200-distilled-1.3B
 ```
 
 它支持常用目标语言，例如 `zh-CN`、`zh-TW`、`ja`、`en`、`ko`、`fr`、`de`、`es`、`pt`、`it`、`ru`、`ar`、`th`、`vi`、`id`。
 
-NLLB 模型较大，首次下载会比较慢，CPU 翻译速度也比本地快速模型慢。工具不会自动下载该模型；Web 页面右侧“环境”区会显示是否已安装，并给出下载命令。
+600M 适合快速粗翻，1.3B 适合质量优先。NLLB 模型较大，首次下载会比较慢，CPU 翻译速度也比本地快速模型慢。工具不会在任务中静默下载模型；Web 页面右侧“环境”区会分别显示两个型号是否已安装，并给出下载命令。
 
 手动下载命令示例：
 
 ```bash
 python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-600M', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-600M')"
+python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-1.3B', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-1.3B')"
 ```
 
 本地快速模型速度快，但质量不如 z.ai / OpenAI，也不支持越南语、韩语、法语等更多语言方向。NLLB 覆盖语言更多，但模型更大、速度更慢。遇到源字幕质量差时，本地模型可能出现重复词、重复句或语义崩坏。
@@ -444,6 +451,8 @@ python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoT
 - 明显过长的翻译会失败。
 - 重复词/重复短语过多会失败，例如 `密かに密かに密かに...`。
 - 目标是日语但输出明显不像日语时会失败。
+
+NLLB 按批次输出进度日志。某一条字幕出现空白、乱码、超长或重复内容时，只对该条使用更严格的防重复参数重新翻译；重试成功后继续后面的字幕，不会因为第一次异常立即放弃整批结果。
 
 检测失败时不会继续生成坏字幕视频，日志会提示改用 z.ai / OpenAI 或先改善源字幕。
 

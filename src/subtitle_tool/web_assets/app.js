@@ -127,7 +127,12 @@ const languagePickerModes = {
   "local-nllb": {
     languages: nllbLanguages,
     allowCustom: false,
-    hint: "NLLB 覆盖更多本地语言，但模型更大、速度更慢。",
+    hint: "NLLB 600M 覆盖更多本地语言，速度较快；异常字幕会自动单句重试。",
+  },
+  "local-nllb-quality": {
+    languages: nllbLanguages,
+    allowCustom: false,
+    hint: "NLLB 1.3B 质量更高但速度更慢；异常字幕会自动单句重试。",
   },
   "z-ai": {
     languages: cloudLanguages,

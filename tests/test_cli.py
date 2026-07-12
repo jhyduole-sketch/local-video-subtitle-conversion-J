@@ -74,6 +74,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(run_pipeline.call_args.args[0].translator, "local-nllb")
 
+    def test_local_nllb_quality_translator_option_is_passed_to_pipeline(self):
+        with patch("subtitle_tool.cli.run_pipeline") as run_pipeline:
+            run_pipeline.return_value.source_subtitle_path = Path("/tmp/source.ja.srt")
+            run_pipeline.return_value.translated_paths = {"zh-CN": Path("/tmp/subtitles.zh.srt")}
+            run_pipeline.return_value.failed_languages = {}
+            run_pipeline.return_value.source_kind = "audio-local-whisper"
+            run_pipeline.return_value.downloaded_video_path = None
+            run_pipeline.return_value.subtitled_video_paths = None
+            exit_code = main(
+                [
+                    "input.mp4",
+                    "--source-lang",
+                    "ja",
+                    "--target-lang",
+                    "zh-CN",
+                    "--translator",
+                    "local-nllb-quality",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            run_pipeline.call_args.args[0].translator, "local-nllb-quality"
+        )
+
     def test_hard_subtitle_video_options_are_passed_to_pipeline(self):
         with patch("subtitle_tool.cli.run_pipeline") as run_pipeline:
             run_pipeline.return_value.source_subtitle_path = Path("/tmp/source.ja.srt")

@@ -22,7 +22,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .env import load_dotenv
 from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError
-from .local_translate import local_translation_model_statuses, nllb_model_status
+from .local_translate import (
+    NLLB_MODEL_NAME,
+    NLLB_QUALITY_MODEL_NAME,
+    local_translation_model_statuses,
+    nllb_model_status,
+)
 from .job_store import JobStore
 from .runtime_paths import cache_root, state_database_path
 from .media import ass_ffmpeg_binary
@@ -152,7 +157,18 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
         },
     ]
     checks.extend(_local_translation_model_checks())
-    checks.append(_nllb_model_check())
+    checks.append(
+        _nllb_model_check(
+            NLLB_MODEL_NAME,
+            "本地多语言 NLLB",
+        )
+    )
+    checks.append(
+        _nllb_model_check(
+            NLLB_QUALITY_MODEL_NAME,
+            "本地多语言 NLLB 1.3B（质量）",
+        )
+    )
     return {
         "checks": checks,
         "ok": all(check["ok"] for check in checks if not check.get("optional")),
@@ -794,8 +810,8 @@ def _local_translation_model_checks() -> list[dict[str, object]]:
     return checks
 
 
-def _nllb_model_check() -> dict[str, object]:
-    status = nllb_model_status()
+def _nllb_model_check(model_name: str, display_name: str) -> dict[str, object]:
+    status = nllb_model_status(model_name=model_name)
     installed = bool(status["installed"])
     detail = "已安装"
     if not installed:
@@ -804,7 +820,7 @@ def _nllb_model_check() -> dict[str, object]:
             f"{status['downloadCommand']}"
         )
     return {
-        "name": "本地多语言 NLLB",
+        "name": display_name,
         "ok": installed,
         "optional": True,
         "detail": detail,

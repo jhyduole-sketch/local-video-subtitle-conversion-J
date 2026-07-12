@@ -11,7 +11,13 @@ from typing import Callable
 
 from .errors import CancellationError, MediaError, SubtitleToolError
 from .asset_cache import AssetCache
-from .local_translate import normalize_lang, translate_segments_locally, translate_segments_with_nllb
+from .local_translate import (
+    NLLB_MODEL_NAME,
+    NLLB_QUALITY_MODEL_NAME,
+    normalize_lang,
+    translate_segments_locally,
+    translate_segments_with_nllb,
+)
 from .local_whisper import transcribe_with_whisper_cpp
 from .media import (
     burn_subtitle_track,
@@ -33,6 +39,7 @@ from .video_subtitle_detection import (
 )
 from .youtube import (
     download_bilibili_video,
+    download_generic_video,
     download_youtube_video,
     extract_bilibili_id,
     extract_youtube_id,
@@ -85,9 +92,16 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         raise SubtitleToolError("--source must be one of: auto, embedded, audio.")
     if options.transcriber not in {"openai", "local-whisper"}:
         raise SubtitleToolError("--transcriber must be one of: openai, local-whisper.")
-    if options.translator not in {"openai", "z-ai", "local-transformer", "local-nllb"}:
+    if options.translator not in {
+        "openai",
+        "z-ai",
+        "local-transformer",
+        "local-nllb",
+        "local-nllb-quality",
+    }:
         raise SubtitleToolError(
-            "--translator must be one of: openai, z-ai, local-transformer, local-nllb."
+            "--translator must be one of: openai, z-ai, local-transformer, "
+            "local-nllb, local-nllb-quality."
         )
     if options.subtitle_video_mode not in {"soft", "hard"}:
         raise SubtitleToolError("--subtitle-video-mode must be one of: soft, hard.")
@@ -472,12 +486,29 @@ def _translate_target(
             ),
             "本地快速模型",
         )
-    if options.translator == "local-nllb":
+    if options.translator in {"local-nllb", "local-nllb-quality"}:
+        model_name = (
+            NLLB_QUALITY_MODEL_NAME
+            if options.translator == "local-nllb-quality"
+            else NLLB_MODEL_NAME
+        )
+        engine = (
+            "本地 NLLB 1.3B（质量）"
+            if options.translator == "local-nllb-quality"
+            else "本地 NLLB 600M（快速）"
+        )
+        _progress(options, f"加载{engine}并开始批量翻译", progress_percent)
         return (
             translate_segments_with_nllb(
-                source_segments, options.source_lang, target_lang
+                source_segments,
+                options.source_lang,
+                target_lang,
+                model_name=model_name,
+                progress_callback=lambda message: _progress(
+                    options, message, progress_percent
+                ),
             ),
-            "本地 NLLB",
+            engine,
         )
     if options.translator == "openai":
         return (
@@ -526,7 +557,13 @@ def _translate_target(
 
     try:
         translations = translate_segments_with_nllb(
-            source_segments, options.source_lang, target_lang
+            source_segments,
+            options.source_lang,
+            target_lang,
+            model_name=NLLB_MODEL_NAME,
+            progress_callback=lambda message: _progress(
+                options, message, progress_percent
+            ),
         )
         return translations, "本地模型"
     except Exception as nllb_error:
@@ -598,9 +635,18 @@ def _resolve_input(
         return task_path, task_path
 
     if is_url(options.input_value):
-        raise SubtitleToolError(
-            "Unsupported URL. v1 supports TalkSmith share URLs, YouTube URLs, and Bilibili URLs."
+        _progress(options, "未匹配专用站点，正在尝试通用网址解析", 8)
+        video = download_generic_video(
+            options.input_value,
+            asset_cache.videos_dir,
+            options.force_download,
+            None,
+            options.cancel_check,
         )
+        task_path = asset_cache.materialize_video(
+            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
+        )
+        return task_path, task_path
 
     input_path = Path(options.input_value).expanduser().resolve()
     _progress(options, "检查本地视频文件", 8)

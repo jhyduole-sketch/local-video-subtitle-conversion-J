@@ -27,8 +27,9 @@
               id="input"
               name="input"
               rows="3"
-              placeholder="https://www.youtube.com/watch?v=...、https://www.bilibili.com/video/BV... 或 /Users/.../video.mp4"
+              placeholder="YouTube、Bilibili、TalkSmith、其他公开单视频网址，或 /Users/.../video.mp4"
             ></textarea>
+            <p class="field-hint">专用站点优先处理；其他公开网址会尝试通用解析，不支持登录、DRM、直播或播放列表。</p>
           </div>
 
           <div class="field span-all">
@@ -74,7 +75,8 @@
             <select id="translator" name="translator">
               <option value="z-ai" selected>z.ai 翻译（推荐）</option>
               <option value="local-transformer">本地快速模型（中/日/英）</option>
-              <option value="local-nllb">本地多语言模型（NLLB）</option>
+              <option value="local-nllb">本地多语言 NLLB 600M（快速）</option>
+              <option value="local-nllb-quality">本地多语言 NLLB 1.3B（质量）</option>
               <option value="openai">OpenAI 翻译（高质量备用）</option>
             </select>
           </div>

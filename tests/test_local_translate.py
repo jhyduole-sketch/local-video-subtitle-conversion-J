@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 from subtitle_tool.local_translate import (  # noqa: E402
     NLLB_MODEL_NAME,
+    NLLB_QUALITY_MODEL_NAME,
     _download_command,
     _is_model_cached,
     _infer_source_lang_from_segments,
@@ -16,16 +17,75 @@ from subtitle_tool.local_translate import (  # noqa: E402
     _nllb_lang_code,
     local_translation_model_statuses,
     nllb_model_status,
+    nllb_model_statuses,
     normalize_lang,
     _resolve_model,
     _repeated_unit,
     _validate_local_translation,
     translate_segments_locally,
+    translate_segments_with_nllb,
 )
 from subtitle_tool.srt import SubtitleSegment  # noqa: E402
 
 
 class LocalTranslateQualityTests(unittest.TestCase):
+    def test_nllb_retries_only_invalid_subtitle_with_safe_options(self):
+        class FakeTokenizer:
+            src_lang = ""
+
+            def __call__(self, texts, **kwargs):
+                return {"input_ids": texts}
+
+            def convert_tokens_to_ids(self, value):
+                return 42
+
+            def batch_decode(self, outputs, **kwargs):
+                return outputs
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def eval(self):
+                return None
+
+            def generate(self, input_ids, **kwargs):
+                self.calls.append((list(input_ids), kwargs))
+                if len(input_ids) == 2:
+                    return ["你好。", "，等" * 12]
+                return ["等等。"]
+
+        class FakeTorch:
+            @staticmethod
+            def no_grad():
+                return nullcontext()
+
+        model = FakeModel()
+        progress = []
+        segments = [
+            SubtitleSegment(index=20, start_ms=0, end_ms=1000, text="こんにちは。"),
+            SubtitleSegment(index=21, start_ms=1000, end_ms=2000, text="え、待って。"),
+        ]
+        with patch(
+            "subtitle_tool.local_translate._load_model",
+            return_value=(FakeTokenizer(), model, FakeTorch()),
+        ) as load_model:
+            translations = translate_segments_with_nllb(
+                segments,
+                "ja",
+                "zh-CN",
+                model_name=NLLB_QUALITY_MODEL_NAME,
+                progress_callback=progress.append,
+            )
+
+        load_model.assert_called_once_with(NLLB_QUALITY_MODEL_NAME)
+        self.assertEqual(translations, {20: "你好。", 21: "等等。"})
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(model.calls[1][0], ["え、待って。"])
+        self.assertEqual(model.calls[1][1]["no_repeat_ngram_size"], 3)
+        self.assertTrue(any("第 21 条" in message for message in progress))
+        self.assertTrue(any("重试成功" in message for message in progress))
+
     def test_local_translation_batches_multiple_segments_per_tokenizer_call(self):
         class FakeTokenizer:
             def __init__(self):
@@ -188,6 +248,14 @@ class LocalTranslateQualityTests(unittest.TestCase):
 
         self.assertEqual(status["model"], NLLB_MODEL_NAME)
         self.assertIn(NLLB_MODEL_NAME, str(status["downloadCommand"]))
+
+    def test_nllb_model_statuses_include_fast_and_quality_models(self):
+        statuses = nllb_model_statuses()
+
+        self.assertEqual(
+            [status["model"] for status in statuses],
+            [NLLB_MODEL_NAME, NLLB_QUALITY_MODEL_NAME],
+        )
 
     def test_model_cache_detection_uses_huggingface_layout(self):
         import tempfile

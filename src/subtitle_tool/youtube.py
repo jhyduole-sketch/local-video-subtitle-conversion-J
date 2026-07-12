@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +105,60 @@ def download_bilibili_video(
     )
 
 
+def download_generic_video(
+    value: str,
+    out_dir: Path,
+    force: bool = False,
+    timestamp_suffix: str | None = None,
+    cancel_check: CancelCheck | None = None,
+) -> DownloadedVideo:
+    clean_value = clean_video_url(value)
+    parsed = urlparse(clean_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SubtitleToolError("通用下载只支持有效的 HTTP/HTTPS 视频网址。")
+
+    yt_dlp = _find_ytdlp()
+    probe = run_process(
+        [
+            yt_dlp,
+            "--dump-single-json",
+            "--skip-download",
+            "--flat-playlist",
+            "--no-warnings",
+            clean_value,
+        ],
+        cancel_check=cancel_check,
+    )
+    if probe.returncode != 0:
+        detail = probe.stderr.strip() or probe.stdout.strip()
+        raise _generic_download_error(detail, "解析")
+
+    try:
+        metadata = json.loads(probe.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise SubtitleToolError("通用解析失败：网站没有返回有效的视频信息。") from exc
+    if not isinstance(metadata, dict):
+        raise SubtitleToolError("通用解析失败：网站返回了无法识别的视频信息。")
+    if metadata.get("_type") in {"playlist", "multi_video"} or metadata.get("entries"):
+        raise SubtitleToolError("检测到播放列表或多集视频；当前版本只支持单个视频网址。")
+    if metadata.get("is_live") or metadata.get("live_status") in {"is_live", "is_upcoming"}:
+        raise SubtitleToolError("检测到直播或待开播内容；当前版本只支持普通点播视频。")
+
+    video_id = _safe_video_id(str(metadata.get("id") or "video"))
+    return _download_with_ytdlp(
+        value=value,
+        out_dir=out_dir,
+        force=force,
+        timestamp_suffix=timestamp_suffix,
+        video_id=video_id,
+        clean_value=clean_value,
+        label="通用网址",
+        cancel_check=cancel_check,
+        error_factory=lambda detail: _generic_download_error(detail, "下载"),
+        remux_video=True,
+    )
+
+
 def _download_with_ytdlp(
     *,
     value: str,
@@ -113,10 +169,10 @@ def _download_with_ytdlp(
     clean_value: str,
     label: str,
     cancel_check: CancelCheck | None = None,
+    error_factory=None,
+    remux_video: bool = False,
 ) -> DownloadedVideo:
-    yt_dlp = shutil.which("yt-dlp")
-    if yt_dlp is None:
-        raise DependencyError("yt-dlp is not installed. Install it with: brew install yt-dlp")
+    yt_dlp = _find_ytdlp()
 
     downloads_dir = out_dir
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -135,15 +191,53 @@ def _download_with_ytdlp(
         "--no-playlist",
         "-o",
         output_template,
-        clean_value,
     ]
+    if remux_video:
+        command.extend(["--remux-video", "mp4"])
+    command.append(clean_value)
     completed = run_process(command, cancel_check=cancel_check)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
+        if error_factory:
+            raise error_factory(detail)
         raise SubtitleToolError(f"{label} download failed: {detail}")
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise SubtitleToolError(f"{label} download did not produce an MP4 file.")
     return DownloadedVideo(video_id=video_id, path=output_path)
+
+
+def _find_ytdlp() -> str:
+    yt_dlp = shutil.which("yt-dlp")
+    if yt_dlp is None:
+        raise DependencyError("yt-dlp is not installed. Install it with: brew install yt-dlp")
+    return yt_dlp
+
+
+def _safe_video_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+    return safe[:120] or "video"
+
+
+def _generic_download_error(detail: str, stage: str) -> SubtitleToolError:
+    normalized = detail.lower()
+    if any(marker in normalized for marker in ("sign in", "login", "log in", "cookies")):
+        message = "页面需要登录，当前通用下载不会自动读取浏览器登录信息。"
+    elif "drm" in normalized:
+        message = "视频受 DRM 保护，当前工具无法下载或绕过保护。"
+    elif any(marker in normalized for marker in ("geo", "not available in your country", "region")):
+        message = "视频存在地区限制，当前网络位置无法访问。"
+    elif any(marker in normalized for marker in ("http error 429", "too many requests", "rate limit")):
+        message = "网站触发访问限流（429），请稍后重试或上传本地视频。"
+    elif any(marker in normalized for marker in ("http error 403", "forbidden")):
+        message = "网站拒绝访问（403），可能存在防爬验证或访问限制。"
+    elif any(marker in normalized for marker in ("unsupported url", "no suitable extractor")):
+        message = "当前网站暂不受通用下载器支持，请上传本地视频。"
+    elif any(marker in normalized for marker in ("timed out", "timeout", "temporary failure", "network")):
+        message = "访问网站超时或网络异常，请检查网络后重试。"
+    else:
+        compact_detail = " ".join(detail.split())[:500]
+        message = f"未能取得视频：{compact_detail}" if compact_detail else "未能取得视频。"
+    return SubtitleToolError(f"通用网址{stage}失败：{message}")
 
 
 def clean_youtube_url(value: str) -> str:
