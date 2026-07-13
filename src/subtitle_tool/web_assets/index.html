@@ -122,12 +122,29 @@
           </div>
 
           <div class="field">
+            <label for="whisperVadModel">VAD 模型路径</label>
+            <input id="whisperVadModel" name="whisperVadModel" value="models/ggml-silero-v6.2.0.bin" />
+            <p class="field-hint">VAD 会跳过静音片段；模型缺失时自动继续标准转写。</p>
+          </div>
+
+          <div class="field">
             <label for="subtitleVideoMode">字幕视频模式</label>
             <select id="subtitleVideoMode" name="subtitleVideoMode">
               <option value="soft">软字幕（保持原画质）</option>
               <option value="hard" selected>稳定硬字幕（固定位置）</option>
             </select>
             <p id="subtitleVideoModeHint" class="field-hint">软字幕可开关，但具体位置由播放器控制。</p>
+          </div>
+
+          <div class="field">
+            <label for="subtitleEncodingProfile">硬字幕编码方式</label>
+            <select id="subtitleEncodingProfile" name="subtitleEncodingProfile">
+              <option value="auto" selected>自动推荐（Apple 硬件优先）</option>
+              <option value="hardware">Apple VideoToolbox（低 CPU）</option>
+              <option value="fast">快速 CPU（兼容性好）</option>
+              <option value="quality">高画质 CPU（最慢）</option>
+            </select>
+            <p id="subtitleEncodingHint" class="field-hint">自动模式优先使用 Apple 硬件编码，失败时切换快速 CPU。</p>
           </div>
 
           <div class="field">
@@ -142,6 +159,8 @@
           </div>
 
           <div class="toggles span-all">
+            <label><input id="whisperUseGpu" name="whisperUseGpu" type="checkbox" checked /> Metal/GPU 加速</label>
+            <label><input id="whisperUseVad" name="whisperUseVad" type="checkbox" checked /> VAD 跳过静音</label>
             <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
             <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 自动避让原字幕（使用稳定硬字幕）</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>

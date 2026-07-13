@@ -16,6 +16,7 @@ from subtitle_tool.pipeline import (  # noqa: E402
 from subtitle_tool.asset_cache import AssetCache  # noqa: E402
 from subtitle_tool.youtube import DownloadedVideo  # noqa: E402
 from subtitle_tool.errors import SubtitleToolError  # noqa: E402
+from subtitle_tool.media import EncodingProgress  # noqa: E402
 from subtitle_tool.srt import SubtitleSegment, read_srt  # noqa: E402
 from subtitle_tool.video_subtitle_detection import SubtitleRegionDetection  # noqa: E402
 
@@ -428,6 +429,14 @@ class PipelineTests(unittest.TestCase):
             source_segments = [
                 SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
             ]
+            progress_messages = []
+
+            def fake_burn(video, ass, output, cancel_check=None, **kwargs):
+                kwargs["status_callback"]("使用 Apple VideoToolbox 硬件编码")
+                kwargs["progress_callback"](
+                    EncodingProgress(5.0, 10.0, 50, 2.0, 2.5)
+                )
+                return output
 
             with patch(
                 "subtitle_tool.pipeline._load_source_segments",
@@ -438,7 +447,7 @@ class PipelineTests(unittest.TestCase):
             ), patch(
                 "subtitle_tool.pipeline.write_ass"
             ) as write_ass, patch(
-                "subtitle_tool.pipeline.burn_subtitle_track"
+                "subtitle_tool.pipeline.burn_subtitle_track", side_effect=fake_burn
             ) as burn, patch(
                 "subtitle_tool.pipeline.mux_subtitle_track"
             ) as mux:
@@ -455,12 +464,20 @@ class PipelineTests(unittest.TestCase):
                         avoid_subtitle_overlap=True,
                         subtitle_video_mode="hard",
                         subtitle_position="auto",
+                        subtitle_encoding_profile="auto",
+                        progress_callback=lambda message, percent: progress_messages.append(
+                            (message, percent)
+                        ),
                     )
                 )
 
         write_ass.assert_called_once()
         self.assertEqual(write_ass.call_args.args[2], "above-bottom")
         burn.assert_called_once()
+        self.assertEqual(burn.call_args.kwargs["encoding_profile"], "auto")
+        self.assertTrue(any("50%" in message for message, _ in progress_messages))
+        self.assertTrue(any("预计剩余" in message for message, _ in progress_messages))
+        self.assertTrue(any(percent > 93 for _, percent in progress_messages))
         mux.assert_not_called()
         self.assertRegex(result.subtitled_video_paths["en"].name, r"\.en\.fixed-sub\.mp4$")
 
@@ -581,6 +598,9 @@ class PipelineTests(unittest.TestCase):
                     source="audio",
                     output_format="srt",
                     transcriber="local-whisper",
+                    whisper_use_gpu=False,
+                    whisper_use_vad=False,
+                    whisper_vad_model=Path(tmpdir) / "vad.bin",
                 )
                 first = run_pipeline(options)
                 second = run_pipeline(options)
@@ -589,6 +609,9 @@ class PipelineTests(unittest.TestCase):
 
         extract_audio.assert_called_once()
         transcribe.assert_called_once()
+        self.assertFalse(transcribe.call_args.kwargs["use_gpu"])
+        self.assertFalse(transcribe.call_args.kwargs["use_vad"])
+        self.assertEqual(transcribe.call_args.kwargs["vad_model_path"].name, "vad.bin")
         self.assertEqual(first_text, second_text)
 
     def test_render_edited_hard_subtitle_video_uses_saved_srt(self):

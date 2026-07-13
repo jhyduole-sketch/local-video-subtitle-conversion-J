@@ -30,8 +30,10 @@ const refreshCacheButton = document.querySelector("#refreshCacheButton");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const subtitleVideoMode = document.querySelector("#subtitleVideoMode");
+const subtitleEncodingProfile = document.querySelector("#subtitleEncodingProfile");
 const subtitlePosition = document.querySelector("#subtitlePosition");
 const subtitleVideoModeHint = document.querySelector("#subtitleVideoModeHint");
+const subtitleEncodingHint = document.querySelector("#subtitleEncodingHint");
 const avoidSubtitleOverlap = document.querySelector("#avoidSubtitleOverlap");
 const subtitleEditorDialog = document.querySelector("#subtitleEditorDialog");
 const subtitleEditorPath = document.querySelector("#subtitleEditorPath");
@@ -149,6 +151,7 @@ let pollTimer = null;
 let elapsedTimer = null;
 let activeJob = null;
 let currentJobId = "";
+let submitInFlight = false;
 let copyLogResetTimer = null;
 let editingSubtitlePath = "";
 let editingVideoPath = "";
@@ -169,6 +172,7 @@ whisperModelInput.addEventListener("input", syncWhisperPreset);
 refreshCacheButton.addEventListener("click", loadCache);
 refreshHistoryButton.addEventListener("click", loadHistory);
 subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
+subtitleEncodingProfile.addEventListener("change", updateSubtitleEncodingHint);
 avoidSubtitleOverlap.addEventListener("change", handleAvoidOverlapChange);
 closeSubtitleEditorButton.addEventListener("click", closeSubtitleEditor);
 saveSubtitleButton.addEventListener("click", () => saveEditedSubtitles(false));
@@ -187,11 +191,22 @@ loadHistory();
 renderLanguagePicker();
 syncWhisperPreset();
 updateSubtitleVideoModeHint();
+updateSubtitleEncodingHint();
 
 function updateSubtitleVideoModeHint() {
   subtitleVideoModeHint.textContent = subtitleVideoMode.value === "hard"
     ? "固定位置并在各播放器一致显示；需要重新编码视频，处理时间更长。"
     : "软字幕可开关并保持原视频流，但具体位置由播放器控制。";
+}
+
+function updateSubtitleEncodingHint() {
+  const hints = {
+    auto: "自动模式优先使用 Apple 硬件编码，失败时切换快速 CPU。",
+    hardware: "优先使用 Apple VideoToolbox；不可用或失败时自动切换快速 CPU。",
+    fast: "使用 libx264 veryfast，兼容性好，速度明显快于高画质模式。",
+    quality: "使用 libx264 medium / CRF 18，画质优先，4K 60fps 视频会很慢。",
+  };
+  subtitleEncodingHint.textContent = hints[subtitleEncodingProfile.value] || hints.auto;
 }
 
 function handleSubtitleVideoModeChange() {
@@ -224,6 +239,8 @@ async function loadHealth() {
 
 async function submitJob(event) {
   event.preventDefault();
+  if (submitInFlight || runButton.disabled) return;
+  submitInFlight = true;
   const payload = formPayload();
   setRunningState(true);
   updateProgress(0, "提交任务");
@@ -247,6 +264,11 @@ async function submitJob(event) {
     });
     const data = await response.json();
     if (!response.ok) {
+      if (data.activeJob) {
+        adoptActiveJob(data.activeJob);
+        logBox.textContent = `${data.error || "已有任务正在运行"}\n已切换到当前任务。`;
+        return;
+      }
       throw new Error(data.error || "任务提交失败");
     }
     currentJobId = data.jobId;
@@ -258,6 +280,8 @@ async function submitJob(event) {
     setRunningState(false, "失败", "bad");
     stopElapsedTimer();
     logBox.textContent = error.message;
+  } finally {
+    submitInFlight = false;
   }
 }
 
@@ -311,9 +335,13 @@ function formPayload() {
     translator: data.get("translator"),
     outDir: String(data.get("outDir") || "output").trim(),
     whisperModel: String(data.get("whisperModel") || "").trim(),
+    whisperUseGpu: Boolean(data.get("whisperUseGpu")),
+    whisperUseVad: Boolean(data.get("whisperUseVad")),
+    whisperVadModel: String(data.get("whisperVadModel") || "").trim(),
     embedSubtitles: Boolean(data.get("embedSubtitles")),
     avoidSubtitleOverlap: Boolean(data.get("avoidSubtitleOverlap")),
     subtitleVideoMode: String(data.get("subtitleVideoMode") || "soft"),
+    subtitleEncodingProfile: String(data.get("subtitleEncodingProfile") || "auto"),
     subtitlePosition: String(data.get("subtitlePosition") || "auto"),
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
@@ -460,9 +488,9 @@ async function pollJob(jobId) {
       loadCache();
     }
   } catch (error) {
-    setRunningState(false, "失败", "bad");
-    stopElapsedTimer();
-    logBox.textContent = error.message;
+    setRunningState(true, "连接重试", "warn");
+    logBox.textContent += `\n状态读取失败，稍后重试: ${error.message}`;
+    pollTimer = window.setTimeout(() => pollJob(jobId), 3000);
   }
 }
 
@@ -684,6 +712,7 @@ async function saveEditedSubtitles(regenerate) {
           subtitlePath: editingSubtitlePath,
           mode: subtitleVideoMode.value,
           position: selectedPosition,
+          encodingProfile: subtitleEncodingProfile.value,
         }),
       });
       const renderData = await renderResponse.json();
@@ -764,6 +793,11 @@ async function loadHistory() {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "历史读取失败");
     renderHistory(Array.isArray(data.jobs) ? data.jobs : []);
+    if (data.activeJob) {
+      adoptActiveJob(data.activeJob);
+    } else if (!currentJobId) {
+      setRunningState(false, "空闲", "idle");
+    }
   } catch (error) {
     historyList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
   }
@@ -810,13 +844,26 @@ async function viewHistoryJob(jobId) {
 async function resumeHistoryJob(jobId) {
   const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" });
   const data = await response.json();
-  if (!response.ok) return;
+  if (!response.ok) {
+    if (data.activeJob) adoptActiveJob(data.activeJob);
+    return;
+  }
   currentJobId = data.jobId;
   activeJobId.textContent = data.jobId;
   setRunningState(true, "排队", "running");
   startElapsedTimer({ id: data.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0 });
   pollJob(data.jobId);
   loadHistory();
+}
+
+function adoptActiveJob(job) {
+  if (!job || !job.id) return;
+  const changedJob = currentJobId !== job.id;
+  currentJobId = job.id;
+  activeJobId.textContent = job.id;
+  renderJob(job);
+  startElapsedTimer(job);
+  if (changedJob) pollJob(job.id);
 }
 
 function resultItem(kind, path, action = "") {
@@ -835,6 +882,7 @@ function resultItem(kind, path, action = "") {
 
 function setRunningState(isRunning, label = "运行中", tone = "running") {
   runButton.disabled = isRunning;
+  runButton.textContent = isRunning ? "任务进行中" : "开始任务";
   stopButton.disabled = !isRunning || !currentJobId;
   jobBadge.textContent = label;
   jobBadge.className = `badge ${tone}`;

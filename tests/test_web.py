@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import subtitle_tool.web as web  # noqa: E402
 from subtitle_tool.pipeline import PipelineResult  # noqa: E402
+from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 from subtitle_tool.web import (  # noqa: E402
     JOBS,
     JOB_LOCK,
@@ -32,6 +34,65 @@ from subtitle_tool.web import (  # noqa: E402
 
 
 class WebTests(unittest.TestCase):
+    def test_web_ui_locks_submit_and_restores_active_job(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "subtitle_tool"
+            / "web_assets"
+            / "app.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("let submitInFlight = false;", script)
+        self.assertIn("if (submitInFlight || runButton.disabled) return;", script)
+        self.assertIn("adoptActiveJob(data.activeJob);", script)
+        self.assertIn(
+            'runButton.textContent = isRunning ? "任务进行中" : "开始任务";',
+            script,
+        )
+
+    def test_active_job_returns_newest_inflight_job(self):
+        older = JobState(id="older-active", status="running", created_at=10.0)
+        newer = JobState(id="newer-active", status="queued", created_at=20.0)
+        finished = JobState(id="finished", status="succeeded", created_at=30.0)
+        with JOB_LOCK:
+            JOBS.update({job.id: job for job in (older, newer, finished)})
+        try:
+            active_job = getattr(web, "active_job", lambda: None)
+            self.assertIs(active_job(), newer)
+        finally:
+            with JOB_LOCK:
+                for job in (older, newer, finished):
+                    JOBS.pop(job.id, None)
+
+    def test_create_pipeline_job_rejects_when_another_job_is_active(self):
+        running = JobState(id="already-running", status="running")
+        with JOB_LOCK:
+            JOBS[running.id] = running
+        create_pipeline_job = getattr(web, "create_pipeline_job", lambda *_: None)
+        try:
+            with self.assertRaises(SubtitleToolError):
+                create_pipeline_job(
+                    {"input": "video.mp4"},
+                    options_from_payload({"input": "video.mp4"}),
+                )
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(running.id, None)
+
+    def test_jobs_payload_exposes_active_job_for_page_refresh(self):
+        running = JobState(id="refresh-running", status="running")
+        with JOB_LOCK:
+            JOBS[running.id] = running
+        jobs_payload = getattr(web, "jobs_payload", lambda: {"jobs": []})
+        try:
+            payload = jobs_payload()
+        finally:
+            with JOB_LOCK:
+                JOBS.pop(running.id, None)
+
+        self.assertEqual((payload.get("activeJob") or {}).get("id"), running.id)
+
     def test_subtitle_api_helpers_load_and_save_document(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out_dir = Path(tmpdir) / "output"
@@ -210,6 +271,23 @@ class WebTests(unittest.TestCase):
         self.assertTrue(options.avoid_subtitle_overlap)
         self.assertEqual(options.subtitle_video_mode, "hard")
         self.assertEqual(options.subtitle_position, "auto")
+        self.assertTrue(options.whisper_use_gpu)
+        self.assertTrue(options.whisper_use_vad)
+        self.assertEqual(options.subtitle_encoding_profile, "auto")
+
+    def test_options_from_payload_accepts_whisper_acceleration_settings(self):
+        options = options_from_payload(
+            {
+                "input": "input.mp4",
+                "whisperUseGpu": False,
+                "whisperUseVad": False,
+                "whisperVadModel": "models/custom-vad.bin",
+            }
+        )
+
+        self.assertFalse(options.whisper_use_gpu)
+        self.assertFalse(options.whisper_use_vad)
+        self.assertEqual(options.whisper_vad_model.name, "custom-vad.bin")
 
     def test_options_from_payload_accepts_hard_subtitle_layout(self):
         options = options_from_payload(
@@ -219,11 +297,13 @@ class WebTests(unittest.TestCase):
                 "embedSubtitles": True,
                 "subtitleVideoMode": "hard",
                 "subtitlePosition": "above-bottom",
+                "subtitleEncodingProfile": "quality",
             }
         )
 
         self.assertEqual(options.subtitle_video_mode, "hard")
         self.assertEqual(options.subtitle_position, "above-bottom")
+        self.assertEqual(options.subtitle_encoding_profile, "quality")
 
     def test_options_from_payload_accepts_comma_targets(self):
         options = options_from_payload(
@@ -258,6 +338,16 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertTrue(matching[0]["ok"])
         self.assertIn("ffmpeg-full", matching[0]["detail"])
+
+    def test_collect_health_reports_videotoolbox_encoder(self):
+        with patch("subtitle_tool.web.videotoolbox_available", return_value=True):
+            health = collect_health(Path.cwd())
+
+        matching = [
+            check for check in health["checks"] if check["name"] == "Apple 硬件编码"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertTrue(matching[0]["ok"])
 
     def test_collect_health_includes_local_translation_models(self):
         statuses = [

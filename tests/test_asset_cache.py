@@ -34,6 +34,14 @@ class AssetCacheTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"video")
             self.assertTrue(cached.exists())
 
+    def test_transcript_cache_separates_vad_profiles(self):
+        cache = AssetCache(Path("/tmp/subtitle-tool-cache"))
+
+        standard = cache.transcript_path("video", "local-whisper", "ja", None, "standard")
+        vad = cache.transcript_path("video", "local-whisper", "ja", None, "vad")
+
+        self.assertNotEqual(standard, vad)
+
     def test_summary_and_selective_clear_do_not_touch_output_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

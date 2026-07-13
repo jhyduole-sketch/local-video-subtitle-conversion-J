@@ -69,6 +69,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a whisper.cpp GGML model, default models/ggml-base.bin.",
     )
     parser.add_argument(
+        "--whisper-cpu",
+        action="store_true",
+        help="Disable Metal/GPU acceleration and use CPU for local Whisper.",
+    )
+    parser.add_argument(
+        "--no-whisper-vad",
+        action="store_true",
+        help="Disable VAD silence skipping for local Whisper.",
+    )
+    parser.add_argument(
+        "--whisper-vad-model",
+        default=None,
+        help="Path to a whisper.cpp VAD model, default models/ggml-silero-v6.2.0.bin.",
+    )
+    parser.add_argument(
         "--translator",
         choices=[
             "openai",
@@ -102,6 +117,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Subtitle position for hard-subtitle videos. Auto avoids bottom hard subtitles when requested.",
     )
+    parser.add_argument(
+        "--hard-subtitle-encoder",
+        choices=["auto", "hardware", "fast", "quality"],
+        default="auto",
+        help="Hard subtitle encoder: auto prefers Apple VideoToolbox, fast uses libx264 veryfast, quality preserves the existing high-quality CPU mode.",
+    )
     return parser
 
 
@@ -123,11 +144,17 @@ def main(argv: list[str] | None = None) -> int:
         whisper_model=Path(args.whisper_model).expanduser().resolve()
         if args.whisper_model
         else None,
+        whisper_use_gpu=not args.whisper_cpu,
+        whisper_use_vad=not args.no_whisper_vad,
+        whisper_vad_model=Path(args.whisper_vad_model).expanduser().resolve()
+        if args.whisper_vad_model
+        else None,
         translator=args.translator,
         embed_subtitles=args.embed_subtitles,
         avoid_subtitle_overlap=args.avoid_subtitle_overlap,
         subtitle_video_mode=args.subtitle_video_mode,
         subtitle_position=args.subtitle_position,
+        subtitle_encoding_profile=args.hard_subtitle_encoder,
     )
 
     try:

@@ -17,7 +17,7 @@
 - 支持一次选择多个目标语言，分别输出多份字幕和多份软字幕视频。
 - 支持“重新下载”“只下载”“输出软字幕视频”“避免遮挡原字幕”等选项。
 - Web 页面提供环境检查、进度条、实时日志、已用时、停止任务按钮。
-- Web 任务按单队列顺序执行，避免多个本地模型或下载进程同时争抢资源。
+- Web 服务同一时间只允许一个活动任务；重复点击、刷新页面或局域网多端同时提交时不会创建重复任务。
 - 任务历史会写入本地 SQLite；服务重启后仍可查看，失败、取消或中断的任务可以继续执行。
 - 视频、音频、源字幕、转写结果和翻译结果均有本地缓存，并可在页面按类别查看和清理。
 - 每次任务创建带时间戳的独立目录，文件名也带同一时间戳，便于区分多次任务。
@@ -87,6 +87,12 @@ mkdir -p models
 curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin -o models/ggml-base.bin
 ```
 
+下载 VAD 模型（推荐，用于跳过静音片段）：
+
+```bash
+curl -L https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin -o models/ggml-silero-v6.2.0.bin
+```
+
 ## 配置 API Key
 
 项目支持 `.env`。复制示例文件：
@@ -141,6 +147,14 @@ env PYTHONPATH=src python3 -m subtitle_tool.web --host 127.0.0.1 --port 7860
 http://127.0.0.1:7860
 ```
 
+允许同一局域网内的其它设备访问：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.web --host 0.0.0.0 --port 7860
+```
+
+其它设备使用这台电脑的局域网 IP 访问，例如 `http://192.168.1.20:7860/`。如果无法连接，请检查 macOS 防火墙及路由器的客户端隔离设置。当前 Web 页面没有用户登录保护，只应在可信局域网中开放。
+
 Web 页面支持：
 
 - 输入 YouTube / Bilibili / TalkSmith URL，或尝试其他公开单视频网址。
@@ -152,10 +166,16 @@ Web 页面支持：
 - 选择字幕来源：自动、内置字幕、音频识别。
 - 选择语音转写：本地 Whisper 或 OpenAI。
 - 选择本地 Whisper 模型大小：`base`、`small`、`medium` 或自定义模型路径。
+- 本地 Whisper 默认尝试 Metal/GPU 加速并启用 VAD；Metal 不兼容时自动切换 CPU，VAD 不兼容时自动关闭 VAD继续转写。
+- 可在页面关闭 Metal/GPU 或 VAD，也可以填写自定义 VAD 模型路径；处理日志会显示实际使用和降级情况。
 - 选择字幕翻译：z.ai、本地快速模型、本地多语言 NLLB、OpenAI。
 - 选择字幕视频模式：软字幕保持原画质，稳定硬字幕固定显示位置。
+- 选择硬字幕编码方式：自动推荐、Apple VideoToolbox、快速 CPU 或高画质 CPU。
 - 选择新字幕位置：自动避让、原底部字幕上方、画面底部或画面顶部。
+- 硬字幕烧录时显示真实编码百分比、已处理时长、速度和预计剩余时间。
 - 任务运行时显示进度、日志、已用时。
+- 点击“开始任务”后按钮立即禁用并显示“任务进行中”；任务结束前无法重复提交。
+- 页面刷新或其它局域网设备打开页面时，会自动接管并显示当前活动任务。
 - 任务运行时可点击“停止任务”。
 - 查看历史任务，并继续失败、取消或因服务重启而中断的任务。
 - 查看缓存占用，并按视频、音频、源字幕、转写或翻译类别清理缓存。
@@ -164,7 +184,7 @@ Web 页面支持：
 - 修改字幕文字或预览位置会立即反映在视频画面上，不需要先运行 FFmpeg。
 - 保存字幕时自动创建 `.backup.srt`；可保存后直接提交重新生成视频任务。
 
-Web 服务同一时间只执行一个任务，后提交的任务会进入队列。这样速度未必最快，但能避免 Whisper、ffmpeg 和本地翻译模型互相争抢内存与 CPU。
+Web 服务同一时间只接受一个活动任务，状态包括排队、运行和取消中。重复点击或另一台设备同时提交时，后端返回当前任务，不再创建第二个排队任务。这样可以避免 Whisper、FFmpeg 和本地翻译模型互相争抢内存与 CPU。
 
 点击“停止任务”后，工具会终止当前 `ffmpeg`、`yt-dlp` 或 `whisper-cli` 子进程。正在等待的云端 API 请求仍需等该请求返回或超时，然后任务才会完全停止。
 
@@ -303,6 +323,8 @@ input
 - `local-whisper`
 - `openai`
 
+本地 Whisper 默认启用 Metal/GPU 和 VAD。可使用 `--whisper-cpu` 强制 CPU，使用 `--no-whisper-vad` 关闭静音检测，或用 `--whisper-vad-model` 指定 VAD 模型路径。
+
 ```text
 --translator
 ```
@@ -334,6 +356,17 @@ input
 
 硬字幕位置。`auto` 在启用 `--avoid-subtitle-overlap` 时自动使用 `above-bottom`。
 为了保证避让真实生效，只要同时启用 `--embed-subtitles` 和 `--avoid-subtitle-overlap`，后端就会自动使用硬字幕模式，即使传入的 `--subtitle-video-mode` 是 `soft`。
+
+```text
+--hard-subtitle-encoder auto|hardware|fast|quality
+```
+
+- `auto`：默认，优先 Apple VideoToolbox；不可用或失败时自动切换快速 CPU。
+- `hardware`：优先使用 Apple VideoToolbox，CPU 占用更低；不同分辨率和源编码下不一定总是最快。
+- `fast`：使用 `libx264 veryfast / CRF 20`，兼容性好，适合 4K 或长视频快速生成。
+- `quality`：保留原来的 `libx264 medium / CRF 18` 高画质模式，速度最慢。
+
+硬字幕编码过程中，Web 日志会持续显示类似：`烧录硬字幕 en: 68% · 已处理 15:32/22:46 · 速度 1.20x · 预计剩余 06:02`。
 
 在原底部字幕上方生成稳定英文字幕视频：
 

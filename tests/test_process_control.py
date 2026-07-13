@@ -6,10 +6,25 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from subtitle_tool.errors import CancellationError  # noqa: E402
-from subtitle_tool.process_control import run_process  # noqa: E402
+from subtitle_tool.process_control import run_process, run_process_streaming  # noqa: E402
 
 
 class ProcessControlTests(unittest.TestCase):
+    def test_streaming_process_emits_stdout_lines(self):
+        lines = []
+
+        completed = run_process_streaming(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; print('first', flush=True); time.sleep(.1); print('second', flush=True)",
+            ],
+            stdout_line_callback=lines.append,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(lines, ["first", "second"])
+
     def test_invalid_utf8_from_child_process_is_replaced(self):
         completed = run_process(
             [

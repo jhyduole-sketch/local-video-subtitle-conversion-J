@@ -7,9 +7,10 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .errors import DependencyError, MediaError
-from .process_control import CancelCheck, run_process
+from .process_control import CancelCheck, run_process, run_process_streaming
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,15 @@ class SubtitleStream:
     codec_name: str | None
     language: str | None
     title: str | None
+
+
+@dataclass(frozen=True)
+class EncodingProgress:
+    processed_seconds: float
+    duration_seconds: float
+    percent: int
+    speed: float | None
+    eta_seconds: float | None
 
 
 def ensure_ffmpeg() -> None:
@@ -38,6 +48,14 @@ def ass_ffmpeg_binary() -> str:
         "Install it with: brew install ffmpeg-full. The tool will automatically "
         "use /opt/homebrew/opt/ffmpeg-full/bin/ffmpeg after installation."
     )
+
+
+def videotoolbox_available() -> bool:
+    try:
+        binary = ass_ffmpeg_binary()
+    except DependencyError:
+        return False
+    return _ffmpeg_has_encoder(binary, "h264_videotoolbox")
 
 
 def _candidate_ffmpeg_binaries() -> list[str]:
@@ -63,6 +81,18 @@ def _ffmpeg_has_filter(binary: str, filter_name: str) -> bool:
     )
     output = f"{completed.stdout}\n{completed.stderr}"
     pattern = rf"^\s*[TSC\.]+\s+{re.escape(filter_name)}\s"
+    return completed.returncode == 0 and re.search(pattern, output, re.MULTILINE) is not None
+
+
+def _ffmpeg_has_encoder(binary: str, encoder_name: str) -> bool:
+    completed = subprocess.run(
+        [binary, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = f"{completed.stdout}\n{completed.stderr}"
+    pattern = rf"^\s*V\S*\s+{re.escape(encoder_name)}\s"
     return completed.returncode == 0 and re.search(pattern, output, re.MULTILINE) is not None
 
 
@@ -261,37 +291,191 @@ def burn_subtitle_track(
     ass_path: Path,
     output_path: Path,
     cancel_check: CancelCheck | None = None,
+    encoding_profile: str = "quality",
+    progress_callback: Callable[[EncodingProgress], None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> Path:
+    if encoding_profile not in {"auto", "hardware", "fast", "quality"}:
+        raise MediaError(f"Unknown hard subtitle encoding profile: {encoding_profile}")
     ffmpeg_binary = ass_ffmpeg_binary()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ass_filter_path = _escape_filter_path(ass_path)
-    _run(
-        [
+    duration = _probe_duration_seconds(video_path, cancel_check)
+    selected_profile = encoding_profile
+    if encoding_profile in {"auto", "hardware"}:
+        if _ffmpeg_has_encoder(ffmpeg_binary, "h264_videotoolbox"):
+            selected_profile = "hardware"
+            if status_callback:
+                status_callback("使用 Apple VideoToolbox 硬件编码")
+        else:
+            selected_profile = "fast"
+            if status_callback:
+                status_callback("VideoToolbox 不可用，已切换快速 CPU 编码")
+
+    completed = _run_burn_command(
+        _burn_command(
             ffmpeg_binary,
-            "-y",
-            "-i",
+            video_path,
+            ass_filter_path,
+            output_path,
+            selected_profile,
+        ),
+        duration,
+        cancel_check,
+        progress_callback,
+    )
+    if completed.returncode != 0 and selected_profile == "hardware":
+        output_path.unlink(missing_ok=True)
+        if status_callback:
+            detail = _short_error(completed.stderr or completed.stdout)
+            status_callback(
+                f"VideoToolbox 编码失败（{detail}），已切换快速 CPU 编码重试"
+            )
+        completed = _run_burn_command(
+            _burn_command(
+                ffmpeg_binary,
+                video_path,
+                ass_filter_path,
+                output_path,
+                "fast",
+            ),
+            duration,
+            cancel_check,
+            progress_callback,
+        )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise MediaError(f"{ffmpeg_binary} failed: {detail}")
+    return output_path
+
+
+def _probe_duration_seconds(
+    video_path: Path, cancel_check: CancelCheck | None = None
+) -> float:
+    completed = _run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             str(video_path),
-            "-vf",
-            f"ass=filename='{ass_filter_path}'",
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
+        ],
+        cancel_check,
+    )
+    try:
+        return max(float(completed.stdout.strip()), 0.001)
+    except ValueError as exc:
+        raise MediaError("Unable to read video duration for subtitle encoding.") from exc
+
+
+def _burn_command(
+    ffmpeg_binary: str,
+    video_path: Path,
+    ass_filter_path: str,
+    output_path: Path,
+    encoding_profile: str,
+) -> list[str]:
+    command = [
+        ffmpeg_binary,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"ass=filename='{ass_filter_path}'",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+    ]
+    if encoding_profile == "hardware":
+        command.extend(
+            [
+                "-c:v",
+                "h264_videotoolbox",
+                "-profile:v",
+                "high",
+                "-b:v",
+                "20M",
+                "-maxrate",
+                "30M",
+                "-bufsize",
+                "40M",
+                "-allow_sw",
+                "1",
+            ]
+        )
+    elif encoding_profile == "fast":
+        command.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+    else:
+        command.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "18"])
+    command.extend(
+        [
             "-c:a",
             "copy",
             "-movflags",
             "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
             str(output_path),
-        ],
-        cancel_check,
+        ]
     )
-    return output_path
+    return command
+
+
+def _run_burn_command(
+    command: list[str],
+    duration_seconds: float,
+    cancel_check: CancelCheck | None,
+    progress_callback: Callable[[EncodingProgress], None] | None,
+) -> subprocess.CompletedProcess[str]:
+    values: dict[str, str] = {}
+    last_percent = -1
+
+    def handle_line(line: str) -> None:
+        nonlocal last_percent
+        key, separator, value = line.partition("=")
+        if not separator:
+            return
+        values[key] = value
+        if key != "progress" or progress_callback is None:
+            return
+        try:
+            processed = max(float(values.get("out_time_us", "0")) / 1_000_000, 0.0)
+        except ValueError:
+            processed = 0.0
+        speed_text = values.get("speed", "").rstrip("x")
+        try:
+            speed = float(speed_text) if speed_text else None
+        except ValueError:
+            speed = None
+        percent = min(100, max(0, round(processed * 100 / duration_seconds)))
+        if percent == last_percent:
+            return
+        last_percent = percent
+        eta = None
+        if speed and speed > 0:
+            eta = max(duration_seconds - processed, 0.0) / speed
+        progress_callback(
+            EncodingProgress(processed, duration_seconds, percent, speed, eta)
+        )
+
+    return run_process_streaming(
+        command,
+        cancel_check=cancel_check,
+        stdout_line_callback=handle_line,
+    )
+
+
+def _short_error(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if "error" in line.lower() or "cannot" in line.lower():
+            return line[:180]
+    return (lines[-1][:180] if lines else "未知错误")
 
 
 def _escape_filter_path(path: Path) -> str:

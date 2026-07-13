@@ -47,12 +47,14 @@ class AssetCache:
         transcriber: str,
         source_lang: str | None,
         whisper_model: Path | None,
+        transcription_profile: str | None = None,
     ) -> Path:
         identity = {
             "video": video_fingerprint,
             "transcriber": transcriber,
             "source": source_lang or "auto",
             "model": str(whisper_model or "default"),
+            "profile": transcription_profile or "standard",
         }
         digest = sha256(
             json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")

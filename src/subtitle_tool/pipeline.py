@@ -18,8 +18,9 @@ from .local_translate import (
     translate_segments_locally,
     translate_segments_with_nllb,
 )
-from .local_whisper import transcribe_with_whisper_cpp
+from .local_whisper import DEFAULT_VAD_MODEL_PATH, transcribe_with_whisper_cpp
 from .media import (
+    EncodingProgress,
     burn_subtitle_track,
     extract_audio,
     extract_first_subtitle,
@@ -63,11 +64,15 @@ class PipelineOptions:
     download_only: bool = False
     transcriber: str = "openai"
     whisper_model: Path | None = None
+    whisper_use_gpu: bool = True
+    whisper_use_vad: bool = True
+    whisper_vad_model: Path | None = None
     translator: str = "openai"
     embed_subtitles: bool = False
     avoid_subtitle_overlap: bool = False
     subtitle_video_mode: str = "soft"
     subtitle_position: str = "auto"
+    subtitle_encoding_profile: str = "auto"
     progress_callback: ProgressCallback | None = None
     cancel_check: CancelCheck | None = None
 
@@ -108,6 +113,10 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     if options.subtitle_position not in {"auto", "bottom", "above-bottom", "top"}:
         raise SubtitleToolError(
             "--subtitle-position must be one of: auto, bottom, above-bottom, top."
+        )
+    if options.subtitle_encoding_profile not in {"auto", "hardware", "fast", "quality"}:
+        raise SubtitleToolError(
+            "--hard-subtitle-encoder must be one of: auto, hardware, fast, quality."
         )
 
     timestamp = _timestamp_suffix()
@@ -308,11 +317,18 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                             ass_path,
                             video_output_path,
                             options.cancel_check,
+                            encoding_profile=options.subtitle_encoding_profile,
+                            progress_callback=lambda progress, language=target_lang: _encoding_progress(
+                                options, language, progress
+                            ),
+                            status_callback=lambda message, language=target_lang: _progress(
+                                options, f"硬字幕 {language}: {message}", 93
+                            ),
                         )
                     mux_jobs[target_lang] = (
                         future,
                         video_output_path,
-                        min(output_percent + 3, 96),
+                        99 if subtitle_video_mode == "hard" else min(output_percent + 3, 96),
                     )
             except CancellationError:
                 raise
@@ -362,6 +378,9 @@ def render_edited_subtitle_video(
     mode: str,
     position: str,
     cancel_check: CancelCheck | None = None,
+    encoding_profile: str = "auto",
+    progress_callback: Callable[[EncodingProgress], None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> Path:
     if mode not in {"soft", "hard"}:
         raise SubtitleToolError("Edited subtitle video mode must be soft or hard.")
@@ -373,7 +392,13 @@ def render_edited_subtitle_video(
         ass_path = output_path.with_suffix(".ass")
         write_ass(ass_path, segments, position)
         return burn_subtitle_track(
-            video_path, ass_path, output_path, cancel_check
+            video_path,
+            ass_path,
+            output_path,
+            cancel_check,
+            encoding_profile=encoding_profile,
+            progress_callback=progress_callback,
+            status_callback=status_callback,
         )
     return mux_subtitle_track(
         video_path,
@@ -389,6 +414,35 @@ def _resolved_subtitle_position(options: PipelineOptions) -> str:
     if options.subtitle_position != "auto":
         return options.subtitle_position
     return "above-bottom" if options.avoid_subtitle_overlap else "bottom"
+
+
+def _encoding_progress(
+    options: PipelineOptions, language: str, progress: EncodingProgress
+) -> None:
+    processed = _format_elapsed(progress.processed_seconds)
+    duration = _format_elapsed(progress.duration_seconds)
+    speed = f"{progress.speed:.2f}x" if progress.speed else "计算中"
+    eta = (
+        _format_elapsed(progress.eta_seconds)
+        if progress.eta_seconds is not None
+        else "计算中"
+    )
+    overall_percent = min(99, 93 + round(progress.percent * 6 / 100))
+    _progress(
+        options,
+        f"烧录硬字幕 {language}: {progress.percent}% · 已处理 {processed}/{duration} "
+        f"· 速度 {speed} · 预计剩余 {eta}",
+        overall_percent,
+    )
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_seconds = max(0, round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _resolved_subtitle_video_mode(options: PipelineOptions) -> str:
@@ -699,11 +753,15 @@ def _load_source_segments(
                 audio_path.unlink(missing_ok=True)
                 raise
             _progress(options, "音频抽取完成，开始语音转写", 34)
+        transcription_profile = "standard"
+        if options.transcriber == "local-whisper" and options.whisper_use_vad:
+            transcription_profile = f"vad:{options.whisper_vad_model or DEFAULT_VAD_MODEL_PATH}"
         transcript_path = asset_cache.transcript_path(
             video_fingerprint,
             options.transcriber,
             options.source_lang,
             options.whisper_model,
+            transcription_profile,
         )
         if transcript_path.exists():
             segments = read_srt(transcript_path)
@@ -716,6 +774,10 @@ def _load_source_segments(
                 options.source_lang,
                 options.whisper_model,
                 options.cancel_check,
+                progress_callback=lambda message: _progress(options, message, 40),
+                use_gpu=options.whisper_use_gpu,
+                use_vad=options.whisper_use_vad,
+                vad_model_path=options.whisper_vad_model,
             )
             source_kind = "audio-local-whisper"
             _progress(options, "本地 Whisper 转写完成", 48)

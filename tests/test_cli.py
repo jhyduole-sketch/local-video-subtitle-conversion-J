@@ -119,6 +119,8 @@ class CliTests(unittest.TestCase):
                     "hard",
                     "--subtitle-position",
                     "above-bottom",
+                    "--hard-subtitle-encoder",
+                    "fast",
                 ]
             )
 
@@ -126,6 +128,33 @@ class CliTests(unittest.TestCase):
         options = run_pipeline.call_args.args[0]
         self.assertEqual(options.subtitle_video_mode, "hard")
         self.assertEqual(options.subtitle_position, "above-bottom")
+        self.assertEqual(options.subtitle_encoding_profile, "fast")
+
+    def test_whisper_acceleration_options_are_passed_to_pipeline(self):
+        with patch("subtitle_tool.cli.run_pipeline") as run_pipeline:
+            run_pipeline.return_value.source_subtitle_path = Path("/tmp/source.ja.srt")
+            run_pipeline.return_value.translated_paths = {}
+            run_pipeline.return_value.failed_languages = {}
+            run_pipeline.return_value.source_kind = "audio-local-whisper"
+            run_pipeline.return_value.downloaded_video_path = None
+            run_pipeline.return_value.subtitled_video_paths = None
+            exit_code = main(
+                [
+                    "input.mp4",
+                    "--transcriber",
+                    "local-whisper",
+                    "--whisper-cpu",
+                    "--no-whisper-vad",
+                    "--whisper-vad-model",
+                    "models/custom-vad.bin",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        options = run_pipeline.call_args.args[0]
+        self.assertFalse(options.whisper_use_gpu)
+        self.assertFalse(options.whisper_use_vad)
+        self.assertEqual(options.whisper_vad_model.name, "custom-vad.bin")
 
 
 if __name__ == "__main__":

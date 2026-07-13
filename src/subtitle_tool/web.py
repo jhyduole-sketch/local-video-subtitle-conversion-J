@@ -29,8 +29,9 @@ from .local_translate import (
     nllb_model_status,
 )
 from .job_store import JobStore
+from .local_whisper import DEFAULT_VAD_MODEL_PATH
 from .runtime_paths import cache_root, state_database_path
-from .media import ass_ffmpeg_binary
+from .media import ass_ffmpeg_binary, videotoolbox_available
 from .media_preview import build_media_response
 from .pipeline import (
     PipelineOptions,
@@ -62,9 +63,55 @@ class JobState:
     resumed_from: str | None = None
 
 
+class ActiveJobError(SubtitleToolError):
+    def __init__(self, job: JobState):
+        self.job = job
+        super().__init__(f"已有任务正在运行: {job.id}")
+
+
 JOBS: dict[str, JobState] = {}
 JOB_LOCK = threading.Lock()
 JOB_STORE: JobStore | None = None
+ACTIVE_JOB_STATUSES = frozenset({"queued", "running", "canceling"})
+
+
+def _active_job_unlocked() -> JobState | None:
+    active = (job for job in JOBS.values() if job.status in ACTIVE_JOB_STATUSES)
+    return max(active, key=lambda job: job.created_at, default=None)
+
+
+def active_job() -> JobState | None:
+    with JOB_LOCK:
+        return _active_job_unlocked()
+
+
+def _reserve_job(
+    payload: dict[str, object],
+    *,
+    resumed_from: str | None = None,
+    logs: list[str] | None = None,
+) -> JobState:
+    with JOB_LOCK:
+        existing = _active_job_unlocked()
+        if existing:
+            raise ActiveJobError(existing)
+        job = JobState(
+            id=uuid.uuid4().hex[:12],
+            payload=payload,
+            resumed_from=resumed_from,
+            logs=list(logs or []),
+        )
+        JOBS[job.id] = job
+        _persist_job(job)
+        return job
+
+
+def create_pipeline_job(
+    payload: dict[str, object], options: PipelineOptions
+) -> JobState:
+    job = _reserve_job(dict(payload))
+    JOB_EXECUTOR.submit(_run_job, job.id, options)
+    return job
 
 
 def create_job_executor() -> ThreadPoolExecutor:
@@ -109,6 +156,7 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
     target_langs = _coerce_target_langs(payload.get("targetLangs"))
     out_dir = Path(str(payload.get("outDir") or "output")).expanduser().resolve()
     whisper_model_value = str(payload.get("whisperModel") or "").strip()
+    whisper_vad_model_value = str(payload.get("whisperVadModel") or "").strip()
     source_lang = str(payload.get("sourceLang") or "").strip() or None
     embed_subtitles = bool(payload.get("embedSubtitles"))
     avoid_subtitle_overlap = bool(payload.get("avoidSubtitleOverlap"))
@@ -129,11 +177,19 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         whisper_model=Path(whisper_model_value).expanduser().resolve()
         if whisper_model_value
         else None,
+        whisper_use_gpu=bool(payload.get("whisperUseGpu", True)),
+        whisper_use_vad=bool(payload.get("whisperUseVad", True)),
+        whisper_vad_model=Path(whisper_vad_model_value).expanduser().resolve()
+        if whisper_vad_model_value
+        else None,
         translator=str(payload.get("translator") or "z-ai"),
         embed_subtitles=embed_subtitles,
         avoid_subtitle_overlap=avoid_subtitle_overlap,
         subtitle_video_mode=subtitle_video_mode,
         subtitle_position=str(payload.get("subtitlePosition") or "auto"),
+        subtitle_encoding_profile=str(
+            payload.get("subtitleEncodingProfile") or "auto"
+        ),
     )
 
 
@@ -143,9 +199,11 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
         _tool_check("ffmpeg"),
         _tool_check("ffprobe"),
         _ass_ffmpeg_check(),
+        _videotoolbox_check(),
         _tool_check("yt-dlp"),
         _tool_check("whisper-cli"),
         _whisper_models_check(root),
+        _whisper_vad_model_check(root),
         _python_module_check("openai"),
         _python_module_check("transformers"),
         _python_module_check("torch"),
@@ -193,6 +251,16 @@ def _ass_ffmpeg_check() -> dict[str, object]:
     }
 
 
+def _videotoolbox_check() -> dict[str, object]:
+    available = videotoolbox_available()
+    return {
+        "name": "Apple 硬件编码",
+        "ok": available,
+        "optional": True,
+        "detail": "VideoToolbox 可用" if available else "不可用；自动模式将使用快速 CPU",
+    }
+
+
 def result_to_dict(result: PipelineResult) -> dict[str, object]:
     return {
         "sourceSubtitlePath": _path_or_none(result.source_subtitle_path),
@@ -231,10 +299,7 @@ def save_subtitle_payload(payload: dict[str, object]) -> dict[str, object]:
 def create_subtitle_render_job(payload: dict[str, object]) -> JobState:
     render_payload = dict(payload)
     render_payload["operation"] = "render-edited-subtitles"
-    job = JobState(id=uuid.uuid4().hex[:12], payload=render_payload)
-    with JOB_LOCK:
-        JOBS[job.id] = job
-        _persist_job(job)
+    job = _reserve_job(render_payload)
     JOB_EXECUTOR.submit(_run_subtitle_render_job, job.id, render_payload)
     return job
 
@@ -251,7 +316,7 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             self._send_json(collect_health())
             return
         if parsed.path == "/api/jobs":
-            self._send_json({"jobs": list_job_payloads()})
+            self._send_json(jobs_payload())
             return
         if parsed.path == "/api/cache":
             query = parse_qs(parsed.query)
@@ -293,6 +358,8 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             try:
                 job = create_subtitle_render_job(self._read_json())
                 self._send_json({"jobId": job.id, "status": job.status}, status=202)
+            except ActiveJobError as exc:
+                self._send_active_job_conflict(exc.job)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
@@ -314,7 +381,11 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/jobs/") and path.endswith("/resume"):
             job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/resume"))
-            resumed = resume_job(job_id)
+            try:
+                resumed = resume_job(job_id)
+            except ActiveJobError as exc:
+                self._send_active_job_conflict(exc.job)
+                return
             if not resumed:
                 self._send_json({"error": "Job cannot be resumed."}, status=409)
                 return
@@ -330,11 +401,11 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
 
-        job = JobState(id=uuid.uuid4().hex[:12], payload=payload)
-        with JOB_LOCK:
-            JOBS[job.id] = job
-            _persist_job(job)
-        JOB_EXECUTOR.submit(_run_job, job.id, options)
+        try:
+            job = create_pipeline_job(payload, options)
+        except ActiveJobError as exc:
+            self._send_active_job_conflict(exc.job)
+            return
         self._send_json({"jobId": job.id, "status": job.status}, status=202)
 
     def do_PUT(self) -> None:
@@ -462,6 +533,15 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_active_job_conflict(self, job: JobState) -> None:
+        self._send_json(
+            {
+                "error": f"已有任务正在运行: {job.id}",
+                "activeJob": _job_to_dict(job),
+            },
+            status=409,
+        )
+
     def _serve_asset(self, name: str) -> None:
         try:
             asset = resources.files("subtitle_tool").joinpath("web_assets").joinpath(name)
@@ -495,6 +575,7 @@ def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
         )
         mode = str(payload.get("mode") or "hard")
         position = str(payload.get("position") or "above-bottom")
+        encoding_profile = str(payload.get("encodingProfile") or "auto")
         suffix = "fixed-sub" if mode == "hard" else "default-sub"
         output_path = subtitle_path.with_name(
             f"{subtitle_path.stem}.edited.{suffix}.mp4"
@@ -507,6 +588,23 @@ def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
             mode,
             position,
             JOBS[job_id].cancel_event.is_set,
+            encoding_profile=encoding_profile,
+            progress_callback=lambda progress: _update_job(
+                job_id,
+                log=(
+                    f"烧录硬字幕: {progress.percent}% · 已处理 "
+                    f"{_web_duration(progress.processed_seconds)}/"
+                    f"{_web_duration(progress.duration_seconds)} · 速度 "
+                    f"{progress.speed:.2f}x · 预计剩余 "
+                    f"{_web_duration(progress.eta_seconds)}"
+                    if progress.speed and progress.eta_seconds is not None
+                    else f"烧录硬字幕: {progress.percent}% · 正在计算剩余时间"
+                ),
+                progress=min(99, 20 + round(progress.percent * 79 / 100)),
+            ),
+            status_callback=lambda message: _update_job(
+                job_id, log=message, progress=21
+            ),
         )
     except CancellationError:
         _update_job(job_id, status="canceled", log="任务已停止", progress_message="已停止")
@@ -537,6 +635,15 @@ def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
         progress=100,
         progress_message="任务完成",
     )
+
+
+def _web_duration(seconds: float | None) -> str:
+    total = max(0, round(seconds or 0))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _run_job(job_id: str, options: PipelineOptions) -> None:
@@ -671,6 +778,16 @@ def list_job_payloads(limit: int = 50) -> list[dict[str, object]]:
         return [_job_to_dict(job) for job in jobs[:limit] if job is not None]
 
 
+def jobs_payload(limit: int = 50) -> dict[str, object]:
+    with JOB_LOCK:
+        jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)
+        current = _active_job_unlocked()
+        return {
+            "jobs": [_job_to_dict(job) for job in jobs[:limit] if job is not None],
+            "activeJob": _job_to_dict(current),
+        }
+
+
 def cache_summary(out_dir: Path) -> dict[str, object]:
     return AssetCache(cache_root(out_dir)).summary()
 
@@ -691,15 +808,11 @@ def resume_job(job_id: str) -> JobState | None:
             options = options_from_payload(payload)
         except Exception:
             return None
-    resumed = JobState(
-        id=uuid.uuid4().hex[:12],
-        payload=payload,
+    resumed = _reserve_job(
+        payload,
         resumed_from=original.id,
         logs=[f"继续任务: {original.id}"],
     )
-    with JOB_LOCK:
-        JOBS[resumed.id] = resumed
-        _persist_job(resumed)
     if is_render_job:
         JOB_EXECUTOR.submit(_run_subtitle_render_job, resumed.id, payload)
     else:
@@ -789,6 +902,17 @@ def _whisper_models_check(root: Path) -> dict[str, object]:
         "name": "Whisper 模型",
         "ok": has_any_model,
         "detail": "；".join(statuses),
+    }
+
+
+def _whisper_vad_model_check(root: Path) -> dict[str, object]:
+    path = root / DEFAULT_VAD_MODEL_PATH
+    installed = path.exists() and path.stat().st_size > 0
+    return {
+        "name": "Whisper VAD 模型",
+        "ok": installed,
+        "optional": True,
+        "detail": str(path) if installed else "未安装；将自动使用标准语音转写",
     }
 
 

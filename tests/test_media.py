@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from subtitle_tool.errors import DependencyError  # noqa: E402
 from subtitle_tool.media import (  # noqa: E402
+    EncodingProgress,
     ass_ffmpeg_binary,
     burn_subtitle_track,
     extract_audio,
@@ -39,7 +40,9 @@ class MediaTests(unittest.TestCase):
             "subtitle_tool.media.ass_ffmpeg_binary",
             return_value="/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
         ), patch(
-            "subtitle_tool.media.run_process",
+            "subtitle_tool.media._probe_duration_seconds", return_value=10.0
+        ), patch(
+            "subtitle_tool.media.run_process_streaming",
             return_value=subprocess.CompletedProcess([], 0, "", ""),
         ) as run_process:
             output = burn_subtitle_track(
@@ -58,6 +61,79 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(command[command.index("-c:a") + 1], "copy")
         self.assertIs(run_process.call_args.kwargs["cancel_check"], cancel_check)
         self.assertEqual(output.name, "result.mp4")
+
+    def test_fast_hard_subtitle_reports_real_ffmpeg_progress(self):
+        progress_updates = []
+
+        def fake_stream(command, cancel_check=None, stdout_line_callback=None):
+            for line in (
+                "out_time_us=5000000",
+                "speed=2.0x",
+                "progress=continue",
+            ):
+                stdout_line_callback(line)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.media.ass_ffmpeg_binary",
+            return_value="/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        ), patch(
+            "subtitle_tool.media._probe_duration_seconds", return_value=10.0
+        ), patch(
+            "subtitle_tool.media.run_process_streaming", side_effect=fake_stream
+        ) as run:
+            burn_subtitle_track(
+                Path(tmpdir) / "video.mp4",
+                Path(tmpdir) / "captions.ass",
+                Path(tmpdir) / "result.mp4",
+                encoding_profile="fast",
+                progress_callback=progress_updates.append,
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-c:v") + 1], "libx264")
+        self.assertEqual(command[command.index("-preset") + 1], "veryfast")
+        self.assertIn("-progress", command)
+        self.assertIsInstance(progress_updates[-1], EncodingProgress)
+        self.assertEqual(progress_updates[-1].percent, 50)
+        self.assertEqual(progress_updates[-1].speed, 2.0)
+        self.assertEqual(progress_updates[-1].eta_seconds, 2.5)
+
+    def test_auto_hard_subtitle_uses_videotoolbox_and_falls_back_to_fast_cpu(self):
+        commands = []
+        statuses = []
+
+        def fake_stream(command, cancel_check=None, stdout_line_callback=None):
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                1 if len(commands) == 1 else 0,
+                "",
+                "hardware failed" if len(commands) == 1 else "",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.media.ass_ffmpeg_binary",
+            return_value="/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
+        ), patch(
+            "subtitle_tool.media._probe_duration_seconds", return_value=10.0
+        ), patch(
+            "subtitle_tool.media._ffmpeg_has_encoder", return_value=True
+        ), patch(
+            "subtitle_tool.media.run_process_streaming", side_effect=fake_stream
+        ):
+            burn_subtitle_track(
+                Path(tmpdir) / "video.mp4",
+                Path(tmpdir) / "captions.ass",
+                Path(tmpdir) / "result.mp4",
+                encoding_profile="auto",
+                status_callback=statuses.append,
+            )
+
+        self.assertEqual(commands[0][commands[0].index("-c:v") + 1], "h264_videotoolbox")
+        self.assertEqual(commands[1][commands[1].index("-c:v") + 1], "libx264")
+        self.assertEqual(commands[1][commands[1].index("-preset") + 1], "veryfast")
+        self.assertTrue(any("快速 CPU" in status for status in statuses))
 
     def test_ass_ffmpeg_binary_explains_how_to_install_missing_filter(self):
         with patch(
