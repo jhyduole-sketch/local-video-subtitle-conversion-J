@@ -35,23 +35,20 @@ def is_url(value: str) -> bool:
 def extract_scenario_id(value: str) -> str:
     parsed = urllib.parse.urlparse(value)
     if parsed.netloc != TALKSMITH_SHARE_HOST or parsed.path != "/s":
-        raise SubtitleToolError(
-            "Unsupported URL. v1 only supports TalkSmith share URLs like "
-            "https://service.talk-smith.com/s?id=..."
-        )
+        raise SubtitleToolError("无效的公开视频分享链接。")
 
     query = urllib.parse.parse_qs(parsed.query)
     scenario_ids = query.get("id", [])
     scenario_id = scenario_ids[0].strip() if scenario_ids else ""
     if not scenario_id:
-        raise SubtitleToolError("Invalid TalkSmith share URL: missing id query parameter.")
+        raise SubtitleToolError("无效的公开视频分享链接：缺少 id 参数。")
     return scenario_id
 
 
 def find_available_video(payload: dict[str, Any], scenario_id: str) -> TalkSmithVideo:
     slides = payload.get("publishedSlides")
     if not isinstance(slides, list):
-        raise SubtitleToolError("TalkSmith API response does not contain publishedSlides.")
+        raise SubtitleToolError("公开视频服务响应缺少视频列表。")
 
     for slide in slides:
         if not isinstance(slide, dict) or slide.get("type") != "VIDEO":
@@ -66,7 +63,7 @@ def find_available_video(payload: dict[str, Any], scenario_id: str) -> TalkSmith
         if isinstance(video_url, str) and video_url:
             return TalkSmithVideo(scenario_id=scenario_id, video_url=video_url)
 
-    raise SubtitleToolError("TalkSmith scenario has no available VIDEO slide.")
+    raise SubtitleToolError("该公开视频分享页没有可下载的视频。")
 
 
 def fetch_talksmith_video(url: str) -> TalkSmithVideo:
@@ -81,21 +78,21 @@ def fetch_talksmith_video(url: str) -> TalkSmithVideo:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise SubtitleToolError(f"TalkSmith scenario not found: {scenario_id}") from exc
-        raise SubtitleToolError(f"TalkSmith API request failed with HTTP {exc.code}.") from exc
+            raise SubtitleToolError(f"公开视频分享内容不存在：{scenario_id}") from exc
+        raise SubtitleToolError(f"公开视频服务请求失败：HTTP {exc.code}。") from exc
     except urllib.error.URLError as exc:
-        raise SubtitleToolError(f"TalkSmith API request failed: {exc.reason}") from exc
+        raise SubtitleToolError(f"公开视频服务请求失败：{exc.reason}") from exc
 
     if "application/json" not in content_type:
-        raise SubtitleToolError("TalkSmith API returned a non-JSON response.")
+        raise SubtitleToolError("公开视频服务返回了非 JSON 响应。")
 
     try:
         payload = json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as exc:
-        raise SubtitleToolError("TalkSmith API returned invalid JSON.") from exc
+        raise SubtitleToolError("公开视频服务返回了无效 JSON。") from exc
 
     if not isinstance(payload, dict):
-        raise SubtitleToolError("TalkSmith API returned an unexpected response shape.")
+        raise SubtitleToolError("公开视频服务返回了无法识别的数据。")
     return find_available_video(payload, scenario_id)
 
 

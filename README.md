@@ -1,68 +1,83 @@
-# local-video-subtitle-conversion-J
+# 本地多语言视频字幕工具
 
-本项目是一个本地视频字幕转换工具：输入本地视频或公开视频网址，生成目标语言 `.srt` 字幕，并可输出带字幕轨或固定硬字幕的 MP4 视频。
+[中文首页](README.md) · [完整使用指南](docs/使用指南.md) · [更新记录](docs/更新记录.md) · [English](README.en.md)
 
-当前版本重点做的是“稳定产出外挂字幕和软字幕视频”，不是把字幕硬烧录进画面像素里。
+输入一个**本地视频、上传文件或公开视频网址**，工具会自动取得源字幕或识别视频语音，再生成一种或多种目标语言的 `.srt` 字幕。需要时，还可以输出保留原画质的软字幕视频，或固定位置显示的硬字幕视频。
 
-## 功能要点
+项目同时提供本地 Web 界面和命令行，适合个人在 macOS 上处理日语、中文、英语及其他常见语言的视频。
 
-- 支持本地视频路径、网页上传视频、TalkSmith URL、YouTube URL、Bilibili URL，以及其他公开单视频网址的通用尝试下载。
-- TalkSmith、YouTube 和 Bilibili 使用专用处理逻辑；其他 HTTP/HTTPS 地址使用 `yt-dlp` 匿名探测，成功后自动进入字幕流程。
-- YouTube 默认优先下载高清视频，不再优先使用低清 360p 格式。
-- 字幕来源支持自动判断：优先读视频内置字幕，没有内置字幕时再抽音频语音识别。
-- 语音转写支持本地 Whisper 和 OpenAI。
-- 字幕翻译支持 z.ai、本地中/日/英快速模型、本地多语言 NLLB 和 OpenAI。
-- z.ai 连续限流或翻译失败时，会自动尝试本地模型；本地结果未通过质量检查时再切换 OpenAI，并在日志和结果中标明实际引擎。
-- 相同源字幕、目标语言和翻译策略会复用本地翻译缓存，减少重复 API 请求。
-- 支持一次选择多个目标语言，分别输出多份字幕和多份软字幕视频。
-- 支持“重新下载”“只下载”“输出软字幕视频”“避免遮挡原字幕”等选项。
-- Web 页面提供环境检查、进度条、实时日志、已用时、停止任务按钮。
-- Web 服务同一时间只允许一个活动任务；重复点击、刷新页面或局域网多端同时提交时不会创建重复任务。
-- 任务历史会写入本地 SQLite；服务重启后仍可查看，失败、取消或中断的任务可以继续执行。
-- 视频、音频、源字幕、转写结果和翻译结果均有本地缓存，并可在页面按类别查看和清理。
-- 每次任务创建带时间戳的独立目录，文件名也带同一时间戳，便于区分多次任务。
+## 项目亮点
 
-## 适合场景
+- **多种输入**：本地路径、网页上传、YouTube、Bilibili，以及其它公开单视频网址的通用尝试下载。
+- **智能字幕来源**：优先读取视频内置字幕；没有字幕轨时，使用本地 Whisper 或 OpenAI 识别语音。
+- **多语言翻译**：支持 z.ai、OpenAI、本地中/日/英快速模型，以及 NLLB 600M / 1.3B 多语言模型。
+- **稳定回退**：z.ai 限流或翻译失败时，可自动切换本地模型；本地结果不合格时再尝试 OpenAI。
+- **质量保护**：检测空字幕、重复内容、异常长度、语言不匹配，并对 NLLB 异常句进行单句重试。
+- **多种成品**：输出外挂 `.srt`、可开关软字幕 MP4，或固定位置硬字幕 MP4。
+- **字幕避让**：分析视频顶部和底部的文字区域，把新硬字幕放到更合适的位置，减少与原画面字幕重叠。
+- **预览与校对**：任务完成后可在浏览器中播放视频、同步查看字幕、修改文字和时间轴，再重新生成视频。
+- **任务可靠性**：实时进度、时间戳日志、停止任务、任务历史、失败继续、缓存复用和重复提交保护。
+- **本地优先**：视频、模型、缓存、任务记录和输出均保存在当前电脑，不需要单独部署服务端。
 
-- 把日语或英语视频转成中文字幕。
-- 把中文视频转成日语、英语等字幕。
-- 批量生成不同目标语言的 `.srt` 文件。
-- 给 MP4 添加默认软字幕轨，方便在 IINA / VLC 等播放器里选择字幕。
-- 生成固定位置的硬字幕视频，避开原画面底部字幕。
-- 下载 TalkSmith、YouTube、Bilibili 或其他受 `yt-dlp` 支持的公开视频后再生成字幕。
+## 处理流程
 
-## 重要概念
+```mermaid
+flowchart LR
+    A["本地视频 / 上传文件 / 公共 URL"] --> B["准备视频"]
+    B --> C{"存在内置字幕轨？"}
+    C -- "是" --> D["导出源字幕与时间轴"]
+    C -- "否" --> E["抽取音频"]
+    E --> F["本地 Whisper / OpenAI 转写"]
+    F --> D
+    D --> G["选择目标语言与翻译引擎"]
+    G --> H["翻译、质量检查与自动回退"]
+    H --> I["生成目标语言 SRT"]
+    I --> J["软字幕视频：保留原画质"]
+    I --> K["硬字幕视频：固定位置"]
+    I --> L["浏览器预览与字幕校对"]
+    L --> M["保存字幕并重新生成视频"]
+```
 
-### 软字幕
+## 系统架构
 
-软字幕是独立字幕轨，被封装进 MP4 或作为 `.srt` 文件存在。播放器可以开关和切换字幕。
+```mermaid
+flowchart TB
+    subgraph Input["输入与操作"]
+        WEB["本地 Web 界面"]
+        CLI["命令行 CLI"]
+        FILE["本地文件 / 视频 URL"]
+    end
 
-本项目的 `*.default-sub.mp4` 是软字幕视频。它不会改变原视频画面清晰度，因为视频流使用 `copy` 方式保留。
+    subgraph Core["字幕处理核心"]
+        JOB["任务调度、历史、停止与继续"]
+        MEDIA["ffmpeg / ffprobe / yt-dlp"]
+        SOURCE["内置字幕读取与音频抽取"]
+        STT["Whisper / OpenAI 转写"]
+        TRANS["z.ai / OpenAI / OPUS-MT / NLLB"]
+        QA["翻译质量检查与引擎回退"]
+        LAYOUT["字幕换行、时间整理与位置检测"]
+    end
 
-### 硬字幕
+    subgraph Storage["本地数据"]
+        CACHE["视频、音频、转写、翻译缓存"]
+        STATE["SQLite 任务记录"]
+        OUTPUT["SRT、软字幕视频、硬字幕视频"]
+    end
 
-硬字幕是画面像素的一部分，播放器不能关闭，也不能直接提取成文本。选择“稳定硬字幕”后，工具会使用 ASS 样式和 FFmpeg 把新字幕烧录进画面，因此需要重新编码视频。
+    FILE --> WEB
+    FILE --> CLI
+    WEB --> JOB
+    CLI --> JOB
+    JOB --> MEDIA --> SOURCE --> STT --> TRANS --> QA --> LAYOUT --> OUTPUT
+    JOB <--> STATE
+    MEDIA <--> CACHE
+    STT <--> CACHE
+    TRANS <--> CACHE
+```
 
-如果原视频底部已经有硬字幕，推荐选择“稳定硬字幕”和“自动避让”或“原底部字幕上方”。软字幕实际显示位置主要由播放器控制，无法保证在每个播放器里都能避让。
+## 快速开始
 
-页面勾选“自动避让原字幕”时会强制使用稳定硬字幕，避免出现“勾选了避让、实际却仍输出软字幕”的冲突。任务日志会显示最终采用的字幕模式和位置。主动切换回软字幕时，页面会自动关闭避让选项。
-
-自动避让会从视频时间轴均匀抽取最多 8 帧，分析顶部和底部反复出现的文字边缘。检测到底部硬字幕时，新字幕放到原字幕上方；检测到顶部硬字幕时，新字幕放到底部。检测结果带置信度并缓存在 `.subtitle-tool-cache/analysis/`。置信度不足时采用保守的底部上方位置，不擦除原画面。
-
-所有目标字幕写出前都会自动整理：按中英文显示宽度换行、尽量保持最多两行、长句按原时间段拆分，并修复相邻字幕时间重叠。字幕文字不会被截断。
-
-## 环境要求
-
-- macOS
-- Python 3.9+
-- `ffmpeg` / `ffprobe`
-- `ffmpeg-full`，仅固定位置硬字幕模式需要；它提供 `libass` 过滤器
-- `yt-dlp`，处理 YouTube、Bilibili 和通用视频网址时需要
-- `whisper.cpp`，本地语音识别时需要
-- whisper.cpp GGML 模型文件，例如 `models/ggml-base.bin`
-- 本地翻译模型缓存，使用本地翻译时需要
-
-安装系统工具：
+### 1. 安装基础工具
 
 ```bash
 brew install ffmpeg
@@ -71,37 +86,29 @@ brew install whisper-cpp
 brew install yt-dlp
 ```
 
-`ffmpeg-full` 是 keg-only，无需替换系统中的普通 `ffmpeg`。本工具会自动使用 `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` 处理硬字幕。
-
 安装 Python 依赖：
 
 ```bash
-python3 -m pip install openai
+python3 -m pip install -e .
 python3 -m pip install transformers sentencepiece torch protobuf
 ```
 
-下载 Whisper 模型：
+下载基础 Whisper 模型：
 
 ```bash
 mkdir -p models
 curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin -o models/ggml-base.bin
 ```
 
-下载 VAD 模型（推荐，用于跳过静音片段）：
+完整的 VAD、本地翻译模型和 API 配置见[完整使用指南](docs/使用指南.md)。
 
-```bash
-curl -L https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin -o models/ggml-silero-v6.2.0.bin
-```
-
-## 配置 API Key
-
-项目支持 `.env`。复制示例文件：
+### 2. 配置云端模型（可选）
 
 ```bash
 cp .env.example .env
 ```
 
-然后按需填写：
+按需要填写：
 
 ```text
 OPENAI_API_KEY=
@@ -110,101 +117,29 @@ ZAI_API_BASE=https://open.bigmodel.cn/api/paas/v4/
 ZAI_MODEL=glm-4.7-flash
 ```
 
-z.ai 限流保护参数：
+只使用本地 Whisper 和本地翻译模型时，可以不配置云端 Key。
 
-```text
-ZAI_TIMEOUT_SECONDS=60
-ZAI_REQUEST_DELAY_SECONDS=2
-ZAI_RATE_LIMIT_RETRY_SECONDS=20
-ZAI_RATE_LIMIT_RETRY_LIMIT=3
-ZAI_TRANSLATION_BATCH_SEGMENTS=24
-ZAI_TRANSLATION_BATCH_CHARACTERS=4000
-LOCAL_TRANSLATION_BATCH_SIZE=8
-LOCAL_TRANSLATION_DEVICE=cpu
-```
+### 3. 启动 Web 界面
 
-说明：
-
-- `ZAI_REQUEST_DELAY_SECONDS`：每批翻译之间等待几秒，降低限流概率。
-- `ZAI_RATE_LIMIT_RETRY_SECONDS`：遇到 429 后首次等待秒数，后续会递增。
-- `ZAI_RATE_LIMIT_RETRY_LIMIT`：遇到 429 最多重试几次。
-- `ZAI_TRANSLATION_BATCH_SEGMENTS` / `ZAI_TRANSLATION_BATCH_CHARACTERS`：限制每次 z.ai 请求包含的字幕条数和字符数。
-- `LOCAL_TRANSLATION_BATCH_SIZE`：本地模型每批处理的字幕条数。
-- `LOCAL_TRANSLATION_DEVICE`：默认 `cpu`；Apple 芯片可手动设为 `mps`，设备推理失败时会回退 CPU。
-- `.env` 不会提交到 GitHub。
-
-## 启动图形界面
-
-在项目目录运行：
+仅本机访问：
 
 ```bash
 env PYTHONPATH=src python3 -m subtitle_tool.web --host 127.0.0.1 --port 7860
 ```
 
-浏览器打开：
+浏览器打开 [http://127.0.0.1:7860](http://127.0.0.1:7860)。
 
-```text
-http://127.0.0.1:7860
-```
-
-允许同一局域网内的其它设备访问：
+允许可信局域网设备访问：
 
 ```bash
 env PYTHONPATH=src python3 -m subtitle_tool.web --host 0.0.0.0 --port 7860
 ```
 
-其它设备使用这台电脑的局域网 IP 访问，例如 `http://192.168.1.20:7860/`。如果无法连接，请检查 macOS 防火墙及路由器的客户端隔离设置。当前 Web 页面没有用户登录保护，只应在可信局域网中开放。
+当前 Web 页面没有登录保护，局域网模式只适合可信网络。
 
-Web 页面支持：
+## 常见使用方式
 
-- 输入 YouTube / Bilibili / TalkSmith URL，或尝试其他公开单视频网址。
-- 输入本地视频路径。
-- 上传本地视频文件。上传视频优先级高于文本框里的 URL 或路径。
-- 选择原视频语言和目标语言。
-- 目标语言可以多选，例如 `ja, vi, en`。
-- 常用目标语言使用下拉复选框；切换字幕翻译模型时，会自动收敛到当前模型支持/推荐的语言范围。
-- 选择字幕来源：自动、内置字幕、音频识别。
-- 选择语音转写：本地 Whisper 或 OpenAI。
-- 选择本地 Whisper 模型大小：`base`、`small`、`medium` 或自定义模型路径。
-- 本地 Whisper 默认尝试 Metal/GPU 加速并启用 VAD；Metal 不兼容时自动切换 CPU，VAD 不兼容时自动关闭 VAD继续转写。
-- 可在页面关闭 Metal/GPU 或 VAD，也可以填写自定义 VAD 模型路径；处理日志会显示实际使用和降级情况。
-- 选择字幕翻译：z.ai、本地快速模型、本地多语言 NLLB、OpenAI。
-- 选择字幕视频模式：软字幕保持原画质，稳定硬字幕固定显示位置。
-- 选择硬字幕编码方式：自动推荐、Apple VideoToolbox、快速 CPU 或高画质 CPU。
-- 选择新字幕位置：自动避让、原底部字幕上方、画面底部或画面顶部。
-- 硬字幕烧录时显示真实编码百分比、已处理时长、速度和预计剩余时间。
-- 任务运行时显示进度、日志、已用时。
-- 点击“开始任务”后按钮立即禁用并显示“任务进行中”；任务结束前无法重复提交。
-- 页面刷新或其它局域网设备打开页面时，会自动接管并显示当前活动任务。
-- 任务运行时可点击“停止任务”。
-- 查看历史任务，并继续失败、取消或因服务重启而中断的任务。
-- 查看缓存占用，并按视频、音频、源字幕、转写或翻译类别清理缓存。
-- 任务完成后页面自动定位到左侧表单下方的“输出与字幕校对”；点击目标字幕的“预览并校对字幕”，修改字幕文字与开始/结束时间。
-- 字幕编辑器内可直接播放原视频，播放时同步高亮当前字幕；点击字幕行可跳转到对应时间。
-- 修改字幕文字或预览位置会立即反映在视频画面上，不需要先运行 FFmpeg。
-- 保存字幕时自动创建 `.backup.srt`；可保存后直接提交重新生成视频任务。
-
-Web 服务同一时间只接受一个活动任务，状态包括排队、运行和取消中。重复点击或另一台设备同时提交时，后端返回当前任务，不再创建第二个排队任务。这样可以避免 Whisper、FFmpeg 和本地翻译模型互相争抢内存与 CPU。
-
-点击“停止任务”后，工具会终止当前 `ffmpeg`、`yt-dlp` 或 `whisper-cli` 子进程。正在等待的云端 API 请求仍需等该请求返回或超时，然后任务才会完全停止。
-
-任务记录保存在项目根目录的 `.subtitle-tool-state/jobs.sqlite3`。继续任务会创建一个新的关联任务，并复用已完成的下载、音频、转写及翻译批次，不会覆盖原任务记录。`output/` 只保存下载视频、字幕和成品视频。
-
-## 命令行用法
-
-所有命令建议在项目目录运行：
-
-```bash
-cd /Users/duole/DDeveloper/AI/codex-test/project3-codex
-```
-
-直接用源码运行时，在命令前加：
-
-```bash
-env PYTHONPATH=src
-```
-
-### 本地视频转字幕
+### 本地视频生成中文字幕
 
 ```bash
 env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
@@ -216,424 +151,93 @@ env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
   --out-dir output
 ```
 
-### YouTube 视频转日语字幕视频
+### 远程视频生成日语和英语字幕
 
 ```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v=gaaarGhydLk' \
-  --source-lang zh \
-  --target-lang ja \
-  --transcriber local-whisper \
-  --translator z-ai \
-  --embed-subtitles \
-  --force-download \
-  --out-dir output
-```
-
-### TalkSmith 视频转中文字幕
-
-```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://service.talk-smith.com/s?id=cmdfs4a5k265w0z1anf9fk08z' \
-  --source-lang ja \
-  --target-lang zh-CN \
-  --transcriber local-whisper \
-  --translator z-ai \
-  --embed-subtitles \
-  --out-dir output
-```
-
-### Bilibili 视频转日语字幕
-
-```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.bilibili.com/video/BV1rR4y197tP/' \
-  --source-lang zh \
-  --target-lang ja \
-  --transcriber local-whisper \
-  --translator z-ai \
-  --embed-subtitles \
-  --out-dir output
-```
-
-### 一次输出多种语言
-
-```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
-  --source-lang zh \
+env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v=VIDEO_ID' \
+  --source-lang auto \
   --target-lang ja \
   --target-lang en \
-  --target-lang vi \
   --transcriber local-whisper \
   --translator z-ai \
   --embed-subtitles \
   --out-dir output
 ```
 
-每种目标语言会分别输出 `.srt` 和软字幕 MP4。
-
-### 只下载远程视频
+### 只下载视频
 
 ```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://www.youtube.com/watch?v=gaaarGhydLk' \
+env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://example.com/video' \
   --download-only \
-  --force-download \
   --out-dir output
 ```
 
-`--download-only` 只下载，不转写、不翻译。适合先检查下载视频是否清晰。
+通用网址下载属于尽力尝试：需要登录、Cookie、DRM、地区授权或特殊播放器的网站可能无法下载。
 
-`--force-download` 会忽略已有缓存，重新下载。之前下载过低清版本时建议打开。
+## 翻译引擎怎么选
 
-## 参数说明
+| 引擎 | 适合场景 | 特点 |
+| --- | --- | --- |
+| z.ai | 默认在线多语言翻译 | 语言覆盖广；可能遇到账号限流 |
+| OpenAI | 高质量在线备用 | 质量稳定；需要 API Key 并产生 API 费用 |
+| 本地快速模型 | 中、日、英离线粗翻 | 速度快、模型较小；支持方向有限 |
+| NLLB 600M | 更多语言的本地快速翻译 | 离线、覆盖广；质量低于 1.3B |
+| NLLB 1.3B | 更多语言的本地质量模式 | 更准确；模型更大、CPU 推理更慢 |
 
-```text
-input
-```
+转写和翻译不是一件事：Whisper 负责“听懂视频在说什么”，翻译模型负责“把源字幕转换成目标语言”。
 
-输入视频路径或 URL。TalkSmith、YouTube 和 Bilibili 优先使用专用逻辑；其他 HTTP/HTTPS 地址会尝试由 `yt-dlp` 匿名解析和下载。
+## 输出结果
 
-通用下载 v1 只处理公开的单个点播视频，不自动读取浏览器 Cookie，也不支持需要登录、DRM、直播或播放列表。网站不受支持、触发 `403/429`、存在地区限制或网络超时时，页面和任务日志会显示对应原因。通用解析是尽力尝试，不代表所有视频网站都保证可下载。
-
-```text
---source-lang
-```
-
-原视频语言，例如 `zh`、`zh-CN`、`ja`、`en`。本地 Whisper 建议显式填写，识别更稳定。
-
-```text
---target-lang
-```
-
-目标字幕语言，可重复传入。不传时只输出源字幕。
-
-```text
---source
-```
-
-字幕来源策略：
-
-- `auto`：默认，先找内置字幕，没有就听音频。
-- `embedded`：只读取内置字幕。
-- `audio`：强制听音频识别。
-
-```text
---transcriber
-```
-
-语音识别引擎：
-
-- `local-whisper`
-- `openai`
-
-本地 Whisper 默认启用 Metal/GPU 和 VAD。可使用 `--whisper-cpu` 强制 CPU，使用 `--no-whisper-vad` 关闭静音检测，或用 `--whisper-vad-model` 指定 VAD 模型路径。
-
-```text
---translator
-```
-
-翻译引擎：
-
-- `z-ai`
-- `local-transformer`
-- `local-nllb`
-- `local-nllb-quality`
-- `openai`
-
-```text
---embed-subtitles
-```
-
-输出字幕视频，默认生成带可开关软字幕轨的 MP4。
-
-```text
---subtitle-video-mode soft|hard
-```
-
-- `soft`：复制原视频和音频流，速度快、不改变视频清晰度，但字幕位置由播放器控制。
-- `hard`：将字幕烧录进画面，位置稳定，需要重新编码视频。
-
-```text
---subtitle-position auto|bottom|above-bottom|top
-```
-
-硬字幕位置。`auto` 在启用 `--avoid-subtitle-overlap` 时自动使用 `above-bottom`。
-为了保证避让真实生效，只要同时启用 `--embed-subtitles` 和 `--avoid-subtitle-overlap`，后端就会自动使用硬字幕模式，即使传入的 `--subtitle-video-mode` 是 `soft`。
-
-```text
---hard-subtitle-encoder auto|hardware|fast|quality
-```
-
-- `auto`：默认，优先 Apple VideoToolbox；不可用或失败时自动切换快速 CPU。
-- `hardware`：优先使用 Apple VideoToolbox，CPU 占用更低；不同分辨率和源编码下不一定总是最快。
-- `fast`：使用 `libx264 veryfast / CRF 20`，兼容性好，适合 4K 或长视频快速生成。
-- `quality`：保留原来的 `libx264 medium / CRF 18` 高画质模式，速度最慢。
-
-硬字幕编码过程中，Web 日志会持续显示类似：`烧录硬字幕 en: 68% · 已处理 15:32/22:46 · 速度 1.20x · 预计剩余 06:02`。
-
-在原底部字幕上方生成稳定英文字幕视频：
-
-```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
-  --source-lang ja \
-  --target-lang en \
-  --translator z-ai \
-  --embed-subtitles \
-  --avoid-subtitle-overlap \
-  --subtitle-video-mode hard \
-  --subtitle-position above-bottom
-```
-
-```text
---download-only
-```
-
-只下载远程视频，不生成字幕。
-
-```text
---force-download
-```
-
-远程视频已存在时也重新下载。
-
-```text
---whisper-model
-```
-
-指定 whisper.cpp 模型路径。默认：
-
-```text
-models/ggml-base.bin
-```
-
-## 模型选择建议
-
-### 本地 Whisper
-
-适合不想使用 OpenAI 转写的场景。`ggml-base.bin` 速度快，但对专有名词、噪声、动漫台词、混合语言可能识别不准。
-
-如果源字幕识别错，后续翻译质量也会下降。
-
-Web 页面可以选择 `base`、`small`、`medium` 三档模型：
-
-- `base`：速度快，适合快速试跑。
-- `small`：速度和准确率更平衡。
-- `medium`：更准但更慢，对机器性能要求更高。
-
-选择更大的模型前，需要先把对应文件下载到 `models/`，例如 `models/ggml-small.bin` 或 `models/ggml-medium.bin`。
-
-### 本地中/日/英翻译模型
-
-当前本地翻译支持：
-
-```text
-ja -> zh-CN
-zh / zh-CN -> ja
-ja -> en
-en -> ja
-zh / zh-CN -> en
-en -> zh-CN
-```
-
-中日方向继续使用已有小模型。英文方向使用 Helsinki-NLP OPUS-MT 模型：
-
-```text
-Helsinki-NLP/opus-mt-zh-en
-Helsinki-NLP/opus-mt-en-zh
-Helsinki-NLP/opus-mt-ja-en
-Helsinki-NLP/opus-mt-en-jap
-```
-
-这些英文模型需要先下载到 Hugging Face 本地缓存。Web 页面右侧“环境”区会显示每个本地翻译方向是否已安装；未安装时，会直接显示对应下载命令。
-
-也可以手动执行类似命令下载：
-
-```bash
-python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('Helsinki-NLP/opus-mt-zh-en', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('Helsinki-NLP/opus-mt-zh-en')"
-```
-
-### 本地多语言 NLLB 模型
-
-如果需要离线支持更多语言，可以在 Web 页面选择：
-
-```text
-本地多语言 NLLB 600M（快速）
-本地多语言 NLLB 1.3B（质量）
-```
-
-两个档位分别使用：
-
-```text
-facebook/nllb-200-distilled-600M
-facebook/nllb-200-distilled-1.3B
-```
-
-它支持常用目标语言，例如 `zh-CN`、`zh-TW`、`ja`、`en`、`ko`、`fr`、`de`、`es`、`pt`、`it`、`ru`、`ar`、`th`、`vi`、`id`。
-
-600M 适合快速粗翻，1.3B 适合质量优先。NLLB 模型较大，首次下载会比较慢，CPU 翻译速度也比本地快速模型慢。工具不会在任务中静默下载模型；Web 页面右侧“环境”区会分别显示两个型号是否已安装，并给出下载命令。
-
-手动下载命令示例：
-
-```bash
-python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-600M', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-600M')"
-python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; AutoTokenizer.from_pretrained('facebook/nllb-200-distilled-1.3B', use_fast=False); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-distilled-1.3B')"
-```
-
-本地快速模型速度快，但质量不如 z.ai / OpenAI，也不支持越南语、韩语、法语等更多语言方向。NLLB 覆盖语言更多，但模型更大、速度更慢。遇到源字幕质量差时，本地模型可能出现重复词、重复句或语义崩坏。
-
-当前版本会对本地翻译结果做基础质量保护：
-
-- 空翻译会失败。
-- 明显过长的翻译会失败。
-- 重复词/重复短语过多会失败，例如 `密かに密かに密かに...`。
-- 目标是日语但输出明显不像日语时会失败。
-
-NLLB 按批次输出进度日志。某一条字幕出现空白、乱码、超长或重复内容时，只对该条使用更严格的防重复参数重新翻译；重试成功后继续后面的字幕，不会因为第一次异常立即放弃整批结果。
-
-检测失败时不会继续生成坏字幕视频，日志会提示改用 z.ai / OpenAI 或先改善源字幕。
-
-### z.ai 翻译
-
-适合多语言翻译，例如 `ja`、`en`、`vi`、`ko`、`fr`。Web 页面会展示更多常用目标语言快捷按钮；这些按钮只是常用入口，也可以在目标语言输入框手动填写其它语言代码，例如 `he`、`fa`、`cs`、`ro`、`hu`、`fi`、`da`、`sw`。
-
-当前实现带动态批次、缺失字幕补翻、全局串行请求、限流等待重试和超时。连续限流或翻译失败后会自动尝试本地快速模型和 NLLB；本地模型不可用或质量检查失败时，再尝试 OpenAI。
-
-每个目标语言的最终结果会标明实际使用的引擎，例如 `z.ai`、`本地模型`、`OpenAI` 或 `OpenAI（缓存）`。
-
-如果一次选择很多目标语言，仍可能遇到 429 限流。可以减少目标语言数量，或调大 `.env` 里的等待参数。
-
-### OpenAI 翻译
-
-适合希望质量更稳定的场景，需要 `OPENAI_API_KEY`。OpenAI 也按云端多语言模型处理，Web 页面会展示和 z.ai 类似的更多常用语言快捷按钮，同时保留手动输入其它语言代码。
-
-## 输出目录
-
-每次任务按原视频名和任务时间戳建立独立目录：
+每次任务都会建立独立时间戳目录：
 
 ```text
 output/<video-name>.<YYYYMMDDHHMMSSX>/
+  <video-name>.<timestamp>.mp4
+  <video-name>.<timestamp>.source.<source-lang>.srt
+  <video-name>.<timestamp>.<target-lang>.srt
+  <video-name>.<timestamp>.<target-lang>.default-sub.mp4
+  <video-name>.<timestamp>.<target-lang>.fixed-sub.mp4
 ```
 
-文件名带时间戳和一位随机数字：
+- `*.srt`：外挂字幕，可在播放器或剪辑软件中单独使用。
+- `*.default-sub.mp4`：软字幕视频，字幕可开关，视频流保持原画质。
+- `*.fixed-sub.mp4`：硬字幕视频，字幕固定在画面中，需要重新编码。
 
-```text
-<video-name>.<YYYYMMDDHHMMSSX>.mp4
-<video-name>.<YYYYMMDDHHMMSSX>.source.<source-lang>.srt
-<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.srt
-<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.default-sub.mp4
-<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.fixed-sub.mp4
-<video-name>.<YYYYMMDDHHMMSSX>.<target-lang>.edited.fixed-sub.mp4
-```
+软字幕推荐使用 IINA 或 VLC 验证。QuickTime 对部分 MP4 软字幕轨的显示兼容性有限。
 
-示例：
+## 近期更新
 
-```text
-output/ftWe_pVrtho.202607091516421/
-  ftWe_pVrtho.202607091516421.mp4
-  ftWe_pVrtho.202607091516421.source.zh.srt
-  ftWe_pVrtho.202607091516421.ja.srt
-  ftWe_pVrtho.202607091516421.ja.default-sub.mp4
-```
+- Whisper 支持 Metal/GPU 加速、VAD 跳过静音，以及失败后的 CPU/标准转写回退。
+- 硬字幕支持 Apple VideoToolbox、快速 CPU 和高质量 CPU 编码，并显示真实百分比、速度和预计剩余时间。
+- Web 前后端共同阻止连续点击和重复提交，页面刷新后可恢复当前任务状态。
+- 任务历史支持安全清空已结束记录；缓存支持分类清理和一键清空全部，并在删除前明确提示影响范围。
+- 加入 NLLB 1.3B、多语言质量检查、异常句重试、翻译缓存和云端限流回退。
+- 加入画面字幕位置检测、自动避让、字幕预览校对和保存后重新生成视频。
+- 加入任务历史、失败继续、分类缓存管理和通用公开视频网址尝试下载。
 
-同一个视频再次运行会创建新的时间戳目录。相同字幕翻译会从 `.subtitle-tool-cache/translations/` 复用缓存，但输出文件仍会放在本次任务目录，避免与旧结果混在一起。
+完整变化见[更新记录](docs/更新记录.md)和[性能与任务安全技术说明](docs/2026-07-13-performance-and-task-safety.md)。
 
-稳定缓存位于项目根目录的 `.subtitle-tool-cache/`，包括：
+## 文档导航
 
-```text
-videos/              下载的视频
-audio/               已抽取音频
-source-subtitles/    内置源字幕
-transcripts/         Whisper 转写结果
-translations/        完整及分批翻译结果
-analysis/            画面硬字幕位置检测
-```
-
-清理缓存不会删除已经生成的时间戳任务目录。z.ai 分批翻译中断后，已成功的批次也会保留；继续任务时只请求尚未完成的字幕片段。
-
-旧版本保存在 `output/.subtitle-tool-state/` 和 `output/.subtitle-tool-cache/` 的数据会在服务启动或首次使用缓存时自动迁移到项目根目录。也可以分别使用 `SUBTITLE_TOOL_STATE_DB` 和 `SUBTITLE_TOOL_CACHE_DIR` 环境变量指定其它位置。
-
-字幕预览通过浏览器 Range 分段读取任务目录内的视频，不会一次把整个视频载入内存，也不会在预览阶段重新编码。MP4/WebM 通常可以直接播放；如果浏览器不支持某个 MOV/MKV 编码，仍可编辑字幕并使用“保存并重新生成视频”。画面中的预览字幕用于校对位置和内容，最终字体渲染以 FFmpeg 生成的视频为准。
-
-## 验证字幕
-
-推荐用 IINA 或 VLC 验证软字幕轨。QuickTime 对 MP4 软字幕显示比较挑，可能出现“文件里有字幕但播放时没显示”。
-
-也可以用 `ffprobe` 检查：
-
-```bash
-ffprobe -v error -select_streams s -show_entries stream=index,codec_name:stream_tags=language,title -of json output/video/video.default-sub.mp4
-```
-
-如果能看到 `mov_text` 字幕流，说明软字幕轨已经写入。
-
-`*.fixed-sub.mp4` 的字幕已经成为画面的一部分，不会显示为独立字幕流；直接用 QuickTime、IINA 或 VLC 播放即可验证位置。
-
-## 常见问题
-
-### 为什么视频变模糊？
-
-早期版本 YouTube 下载优先选过低清格式。当前版本优先下载高清 MP4 视频和 M4A 音频。已下载过低清缓存时，勾选“重新下载”或使用 `--force-download`。
-
-生成软字幕 MP4 时视频流使用 `copy`，不会主动降低清晰度。
-
-### 为什么越南语没有输出？
-
-如果使用本地中/日/英翻译模型，越南语不支持。更多语言请用 `z-ai` 或 `openai`。
-
-### 为什么本地模型翻译重复很多句？
-
-本地翻译模型是小型翻译模型，质量有限。源字幕识别不准时，模型容易输出重复词或重复句。当前版本会检测明显异常并阻止坏字幕继续输出；仍建议改用 z.ai / OpenAI，或者先提高转写质量。
-
-### 原视频画面上有中文字幕，工具会读取吗？
-
-不会。画面里的字幕通常是硬字幕，已经是像素。当前工具不会 OCR 画面文字。它会优先读取视频内置字幕轨；没有内置字幕轨时，听音频转写。
-
-### 为什么 z.ai 报 429？
-
-429 表示账号触发请求频率限制。当前版本会自动等待并重试；重试耗尽后会依次尝试本地模型和 OpenAI，并在日志中提示切换过程。仍频繁出现时，可以减少目标语言数量，或调大：
-
-```text
-ZAI_REQUEST_DELAY_SECONDS
-ZAI_RATE_LIMIT_RETRY_SECONDS
-```
+- [完整使用指南](docs/使用指南.md)：安装、配置、Web、CLI、模型、缓存、字幕编辑和故障排查。
+- [更新记录](docs/更新记录.md)：按阶段查看项目能力变化。
+- [English README](README.en.md)：英文项目简介和快速启动。
+- [性能与任务安全更新](docs/2026-07-13-performance-and-task-safety.md)：最近一轮性能优化的详细说明。
 
 ## 当前限制
 
-- 硬字幕模式需要重新编码，处理速度慢于软字幕模式，输出文件大小也可能变化。
-- 不做视频画面 OCR，无法直接读取硬字幕文字。
-- 自动检测置信度不足时会保守假设原字幕位于底部；可在页面手动覆盖新字幕位置。
-- 画面字幕检测是多帧视觉启发式判断，不是 OCR；复杂台标、弹幕或大段画面文字可能降低置信度，此时可手动指定位置。
-- 本地中/日/英翻译模型语言方向有限，质量是粗翻级别。
-- 本地 Whisper `base` 模型识别质量有限，必要时可换更大的 whisper.cpp 模型。
-- YouTube / Bilibili 部分视频可能限制匿名下载，仍可能需要用户自行下载。
-- 云端 API 请求无法像本地子进程一样立即终止，需要等待当前请求返回或超时。
-- 任务历史和缓存是当前电脑上的本地状态，不会自动同步到其它设备。
+- 不做视频画面 OCR，不能直接读取已经烧录进画面的字幕文字。
+- 通用下载不保证支持所有网站，也不绕过 DRM、登录、付费或地区限制。
+- 本地 Whisper `base` 模型和小型翻译模型适合快速试跑，不代表最高识别或翻译质量。
+- 硬字幕需要重新编码，长视频和高分辨率视频会消耗较多时间。
+- 自动字幕位置检测是视觉启发式分析，复杂台标、弹幕或大量画面文字可能降低置信度。
+- 任务历史和缓存保存在当前电脑，不会自动同步到其它设备。
 
-## 开发与测试
-
-运行测试：
+## 开发验证
 
 ```bash
 python3 -m unittest discover -s tests
-```
-
-编译检查：
-
-```bash
 env PYTHONPYCACHEPREFIX=/private/tmp/subtitle-tool-pycache python3 -m compileall src tests
 ```
 
-查看 CLI 帮助：
-
-```bash
-env PYTHONPATH=src python3 -m subtitle_tool.cli --help
-```
-
-## 仓库说明
-
-不会提交到仓库的内容：
-
-- `.env`
-- `output/`
-- `models/*.bin`
-- `.venv/`
-- Python 缓存和构建产物
-
-这些文件已在 `.gitignore` 中排除。
+项目不会提交 `.env`、`output/`、本地模型、缓存和任务数据库。

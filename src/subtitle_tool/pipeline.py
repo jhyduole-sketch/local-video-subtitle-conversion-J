@@ -646,7 +646,7 @@ def _resolve_input(
     asset_cache: AssetCache,
 ) -> tuple[Path, Path | None]:
     if is_talksmith_url(options.input_value):
-        _progress(options, "解析 TalkSmith 链接并下载视频", 8)
+        _progress(options, "解析公开视频链接并下载视频", 8)
         downloaded_path = resolve_talksmith_input(
             options.input_value,
             asset_cache.videos_dir,

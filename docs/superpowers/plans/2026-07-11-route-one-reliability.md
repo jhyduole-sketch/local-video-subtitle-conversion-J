@@ -94,7 +94,7 @@
 - Create: `src/subtitle_tool/asset_cache.py`
 - Modify: `src/subtitle_tool/pipeline.py`
 - Modify: `src/subtitle_tool/youtube.py`
-- Modify: `src/subtitle_tool/talksmith.py`
+- Modify: provider-specific downloader implementation.
 - Test: `tests/test_asset_cache.py`
 - Test: `tests/test_pipeline.py`
 

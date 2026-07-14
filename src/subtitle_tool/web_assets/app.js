@@ -27,8 +27,10 @@ const whisperModelInput = document.querySelector("#whisperModel");
 const cacheSummaryLabel = document.querySelector("#cacheSummary");
 const cacheList = document.querySelector("#cacheList");
 const refreshCacheButton = document.querySelector("#refreshCacheButton");
+const clearAllCacheButton = document.querySelector("#clearAllCacheButton");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
+const clearHistoryButton = document.querySelector("#clearHistoryButton");
 const subtitleVideoMode = document.querySelector("#subtitleVideoMode");
 const subtitleEncodingProfile = document.querySelector("#subtitleEncodingProfile");
 const subtitlePosition = document.querySelector("#subtitlePosition");
@@ -47,6 +49,12 @@ const subtitlePreviewVideo = document.querySelector("#subtitlePreviewVideo");
 const subtitlePreviewOverlay = document.querySelector("#subtitlePreviewOverlay");
 const subtitlePreviewPosition = document.querySelector("#subtitlePreviewPosition");
 const subtitlePreviewTime = document.querySelector("#subtitlePreviewTime");
+const confirmationDialog = document.querySelector("#confirmationDialog");
+const confirmationTitle = document.querySelector("#confirmationTitle");
+const confirmationMessage = document.querySelector("#confirmationMessage");
+const confirmationSafetyNote = document.querySelector("#confirmationSafetyNote");
+const cancelConfirmationButton = document.querySelector("#cancelConfirmationButton");
+const confirmActionButton = document.querySelector("#confirmActionButton");
 const whisperModelPaths = {
   base: "models/ggml-base.bin",
   small: "models/ggml-small.bin",
@@ -156,6 +164,16 @@ let copyLogResetTimer = null;
 let editingSubtitlePath = "";
 let editingVideoPath = "";
 let lastResult = null;
+let confirmationResolver = null;
+
+const cacheCategoryLabels = {
+  videos: "视频",
+  audio: "音频",
+  sourceSubtitles: "内置字幕",
+  transcripts: "语音转写",
+  translations: "字幕翻译",
+  analysis: "画面字幕检测",
+};
 
 refreshHealth.addEventListener("click", loadHealth);
 stopButton.addEventListener("click", cancelCurrentJob);
@@ -170,7 +188,9 @@ translatorSelect.addEventListener("change", handleTranslatorChange);
 whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
 refreshCacheButton.addEventListener("click", loadCache);
+clearAllCacheButton.addEventListener("click", clearAllCache);
 refreshHistoryButton.addEventListener("click", loadHistory);
+clearHistoryButton.addEventListener("click", clearHistory);
 subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
 subtitleEncodingProfile.addEventListener("change", updateSubtitleEncodingHint);
 avoidSubtitleOverlap.addEventListener("change", handleAvoidOverlapChange);
@@ -184,6 +204,12 @@ subtitlePreviewPosition.addEventListener("change", updateSubtitlePreviewPosition
 subtitleEditorRows.addEventListener("click", handleSubtitleRowClick);
 subtitleEditorRows.addEventListener("input", syncSubtitlePreview);
 subtitleEditorDialog.addEventListener("close", releaseSubtitlePreview);
+cancelConfirmationButton.addEventListener("click", () => closeConfirmationDialog(false));
+confirmActionButton.addEventListener("click", () => closeConfirmationDialog(true));
+confirmationDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeConfirmationDialog(false);
+});
 
 loadHealth();
 loadCache();
@@ -746,20 +772,12 @@ async function loadCache() {
 }
 
 function renderCache(data) {
-  const labels = {
-    videos: "视频",
-    audio: "音频",
-    sourceSubtitles: "内置字幕",
-    transcripts: "语音转写",
-    translations: "字幕翻译",
-    analysis: "画面字幕检测",
-  };
   cacheSummaryLabel.textContent = formatBytes(data.totalBytes || 0);
   cacheList.innerHTML = Object.entries(data.categories || {})
     .map(([category, detail]) => `
       <div class="data-row">
         <div class="row-main">
-          <strong>${escapeHtml(labels[category] || category)}</strong>
+          <strong>${escapeHtml(cacheCategoryLabels[category] || category)}</strong>
           <span>${detail.files || 0} 个文件 · ${formatBytes(detail.bytes || 0)}</span>
         </div>
         <button class="small-button" type="button" data-clear-cache="${escapeAttribute(category)}">清理</button>
@@ -773,18 +791,53 @@ function renderCache(data) {
 
 async function clearCacheCategory(category) {
   if (!category) return;
-  const outDir = String(document.querySelector("#outDir").value || "output").trim();
-  const response = await fetch("/api/cache/clear", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ outDir, categories: [category] }),
+  const label = cacheCategoryLabels[category] || category;
+  const confirmed = await openConfirmationDialog({
+    title: `清理${label}缓存？`,
+    message: `将删除当前保存的${label}缓存。`,
+    safetyNote: "不会删除 output 中生成的视频、字幕或任务历史。下次处理时可能需要重新生成这些缓存。",
   });
-  const data = await response.json();
-  if (!response.ok) {
-    cacheSummaryLabel.textContent = data.error || "清理失败";
-    return;
+  if (!confirmed) return;
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  try {
+    const response = await fetch("/api/cache/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ outDir, categories: [category] }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "清理失败");
+    renderCache(data);
+  } catch (error) {
+    cacheSummaryLabel.textContent = error.message;
   }
-  renderCache(data);
+}
+
+async function clearAllCache() {
+  const confirmed = await openConfirmationDialog({
+    title: "清空全部缓存？",
+    message: "将删除视频、音频、内置字幕、语音转写、字幕翻译和画面分析缓存。",
+    safetyNote: "不会删除 output 中生成的视频、字幕或任务历史。下次任务可能需要重新下载、转写和翻译。",
+  });
+  if (!confirmed) return;
+  clearAllCacheButton.disabled = true;
+  clearAllCacheButton.textContent = "清理中";
+  const outDir = String(document.querySelector("#outDir").value || "output").trim();
+  try {
+    const response = await fetch("/api/cache/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ outDir, categories: Object.keys(cacheCategoryLabels) }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "清理失败");
+    renderCache(data);
+  } catch (error) {
+    cacheSummaryLabel.textContent = error.message;
+  } finally {
+    clearAllCacheButton.disabled = false;
+    clearAllCacheButton.textContent = "清空全部";
+  }
 }
 
 async function loadHistory() {
@@ -831,6 +884,47 @@ function renderHistory(jobs) {
   historyList.querySelectorAll("[data-resume-job]").forEach((button) => {
     button.addEventListener("click", () => resumeHistoryJob(button.dataset.resumeJob));
   });
+}
+
+async function clearHistory() {
+  const confirmed = await openConfirmationDialog({
+    title: "清空任务历史？",
+    message: "将删除所有已完成、失败、停止和中断的任务记录。",
+    safetyNote: "不会删除 output 中生成的视频、字幕或任何缓存；正在排队和运行的任务会保留。",
+  });
+  if (!confirmed) return;
+  clearHistoryButton.disabled = true;
+  clearHistoryButton.textContent = "清理中";
+  try {
+    const response = await fetch("/api/jobs/clear", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "历史清理失败");
+    await loadHistory();
+  } catch (error) {
+    historyList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
+  } finally {
+    clearHistoryButton.disabled = false;
+    clearHistoryButton.textContent = "清空历史";
+  }
+}
+
+function openConfirmationDialog({ title, message, safetyNote, confirmLabel = "确认清空" }) {
+  if (confirmationResolver) closeConfirmationDialog(false);
+  confirmationTitle.textContent = title;
+  confirmationMessage.textContent = message;
+  confirmationSafetyNote.textContent = safetyNote;
+  confirmActionButton.textContent = confirmLabel;
+  confirmationDialog.showModal();
+  return new Promise((resolve) => {
+    confirmationResolver = resolve;
+  });
+}
+
+function closeConfirmationDialog(confirmed) {
+  const resolve = confirmationResolver;
+  confirmationResolver = null;
+  if (confirmationDialog.open) confirmationDialog.close();
+  if (resolve) resolve(confirmed);
 }
 
 async function viewHistoryJob(jobId) {

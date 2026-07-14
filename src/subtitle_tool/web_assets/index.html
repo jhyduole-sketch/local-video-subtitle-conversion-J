@@ -27,7 +27,7 @@
               id="input"
               name="input"
               rows="3"
-              placeholder="YouTube、Bilibili、TalkSmith、其他公开单视频网址，或 /Users/.../video.mp4"
+              placeholder="YouTube、Bilibili、其他公开单视频网址，或 /Users/.../video.mp4"
             ></textarea>
             <p class="field-hint">专用站点优先处理；其他公开网址会尝试通用解析，不支持登录、DRM、直播或播放列表。</p>
           </div>
@@ -185,7 +185,10 @@
           <section class="panel history-panel">
             <div class="panel-title">
               <h2>任务历史</h2>
-              <button id="refreshHistoryButton" class="small-button" type="button">刷新</button>
+              <div class="panel-tools">
+                <button id="refreshHistoryButton" class="small-button" type="button">刷新</button>
+                <button id="clearHistoryButton" class="small-button destructive-small-button" type="button">清空历史</button>
+              </div>
             </div>
             <div id="historyList" class="data-list"></div>
           </section>
@@ -226,6 +229,7 @@
               <div class="panel-tools">
                 <span id="cacheSummary" class="muted">检查中</span>
                 <button id="refreshCacheButton" class="small-button" type="button">刷新</button>
+                <button id="clearAllCacheButton" class="small-button destructive-small-button" type="button">清空全部</button>
               </div>
             </div>
             <div id="cacheList" class="data-list"></div>
@@ -268,6 +272,18 @@
         <div class="editor-actions">
           <button id="saveSubtitleButton" class="secondary-button" type="button">保存字幕</button>
           <button id="saveRenderSubtitleButton" class="primary-button" type="button">保存并重新生成视频</button>
+        </div>
+      </dialog>
+
+      <dialog id="confirmationDialog" class="confirmation-dialog" aria-labelledby="confirmationTitle">
+        <div class="confirmation-content">
+          <h2 id="confirmationTitle">确认操作</h2>
+          <p id="confirmationMessage"></p>
+          <p id="confirmationSafetyNote" class="confirmation-safety-note"></p>
+        </div>
+        <div class="confirmation-actions">
+          <button id="cancelConfirmationButton" class="small-button" type="button">取消</button>
+          <button id="confirmActionButton" class="danger-button" type="button">确认清空</button>
         </div>
       </dialog>
     </main>

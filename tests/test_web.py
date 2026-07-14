@@ -21,6 +21,7 @@ from subtitle_tool.web import (  # noqa: E402
     collect_health,
     cache_summary,
     clear_cache,
+    clear_finished_jobs,
     create_job_executor,
     create_subtitle_render_job,
     options_from_payload,
@@ -34,6 +35,51 @@ from subtitle_tool.web import (  # noqa: E402
 
 
 class WebTests(unittest.TestCase):
+    def test_web_ui_has_confirmed_history_and_cache_clear_actions(self):
+        assets = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "subtitle_tool"
+            / "web_assets"
+        )
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        script = (assets / "app.js").read_text(encoding="utf-8")
+
+        for element_id in (
+            "clearHistoryButton",
+            "clearAllCacheButton",
+            "confirmationDialog",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("openConfirmationDialog", script)
+        self.assertIn('fetch("/api/jobs/clear"', script)
+
+    def test_clear_finished_jobs_keeps_active_memory_records(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            previous_store = web.JOB_STORE
+            store = web.JobStore(Path(tmpdir) / "jobs.sqlite3")
+            active = JobState(id="active-job", status="running")
+            finished = JobState(id="finished-job", status="failed")
+            for job in (active, finished):
+                store.save(web._job_record(job))
+            with JOB_LOCK:
+                JOBS.update({job.id: job for job in (active, finished)})
+            web.JOB_STORE = store
+            try:
+                result = clear_finished_jobs()
+                with JOB_LOCK:
+                    remaining = set(JOBS)
+            finally:
+                web.JOB_STORE = previous_store
+                with JOB_LOCK:
+                    JOBS.pop(active.id, None)
+                    JOBS.pop(finished.id, None)
+
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["retainedActive"], 1)
+        self.assertIn(active.id, remaining)
+        self.assertNotIn(finished.id, remaining)
+
     def test_web_ui_locks_submit_and_restores_active_job(self):
         script = (
             Path(__file__).resolve().parents[1]
@@ -150,6 +196,30 @@ class WebTests(unittest.TestCase):
         self.assertEqual(summary["categories"]["audio"]["files"], 1)
         self.assertEqual(summary["root"], str(Path(tmpdir) / ".subtitle-tool-cache"))
         self.assertEqual(cleared["cleared"], ["audio"])
+
+    def test_cache_helper_clears_all_categories_without_touching_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "output"
+            output_file = out_dir / "task" / "finished.mp4"
+            output_file.parent.mkdir(parents=True)
+            output_file.write_bytes(b"finished")
+            cache = Path(tmpdir) / ".subtitle-tool-cache"
+            for directory in web.AssetCache.CATEGORY_DIRS.values():
+                path = cache / directory / "cached.dat"
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"cache")
+
+            cleared = clear_cache(
+                out_dir, list(web.AssetCache.CATEGORY_DIRS)
+            )
+
+            output_still_exists = output_file.exists()
+
+        self.assertEqual(
+            set(cleared["cleared"]), set(web.AssetCache.CATEGORY_DIRS)
+        )
+        self.assertEqual(cleared["totalFiles"], 0)
+        self.assertTrue(output_still_exists)
     def test_resume_job_creates_linked_queued_job(self):
         original = JobState(
             id="failed-job",

@@ -375,6 +375,12 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
+        if path == "/api/jobs/clear":
+            try:
+                self._send_json(clear_finished_jobs())
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if path.startswith("/api/jobs/") and path.endswith("/cancel"):
             job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/cancel"))
             self._cancel_job(job_id)
@@ -794,6 +800,20 @@ def cache_summary(out_dir: Path) -> dict[str, object]:
 
 def clear_cache(out_dir: Path, categories: list[str]) -> dict[str, object]:
     return AssetCache(cache_root(out_dir)).clear(categories)
+
+
+def clear_finished_jobs() -> dict[str, int]:
+    with JOB_LOCK:
+        finished_ids = [
+            job_id
+            for job_id, job in JOBS.items()
+            if job.status not in ACTIVE_JOB_STATUSES
+        ]
+        retained_active = len(JOBS) - len(finished_ids)
+        deleted = JOB_STORE.clear_finished() if JOB_STORE else len(finished_ids)
+        for job_id in finished_ids:
+            JOBS.pop(job_id, None)
+    return {"deleted": deleted, "retainedActive": retained_active}
 
 
 def resume_job(job_id: str) -> JobState | None:

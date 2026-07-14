@@ -30,8 +30,11 @@ class TalkSmithTests(unittest.TestCase):
         )
 
     def test_extract_scenario_id_requires_id(self):
-        with self.assertRaises(SubtitleToolError):
+        with self.assertRaises(SubtitleToolError) as context:
             extract_scenario_id("https://service.talk-smith.com/s")
+
+        self.assertIn("公开视频分享链接", str(context.exception))
+        self.assertNotIn("TalkSmith", str(context.exception))
 
     def test_find_available_video(self):
         video = find_available_video(
@@ -64,6 +67,7 @@ class TalkSmithTests(unittest.TestCase):
         self.assertEqual(path.name, "cmd123.202607091530129.mp4")
 
     def test_download_only_skips_subtitle_generation(self):
+        progress_messages = []
         with tempfile.TemporaryDirectory() as tmpdir:
             video_path = Path(tmpdir) / "cmd123" / "cmd123.202607091530129.mp4"
             video_path.parent.mkdir()
@@ -82,6 +86,9 @@ class TalkSmithTests(unittest.TestCase):
                         source="auto",
                         output_format="srt",
                         download_only=True,
+                        progress_callback=lambda message, _percent: progress_messages.append(
+                            message
+                        ),
                     )
                 )
                 downloaded_name = result.downloaded_video_path.name
@@ -92,6 +99,24 @@ class TalkSmithTests(unittest.TestCase):
         self.assertRegex(downloaded_name, r"cmd123\.\d{15}\.mp4")
         self.assertEqual(downloaded_bytes, b"video")
         self.assertIsNone(result.source_subtitle_path)
+        self.assertIn("解析公开视频链接并下载视频", progress_messages)
+        self.assertFalse(any("TalkSmith" in message for message in progress_messages))
+
+    def test_public_documentation_and_web_copy_use_generic_video_wording(self):
+        project_root = Path(__file__).resolve().parents[1]
+        public_files = [
+            project_root / "README.md",
+            project_root / "README.en.md",
+            project_root / "docs" / "使用指南.md",
+            project_root / "docs" / "更新记录.md",
+            project_root / "src" / "subtitle_tool" / "web_assets" / "index.html",
+        ]
+
+        for path in public_files:
+            content = path.read_text(encoding="utf-8").lower()
+            with self.subTest(path=path):
+                self.assertNotIn("talksmith", content)
+                self.assertNotIn("talk-smith", content)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,14 @@ class JobStore:
             ).fetchall()
         return [_row_to_record(row) for row in rows]
 
+    def clear_finished(self) -> int:
+        active_statuses = ("queued", "running", "canceling")
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM jobs WHERE status NOT IN (?, ?, ?)", active_statuses
+            )
+            return max(0, cursor.rowcount)
+
     def mark_inflight_interrupted(self) -> int:
         records = [
             record
