@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .env import load_dotenv
-from .errors import SubtitleToolError
+from .errors import SubtitleToolError, actionable_error_message
 from .pipeline import PipelineOptions, run_pipeline
 
 
@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "local-nllb-quality",
         ],
         default="openai",
-        help="Subtitle translation engine. Use local-nllb for NLLB 600M fast mode or local-nllb-quality for NLLB 1.3B quality mode.",
+        help="Subtitle translation engine. local-nllb and local-nllb-quality both use NLLB 1.3B; local-nllb is retained for compatibility.",
     )
     parser.add_argument(
         "--embed-subtitles",
@@ -160,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run_pipeline(options)
     except SubtitleToolError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"Error: {actionable_error_message(exc)}", file=sys.stderr)
         return 1
 
     if result.downloaded_video_path:

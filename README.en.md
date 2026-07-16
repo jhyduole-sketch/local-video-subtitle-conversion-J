@@ -11,7 +11,7 @@ The project includes both a local Web UI and a CLI.
 - Local files, browser uploads, YouTube, Bilibili, and best-effort public URL downloads.
 - Embedded subtitle extraction with automatic fallback to audio transcription.
 - Local whisper.cpp or OpenAI speech-to-text.
-- z.ai, OpenAI, local Chinese/Japanese/English models, and NLLB 600M/1.3B translation.
+- z.ai, OpenAI, local Chinese/Japanese/English models, and NLLB 1.3B multilingual translation.
 - Translation validation, sentence-level retry, rate-limit handling, engine fallback, and cache reuse.
 - Multiple target languages in a single job.
 - SRT, switchable soft-subtitle MP4, or fixed-position burned-in subtitle MP4 output.

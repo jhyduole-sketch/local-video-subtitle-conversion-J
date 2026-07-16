@@ -249,12 +249,12 @@ class LocalTranslateQualityTests(unittest.TestCase):
         self.assertEqual(status["model"], NLLB_MODEL_NAME)
         self.assertIn(NLLB_MODEL_NAME, str(status["downloadCommand"]))
 
-    def test_nllb_model_statuses_include_fast_and_quality_models(self):
+    def test_nllb_model_statuses_include_only_quality_model(self):
         statuses = nllb_model_statuses()
 
         self.assertEqual(
             [status["model"] for status in statuses],
-            [NLLB_MODEL_NAME, NLLB_QUALITY_MODEL_NAME],
+            [NLLB_QUALITY_MODEL_NAME],
         )
 
     def test_model_cache_detection_uses_huggingface_layout(self):

@@ -37,7 +37,11 @@ class PipelineTests(unittest.TestCase):
                 source="auto",
                 output_format="srt",
                 download_only=True,
+                progress_callback=lambda message, percent: progress_messages.append(
+                    (message, percent)
+                ),
             )
+            progress_messages = []
 
             with patch(
                 "subtitle_tool.pipeline.download_generic_video",
@@ -51,8 +55,11 @@ class PipelineTests(unittest.TestCase):
                 )
 
         download_generic.assert_called_once()
+        download_callback = download_generic.call_args.kwargs["progress_callback"]
+        download_callback("通用网址下载仍在进行，已用时 01:00")
         self.assertEqual(input_path.name, "clip-42.202607121200001.mp4")
         self.assertEqual(downloaded_path, input_path)
+        self.assertTrue(any("下载仍在进行" in message for message, _ in progress_messages))
 
     def test_generated_files_include_timestamp_suffix(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -114,6 +121,10 @@ class PipelineTests(unittest.TestCase):
                 )
 
         translate_segments_with_nllb.assert_called_once()
+        self.assertEqual(
+            translate_segments_with_nllb.call_args.kwargs["model_name"],
+            "facebook/nllb-200-distilled-1.3B",
+        )
         self.assertIn("vi", result.translated_paths)
 
     def test_local_nllb_quality_routes_to_1_3b_with_progress_logs(self):
@@ -276,7 +287,7 @@ class PipelineTests(unittest.TestCase):
             ), patch(
                 "subtitle_tool.pipeline.translate_segments_with_nllb",
                 side_effect=SubtitleToolError("NLLB output contains invalid characters"),
-            ), patch(
+            ) as nllb_translate, patch(
                 "subtitle_tool.pipeline.translate_segments",
                 return_value={1: "Hello"},
             ) as openai_translate:
@@ -293,6 +304,10 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
+        self.assertEqual(
+            nllb_translate.call_args.kwargs["model_name"],
+            "facebook/nllb-200-distilled-1.3B",
+        )
         openai_translate.assert_called_once()
         self.assertEqual(result.translation_engines["en"], "OpenAI")
         self.assertTrue(any("已自动切换 OpenAI" in item for item in progress_messages))

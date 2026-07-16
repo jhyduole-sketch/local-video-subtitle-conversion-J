@@ -21,9 +21,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .env import load_dotenv
 from .asset_cache import AssetCache
-from .errors import CancellationError, SubtitleToolError
+from .errors import CancellationError, SubtitleToolError, actionable_error_message
 from .local_translate import (
-    NLLB_MODEL_NAME,
     NLLB_QUALITY_MODEL_NAME,
     local_translation_model_statuses,
     nllb_model_status,
@@ -217,14 +216,8 @@ def collect_health(project_root: Path | None = None) -> dict[str, object]:
     checks.extend(_local_translation_model_checks())
     checks.append(
         _nllb_model_check(
-            NLLB_MODEL_NAME,
-            "本地多语言 NLLB",
-        )
-    )
-    checks.append(
-        _nllb_model_check(
             NLLB_QUALITY_MODEL_NAME,
-            "本地多语言 NLLB 1.3B（质量）",
+            "本地多语言 NLLB 1.3B",
         )
     )
     return {
@@ -616,11 +609,12 @@ def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
         _update_job(job_id, status="canceled", log="任务已停止", progress_message="已停止")
         return
     except Exception as exc:
+        message = actionable_error_message(exc)
         _update_job(
             job_id,
             status="failed",
-            error=str(exc),
-            log=f"重新生成失败: {exc}",
+            error=message,
+            log=f"重新生成失败: {message}",
             progress_message="任务失败",
         )
         return
@@ -682,11 +676,12 @@ def _run_job(job_id: str, options: PipelineOptions) -> None:
         )
         return
     except Exception as exc:
+        message = actionable_error_message(exc)
         _update_job(
             job_id,
             status="failed",
-            error=str(exc),
-            log=f"失败: {exc}",
+            error=message,
+            log=f"失败: {message}",
             progress_message="任务失败",
         )
         return

@@ -9,11 +9,10 @@ from .errors import DependencyError, SubtitleToolError
 from .srt import SubtitleSegment
 
 
-NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
-NLLB_QUALITY_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
+NLLB_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
+NLLB_QUALITY_MODEL_NAME = NLLB_MODEL_NAME
 NLLB_MODEL_VARIANTS = (
-    ("NLLB 600M（快速）", NLLB_MODEL_NAME),
-    ("NLLB 1.3B（质量）", NLLB_QUALITY_MODEL_NAME),
+    ("NLLB 1.3B", NLLB_QUALITY_MODEL_NAME),
 )
 DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE = 8
 

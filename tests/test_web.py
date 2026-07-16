@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import subtitle_tool.web as web  # noqa: E402
 from subtitle_tool.pipeline import PipelineResult  # noqa: E402
-from subtitle_tool.errors import SubtitleToolError  # noqa: E402
+from subtitle_tool.errors import SubtitleToolError, actionable_error_message  # noqa: E402
 from subtitle_tool.web import (  # noqa: E402
     JOBS,
     JOB_LOCK,
@@ -35,6 +35,23 @@ from subtitle_tool.web import (  # noqa: E402
 
 
 class WebTests(unittest.TestCase):
+    def test_actionable_error_explains_empty_transcription_recovery(self):
+        message = actionable_error_message(
+            SubtitleToolError("Local Whisper returned no subtitle segments.")
+        )
+
+        self.assertIn("没有识别到有效语音", message)
+        self.assertIn("关闭 VAD", message)
+        self.assertIn("技术信息", message)
+
+    def test_actionable_error_explains_provider_timeout(self):
+        message = actionable_error_message(
+            SubtitleToolError("OpenAI translation failed: Request timed out")
+        )
+
+        self.assertIn("在线模型请求超时", message)
+        self.assertIn("稍后重试", message)
+
     def test_web_ui_has_confirmed_history_and_cache_clear_actions(self):
         assets = (
             Path(__file__).resolve().parents[1]
@@ -53,6 +70,18 @@ class WebTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("openConfirmationDialog", script)
         self.assertIn('fetch("/api/jobs/clear"', script)
+
+    def test_web_ui_only_offers_nllb_1_3b(self):
+        assets = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "subtitle_tool"
+            / "web_assets"
+        )
+        html = (assets / "index.html").read_text(encoding="utf-8")
+
+        self.assertNotIn("NLLB 600M", html)
+        self.assertIn("本地多语言 NLLB 1.3B", html)
 
     def test_clear_finished_jobs_keeps_active_memory_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -446,31 +475,29 @@ class WebTests(unittest.TestCase):
 
     def test_collect_health_includes_nllb_model(self):
         status = {
-            "label": "NLLB 本地多语言",
-            "model": "facebook/nllb-200-distilled-600M",
+            "label": "NLLB 1.3B",
+            "model": "facebook/nllb-200-distilled-1.3B",
             "installed": False,
             "downloadCommand": "python3 -c \"download nllb\"",
         }
 
-        with patch("subtitle_tool.web.nllb_model_status", return_value=status):
+        with patch(
+            "subtitle_tool.web.nllb_model_status", return_value=status
+        ) as model_status:
             health = collect_health(Path.cwd())
 
         matching = [
-            check for check in health["checks"] if check["name"] == "本地多语言 NLLB"
+            check
+            for check in health["checks"]
+            if check["name"] == "本地多语言 NLLB 1.3B"
         ]
         self.assertEqual(len(matching), 1)
         self.assertFalse(matching[0]["ok"])
         self.assertTrue(matching[0]["optional"])
         self.assertIn("模型较大", matching[0]["detail"])
-
-        quality = [
-            check
-            for check in health["checks"]
-            if check["name"] == "本地多语言 NLLB 1.3B（质量）"
-        ]
-        self.assertEqual(len(quality), 1)
-        self.assertFalse(quality[0]["ok"])
-        self.assertIn("下载命令", quality[0]["detail"])
+        model_status.assert_called_once_with(
+            model_name="facebook/nllb-200-distilled-1.3B"
+        )
 
     def test_log_line_includes_clock_and_elapsed_time(self):
         job = JobState(id="abc", created_at=100.0)

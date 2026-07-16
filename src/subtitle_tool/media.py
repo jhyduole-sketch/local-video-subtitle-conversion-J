@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Callable
 
 from .errors import DependencyError, MediaError
-from .process_control import CancelCheck, run_process, run_process_streaming
+from .process_control import (
+    CancelCheck,
+    run_process,
+    run_process_streaming,
+    timeout_seconds_from_env,
+)
 
 
 @dataclass(frozen=True)
@@ -323,6 +328,7 @@ def burn_subtitle_track(
         duration,
         cancel_check,
         progress_callback,
+        status_callback,
     )
     if completed.returncode != 0 and selected_profile == "hardware":
         output_path.unlink(missing_ok=True)
@@ -342,6 +348,7 @@ def burn_subtitle_track(
             duration,
             cancel_check,
             progress_callback,
+            status_callback,
         )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
@@ -431,6 +438,7 @@ def _run_burn_command(
     duration_seconds: float,
     cancel_check: CancelCheck | None,
     progress_callback: Callable[[EncodingProgress], None] | None,
+    status_callback: Callable[[str], None] | None,
 ) -> subprocess.CompletedProcess[str]:
     values: dict[str, str] = {}
     last_percent = -1
@@ -463,11 +471,36 @@ def _run_burn_command(
             EncodingProgress(processed, duration_seconds, percent, speed, eta)
         )
 
+    def heartbeat(elapsed_seconds: float) -> None:
+        if status_callback is not None:
+            status_callback(
+                f"编码仍在运行，已用时 {_format_runtime(elapsed_seconds)}；"
+                "若 5 分钟没有任何进度将自动停止"
+            )
+
     return run_process_streaming(
         command,
         cancel_check=cancel_check,
         stdout_line_callback=handle_line,
+        timeout_seconds=timeout_seconds_from_env(
+            "SUBTITLE_TOOL_BURN_TIMEOUT_SECONDS", 43200.0
+        ),
+        inactivity_timeout_seconds=timeout_seconds_from_env(
+            "SUBTITLE_TOOL_BURN_INACTIVITY_TIMEOUT_SECONDS", 300.0
+        ),
+        heartbeat_interval_seconds=30.0,
+        heartbeat_callback=heartbeat,
+        operation_name="固定位置硬字幕烧录",
     )
+
+
+def _format_runtime(seconds: float) -> str:
+    total = max(0, round(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _short_error(output: str) -> str:

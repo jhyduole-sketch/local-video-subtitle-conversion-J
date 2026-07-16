@@ -60,12 +60,17 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(command[command.index("-c:v") + 1], "libx264")
         self.assertEqual(command[command.index("-c:a") + 1], "copy")
         self.assertIs(run_process.call_args.kwargs["cancel_check"], cancel_check)
+        self.assertGreater(run_process.call_args.kwargs["timeout_seconds"], 0)
+        self.assertGreater(run_process.call_args.kwargs["inactivity_timeout_seconds"], 0)
+        self.assertEqual(
+            run_process.call_args.kwargs["operation_name"], "固定位置硬字幕烧录"
+        )
         self.assertEqual(output.name, "result.mp4")
 
     def test_fast_hard_subtitle_reports_real_ffmpeg_progress(self):
         progress_updates = []
 
-        def fake_stream(command, cancel_check=None, stdout_line_callback=None):
+        def fake_stream(command, cancel_check=None, stdout_line_callback=None, **kwargs):
             for line in (
                 "out_time_us=5000000",
                 "speed=2.0x",
@@ -103,7 +108,7 @@ class MediaTests(unittest.TestCase):
         commands = []
         statuses = []
 
-        def fake_stream(command, cancel_check=None, stdout_line_callback=None):
+        def fake_stream(command, cancel_check=None, stdout_line_callback=None, **kwargs):
             commands.append(command)
             return subprocess.CompletedProcess(
                 command,

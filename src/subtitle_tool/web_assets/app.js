@@ -137,12 +137,12 @@ const languagePickerModes = {
   "local-nllb": {
     languages: nllbLanguages,
     allowCustom: false,
-    hint: "NLLB 600M 覆盖更多本地语言，速度较快；异常字幕会自动单句重试。",
+    hint: "旧任务兼容模式，实际使用 NLLB 1.3B；异常字幕会自动单句重试。",
   },
   "local-nllb-quality": {
     languages: nllbLanguages,
     allowCustom: false,
-    hint: "NLLB 1.3B 质量更高但速度更慢；异常字幕会自动单句重试。",
+    hint: "NLLB 1.3B 覆盖更多本地语言，质量优先；异常字幕会自动单句重试。",
   },
   "z-ai": {
     languages: cloudLanguages,

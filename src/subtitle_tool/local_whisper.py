@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from .errors import DependencyError, SubtitleToolError
-from .process_control import CancelCheck, run_process
+from .process_control import CancelCheck, run_process, timeout_seconds_from_env
 from .srt import SubtitleSegment, read_srt
 
 
@@ -99,15 +99,18 @@ def transcribe_with_whisper_cpp(
         use_gpu=effective_use_gpu,
         vad_model=vad_model,
     )
-    completed = run_process(command, cancel_check=cancel_check)
-    if completed.returncode != 0 and effective_use_gpu:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    output_srt.unlink(missing_ok=True)
+    completed = _run_whisper_process(command, cancel_check, progress_callback)
+    segments = _attempt_segments(
+        completed.returncode, output_srt, require_dialogue=vad_model is not None
+    )
+    if not segments and effective_use_gpu:
+        detail = _attempt_detail(completed, output_srt)
         _gpu_failed = True
-        if output_srt.exists():
-            output_srt.unlink()
+        output_srt.unlink(missing_ok=True)
         if progress_callback is not None:
             progress_callback(
-                f"Metal 转写未完成，已切换 CPU 模式重试: {detail}"
+                f"Metal 转写未完成或产生空字幕，已切换 CPU 模式重试: {detail}"
             )
         command = _build_command(
             whisper_cli,
@@ -118,13 +121,17 @@ def transcribe_with_whisper_cpp(
             use_gpu=False,
             vad_model=vad_model,
         )
-        completed = run_process(command, cancel_check=cancel_check)
-    if completed.returncode != 0 and vad_model is not None:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        if output_srt.exists():
-            output_srt.unlink()
+        completed = _run_whisper_process(command, cancel_check, progress_callback)
+        segments = _attempt_segments(
+            completed.returncode, output_srt, require_dialogue=vad_model is not None
+        )
+    if not segments and vad_model is not None:
+        detail = _attempt_detail(completed, output_srt)
+        output_srt.unlink(missing_ok=True)
         if progress_callback is not None:
-            progress_callback(f"VAD 转写未完成，已关闭 VAD 重试: {detail}")
+            progress_callback(
+                f"VAD 未识别到可用对白，已关闭 VAD 并使用 CPU 标准转写重试: {detail}"
+            )
         command = _build_command(
             whisper_cli,
             model,
@@ -134,14 +141,73 @@ def transcribe_with_whisper_cpp(
             use_gpu=False,
             vad_model=None,
         )
-        completed = run_process(command, cancel_check=cancel_check)
+        completed = _run_whisper_process(command, cancel_check, progress_callback)
+        segments = _attempt_segments(completed.returncode, output_srt)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise SubtitleToolError(f"Local Whisper transcription failed: {detail}")
     if not output_srt.exists():
         raise SubtitleToolError("Local Whisper did not produce an SRT file.")
 
-    segments = read_srt(output_srt)
     if not segments:
         raise SubtitleToolError("Local Whisper returned no subtitle segments.")
     return segments
+
+
+def _attempt_segments(
+    returncode: int, output_srt: Path, *, require_dialogue: bool = False
+) -> list[SubtitleSegment]:
+    if returncode != 0 or not output_srt.exists() or output_srt.stat().st_size == 0:
+        return []
+    segments = read_srt(output_srt)
+    if require_dialogue and segments and all(
+        _is_sound_cue(segment.text) for segment in segments
+    ):
+        return []
+    return segments
+
+
+def _is_sound_cue(text: str) -> bool:
+    value = text.strip()
+    pairs = (("(", ")"), ("（", "）"), ("[", "]"), ("【", "】"), ("<", ">"))
+    return any(value.startswith(left) and value.endswith(right) for left, right in pairs)
+
+
+def _run_whisper_process(
+    command: list[str],
+    cancel_check: CancelCheck | None,
+    progress_callback: Callable[[str], None] | None,
+):
+    def heartbeat(elapsed_seconds: float) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                f"本地 Whisper 仍在运行，已用时 {_format_elapsed(elapsed_seconds)}"
+            )
+
+    return run_process(
+        command,
+        cancel_check=cancel_check,
+        timeout_seconds=timeout_seconds_from_env(
+            "SUBTITLE_TOOL_WHISPER_TIMEOUT_SECONDS", 7200.0
+        ),
+        heartbeat_interval_seconds=30.0,
+        heartbeat_callback=heartbeat,
+        operation_name="本地 Whisper 转写",
+    )
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, round(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _attempt_detail(completed, output_srt: Path) -> str:
+    if completed.returncode != 0:
+        return completed.stderr.strip() or completed.stdout.strip() or "进程异常退出"
+    if not output_srt.exists():
+        return "没有生成 SRT 文件"
+    return "生成的 SRT 为空或不包含有效字幕"

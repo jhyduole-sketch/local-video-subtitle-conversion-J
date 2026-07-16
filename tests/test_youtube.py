@@ -135,6 +135,37 @@ class YouTubeTests(unittest.TestCase):
         self.assertIn("--skip-download", commands[0])
         self.assertIn("--no-playlist", commands[1])
 
+    def test_download_configures_timeout_and_heartbeat_logs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir)
+            output_path = out_dir / "abc123.mp4"
+            logs = []
+
+            def fake_run(command, **kwargs):
+                output_path.write_bytes(b"video")
+
+                class Completed:
+                    returncode = 0
+                    stdout = ""
+                    stderr = ""
+
+                return Completed()
+
+            with patch("subtitle_tool.youtube.shutil.which", return_value="/bin/yt-dlp"), patch(
+                "subtitle_tool.youtube.run_process", side_effect=fake_run
+            ) as run:
+                download_youtube_video(
+                    "https://www.youtube.com/watch?v=abc123",
+                    out_dir,
+                    progress_callback=logs.append,
+                )
+
+        self.assertGreater(run.call_args.kwargs["timeout_seconds"], 0)
+        self.assertGreater(run.call_args.kwargs["heartbeat_interval_seconds"], 0)
+        heartbeat = run.call_args.kwargs["heartbeat_callback"]
+        heartbeat(65)
+        self.assertTrue(any("下载仍在进行" in message for message in logs))
+
     def test_generic_download_rejects_playlist_metadata(self):
         class Completed:
             returncode = 0

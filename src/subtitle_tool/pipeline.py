@@ -12,7 +12,6 @@ from typing import Callable
 from .errors import CancellationError, MediaError, SubtitleToolError
 from .asset_cache import AssetCache
 from .local_translate import (
-    NLLB_MODEL_NAME,
     NLLB_QUALITY_MODEL_NAME,
     normalize_lang,
     translate_segments_locally,
@@ -541,16 +540,8 @@ def _translate_target(
             "本地快速模型",
         )
     if options.translator in {"local-nllb", "local-nllb-quality"}:
-        model_name = (
-            NLLB_QUALITY_MODEL_NAME
-            if options.translator == "local-nllb-quality"
-            else NLLB_MODEL_NAME
-        )
-        engine = (
-            "本地 NLLB 1.3B（质量）"
-            if options.translator == "local-nllb-quality"
-            else "本地 NLLB 600M（快速）"
-        )
+        model_name = NLLB_QUALITY_MODEL_NAME
+        engine = "本地 NLLB 1.3B"
         _progress(options, f"加载{engine}并开始批量翻译", progress_percent)
         return (
             translate_segments_with_nllb(
@@ -614,12 +605,12 @@ def _translate_target(
             source_segments,
             options.source_lang,
             target_lang,
-            model_name=NLLB_MODEL_NAME,
+            model_name=NLLB_QUALITY_MODEL_NAME,
             progress_callback=lambda message: _progress(
                 options, message, progress_percent
             ),
         )
-        return translations, "本地模型"
+        return translations, "本地 NLLB 1.3B"
     except Exception as nllb_error:
         local_errors.append(str(nllb_error))
 
@@ -668,6 +659,7 @@ def _resolve_input(
             options.force_download,
             None,
             options.cancel_check,
+            progress_callback=lambda message: _progress(options, message, 8),
         )
         task_path = asset_cache.materialize_video(
             video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
@@ -682,6 +674,7 @@ def _resolve_input(
             options.force_download,
             None,
             options.cancel_check,
+            progress_callback=lambda message: _progress(options, message, 8),
         )
         task_path = asset_cache.materialize_video(
             video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
@@ -696,6 +689,7 @@ def _resolve_input(
             options.force_download,
             None,
             options.cancel_check,
+            progress_callback=lambda message: _progress(options, message, 8),
         )
         task_path = asset_cache.materialize_video(
             video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
