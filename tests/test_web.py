@@ -35,6 +35,17 @@ from subtitle_tool.web import (  # noqa: E402
 
 
 class WebTests(unittest.TestCase):
+    def test_web_source_selector_includes_screen_ocr(self):
+        html = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "subtitle_tool"
+            / "web_assets"
+            / "index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('<option value="screen-ocr">画面字幕 OCR</option>', html)
+
     def test_actionable_error_explains_empty_transcription_recovery(self):
         message = actionable_error_message(
             SubtitleToolError("Local Whisper returned no subtitle segments.")
@@ -82,6 +93,23 @@ class WebTests(unittest.TestCase):
 
         self.assertNotIn("NLLB 600M", html)
         self.assertIn("本地多语言 NLLB 1.3B", html)
+
+    def test_web_ui_separates_language_catalog_and_advanced_settings(self):
+        assets = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "subtitle_tool"
+            / "web_assets"
+        )
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        script = (assets / "app.js").read_text(encoding="utf-8")
+        catalog = assets / "language_catalog.js"
+
+        self.assertTrue(catalog.exists())
+        self.assertIn('id="advancedSettings"', html)
+        self.assertIn("高级设置", html)
+        self.assertLess(html.index("/language_catalog.js"), html.index("/app.js"))
+        self.assertNotIn("const cloudLanguages", script)
 
     def test_clear_finished_jobs_keeps_active_memory_records(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -426,7 +454,7 @@ class WebTests(unittest.TestCase):
 
     def test_collect_health_reports_fixed_subtitle_ffmpeg(self):
         with patch(
-            "subtitle_tool.web.ass_ffmpeg_binary",
+            "subtitle_tool.health.ass_ffmpeg_binary",
             return_value="/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg",
         ):
             health = collect_health(Path.cwd())
@@ -439,7 +467,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("ffmpeg-full", matching[0]["detail"])
 
     def test_collect_health_reports_videotoolbox_encoder(self):
-        with patch("subtitle_tool.web.videotoolbox_available", return_value=True):
+        with patch("subtitle_tool.health.videotoolbox_available", return_value=True):
             health = collect_health(Path.cwd())
 
         matching = [
@@ -460,7 +488,10 @@ class WebTests(unittest.TestCase):
             }
         ]
 
-        with patch("subtitle_tool.web.local_translation_model_statuses", return_value=statuses):
+        with patch(
+            "subtitle_tool.health.local_translation_model_statuses",
+            return_value=statuses,
+        ):
             health = collect_health(Path.cwd())
 
         matching = [
@@ -482,7 +513,7 @@ class WebTests(unittest.TestCase):
         }
 
         with patch(
-            "subtitle_tool.web.nllb_model_status", return_value=status
+            "subtitle_tool.health.nllb_model_status", return_value=status
         ) as model_status:
             health = collect_health(Path.cwd())
 

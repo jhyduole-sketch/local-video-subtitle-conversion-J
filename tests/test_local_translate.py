@@ -14,6 +14,7 @@ from subtitle_tool.local_translate import (  # noqa: E402
     _is_model_cached,
     _infer_source_lang_from_segments,
     _looks_unreasonably_long,
+    _local_translation_batch_size,
     _nllb_lang_code,
     local_translation_model_statuses,
     nllb_model_status,
@@ -29,6 +30,127 @@ from subtitle_tool.srt import SubtitleSegment  # noqa: E402
 
 
 class LocalTranslateQualityTests(unittest.TestCase):
+    def test_nllb_resumes_only_missing_segments_and_checkpoints_each_batch(self):
+        class FakeTokenizer:
+            src_lang = ""
+
+            def __call__(self, texts, **kwargs):
+                return {"input_ids": texts}
+
+            def convert_tokens_to_ids(self, value):
+                return 42
+
+            def batch_decode(self, outputs, **kwargs):
+                return outputs
+
+        class FakeModel:
+            def __init__(self):
+                self.inputs = []
+
+            def eval(self):
+                return None
+
+            def generate(self, input_ids, **kwargs):
+                self.inputs.extend(input_ids)
+                return [f"English {value}" for value in input_ids]
+
+        class FakeTorch:
+            @staticmethod
+            def no_grad():
+                return nullcontext()
+
+        model = FakeModel()
+        checkpoints = []
+        segments = [
+            SubtitleSegment(index=index, start_ms=0, end_ms=1000, text=f"文 {index}")
+            for index in range(1, 4)
+        ]
+        with patch(
+            "subtitle_tool.local_translate._load_model",
+            return_value=(FakeTokenizer(), model, FakeTorch()),
+        ):
+            translations = translate_segments_with_nllb(
+                segments,
+                "ja",
+                "en",
+                initial_translations={1: "Existing"},
+                checkpoint_callback=lambda values: checkpoints.append(dict(values)),
+            )
+
+        self.assertEqual(model.inputs, ["文 2", "文 3"])
+        self.assertEqual(translations[1], "Existing")
+        self.assertEqual(checkpoints[-1], translations)
+
+    def test_nllb_halves_batch_after_out_of_memory_and_reports_eta(self):
+        class FakeTokenizer:
+            src_lang = ""
+
+            def __call__(self, texts, **kwargs):
+                return {"input_ids": texts}
+
+            def convert_tokens_to_ids(self, value):
+                return 42
+
+            def batch_decode(self, outputs, **kwargs):
+                return outputs
+
+        class FakeModel:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def eval(self):
+                return None
+
+            def generate(self, input_ids, **kwargs):
+                self.batch_sizes.append(len(input_ids))
+                if len(input_ids) > 2:
+                    raise RuntimeError("MPS backend out of memory")
+                return ["English subtitle"] * len(input_ids)
+
+        class FakeTorch:
+            @staticmethod
+            def no_grad():
+                return nullcontext()
+
+        model = FakeModel()
+        progress = []
+        segments = [
+            SubtitleSegment(index=index, start_ms=0, end_ms=1000, text=f"文 {index}")
+            for index in range(1, 5)
+        ]
+        with patch.dict(
+            "subtitle_tool.local_translate.os.environ",
+            {"LOCAL_TRANSLATION_BATCH_SIZE": "4"},
+            clear=False,
+        ), patch(
+            "subtitle_tool.local_translate._load_model",
+            return_value=(FakeTokenizer(), model, FakeTorch()),
+        ):
+            translations = translate_segments_with_nllb(
+                segments, "ja", "en", progress_callback=progress.append
+            )
+
+        self.assertEqual(model.batch_sizes, [4, 2, 2])
+        self.assertEqual(len(translations), 4)
+        self.assertTrue(any("批次从 4 调整为 2" in message for message in progress))
+        self.assertTrue(any("预计剩余" in message for message in progress))
+
+    def test_nllb_batch_size_adapts_to_memory_and_respects_override(self):
+        with patch.dict(
+            "subtitle_tool.local_translate.os.environ", {}, clear=True
+        ), patch(
+            "subtitle_tool.local_translate._system_memory_bytes",
+            return_value=8 * 1024**3,
+        ):
+            self.assertEqual(_local_translation_batch_size(NLLB_MODEL_NAME), 2)
+
+        with patch.dict(
+            "subtitle_tool.local_translate.os.environ",
+            {"LOCAL_TRANSLATION_BATCH_SIZE": "7"},
+            clear=True,
+        ):
+            self.assertEqual(_local_translation_batch_size(NLLB_MODEL_NAME), 7)
+
     def test_nllb_retries_only_invalid_subtitle_with_safe_options(self):
         class FakeTokenizer:
             src_lang = ""

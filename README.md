@@ -8,8 +8,8 @@
 
 ## 项目亮点
 
-- **多种输入**：本地路径、网页上传、YouTube、Bilibili，以及其它公开单视频网址的通用尝试下载。
-- **智能字幕来源**：优先读取视频内置字幕；没有字幕轨时，使用本地 Whisper 或 OpenAI 识别语音。
+- **多种输入**：本地路径、网页上传、YouTube（含 Shorts / Live / Embed）、Bilibili，以及其它公开单视频网址的通用尝试下载。
+- **智能字幕来源**：优先读取视频内置字幕；没有字幕轨时识别语音；语音为空或高度重复时，可在 macOS 上自动读取画面硬字幕。
 - **多语言翻译**：支持 z.ai、OpenAI、本地中/日/英快速模型，以及 NLLB 1.3B 本地多语言模型。
 - **稳定回退**：z.ai 限流或翻译失败时，可自动切换本地模型；本地结果不合格时再尝试 OpenAI。
 - **质量保护**：检测空字幕、重复内容、异常长度、语言不匹配，并对 NLLB 异常句进行单句重试。
@@ -28,7 +28,10 @@ flowchart LR
     C -- "是" --> D["导出源字幕与时间轴"]
     C -- "否" --> E["抽取音频"]
     E --> F["本地 Whisper / OpenAI 转写"]
-    F --> D
+    F --> N{"转写有效？"}
+    N -- "是" --> D
+    N -- "无对白 / 高度重复" --> O["可替换画面 OCR 引擎"]
+    O --> D
     D --> G["选择目标语言与翻译引擎"]
     G --> H["翻译、质量检查与自动回退"]
     H --> I["生成目标语言 SRT"]
@@ -53,6 +56,7 @@ flowchart TB
         MEDIA["ffmpeg / ffprobe / yt-dlp"]
         SOURCE["内置字幕读取与音频抽取"]
         STT["Whisper / OpenAI 转写"]
+        OCR["画面 OCR：macOS Vision / 可替换引擎"]
         TRANS["z.ai / OpenAI / OPUS-MT / NLLB"]
         QA["翻译质量检查与引擎回退"]
         LAYOUT["字幕换行、时间整理与位置检测"]
@@ -69,6 +73,7 @@ flowchart TB
     WEB --> JOB
     CLI --> JOB
     JOB --> MEDIA --> SOURCE --> STT --> TRANS --> QA --> LAYOUT --> OUTPUT
+    SOURCE --> OCR --> TRANS
     JOB <--> STATE
     MEDIA <--> CACHE
     STT <--> CACHE
@@ -174,6 +179,21 @@ env PYTHONPATH=src python3 -m subtitle_tool.cli 'https://example.com/video' \
 
 通用网址下载属于尽力尝试：需要登录、Cookie、DRM、地区授权或特殊播放器的网站可能无法下载。
 
+### 无对白视频读取画面字幕
+
+macOS 可直接使用系统 Vision OCR，不需要额外下载 OCR 模型：
+
+```bash
+env PYTHONPATH=src python3 -m subtitle_tool.cli input.mp4 \
+  --source screen-ocr \
+  --source-lang ja \
+  --target-lang zh-CN \
+  --translator z-ai \
+  --out-dir output
+```
+
+默认的 `--source auto` 也会在语音转写为空或出现大段重复幻觉时自动切换画面 OCR。OCR 引擎通过统一接口接入；当前提供 macOS Vision，后续可在 Linux 服务器替换为 PaddleOCR、Tesseract 或云端 OCR。
+
 ## 翻译引擎怎么选
 
 | 引擎 | 适合场景 | 特点 |
@@ -206,6 +226,16 @@ output/<video-name>.<YYYYMMDDHHMMSSX>/
 
 ## 近期更新
 
+- 新增可替换的画面字幕 OCR 引擎架构；macOS 首个实现使用系统 Vision，不需要额外下载 OCR 模型。
+- 自动字幕来源会识别 Whisper 空结果和高度重复幻觉，并切换画面 OCR；也可手动选择“画面字幕 OCR”。
+- OCR 对连续帧文字进行位置、置信度、纯数字噪声和相似文本合并，生成可翻译的源 SRT 时间轴。
+- z.ai 在某个目标语言超时或失败后，会在当前任务内熔断；其余目标语言直接进入本地/OpenAI 回退链路，避免重复等待相同故障。
+- 翻译批次完成时会同步更新任务总百分比，并显示目标语言与已完成字幕条数，不再让长时间翻译一直停在同一个百分比。
+- 完全相同的源字幕会在单次任务中合并翻译，再按原索引展开到完整时间轴，减少重复模型推理。
+- 翻译引擎名称、兼容别名、缓存身份和环境检查改为统一配置，减少 Web、CLI 与处理流程之间的重复定义。
+- Web 表单将模型路径、硬字幕编码和性能开关归入“高级设置”，常用的输入、语言、字幕来源与翻译选项保持在首屏。
+- NLLB 1.3B 会根据 CPU、Metal 和可用内存选择批量；内存不足时自动缩小批量，并在日志中显示批次进度、已用时间和预计剩余时间。
+- NLLB 每完成一批即保存翻译断点；任务失败、停止或服务重启后继续时，只处理尚未完成的字幕。
 - 本地多语言翻译统一使用 NLLB 1.3B；600M 不再出现在 Web、环境检查和自动回退中，旧 CLI 参数继续兼容。
 - Whisper 支持 Metal/GPU 加速和 VAD 跳过静音；当 GPU、VAD 或转写结果不可用时，会按 `Metal + VAD -> CPU + VAD -> CPU 标准转写` 自动降级。
 - 视频解析、下载、语音转写和硬字幕烧录增加超时保护与定时心跳日志，长时间无输出时会明确提示当前状态并自动停止异常进程。
@@ -228,7 +258,8 @@ output/<video-name>.<YYYYMMDDHHMMSSX>/
 
 ## 当前限制
 
-- 不做视频画面 OCR，不能直接读取已经烧录进画面的字幕文字。
+- 画面 OCR 当前首个实现仅支持 macOS Vision；Linux / Windows 需要接入其它兼容引擎。
+- OCR 对花体字、快速动画、低清画面、台标和同屏大量文字的识别可能不完整，生成后建议使用字幕校对功能检查。
 - 通用下载不保证支持所有网站，也不绕过 DRM、登录、付费或地区限制。
 - 本地 Whisper `base` 模型和小型翻译模型适合快速试跑，不代表最高识别或翻译质量。
 - 硬字幕需要重新编码，长视频和高分辨率视频会消耗较多时间。

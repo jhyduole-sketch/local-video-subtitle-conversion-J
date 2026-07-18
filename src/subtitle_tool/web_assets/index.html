@@ -59,7 +59,9 @@
               <option value="auto">自动</option>
               <option value="embedded">内置字幕</option>
               <option value="audio">音频识别</option>
+              <option value="screen-ocr">画面字幕 OCR</option>
             </select>
+            <p class="field-hint">自动模式会在没有有效语音或转写高度重复时尝试读取画面字幕。</p>
           </div>
 
           <div class="field">
@@ -104,6 +106,9 @@
             <input id="outDir" name="outDir" value="output" />
           </div>
 
+          <details id="advancedSettings" class="advanced-settings span-all">
+            <summary>高级设置</summary>
+            <div class="advanced-settings-grid">
           <div class="field">
             <label for="whisperPreset">Whisper 模型大小</label>
             <select id="whisperPreset" name="whisperPreset">
@@ -160,9 +165,14 @@
           <div class="toggles span-all">
             <label><input id="whisperUseGpu" name="whisperUseGpu" type="checkbox" checked /> Metal/GPU 加速</label>
             <label><input id="whisperUseVad" name="whisperUseVad" type="checkbox" checked /> VAD 跳过静音</label>
-            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
-            <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 自动避让原字幕（使用稳定硬字幕）</label>
+            <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 自动避让原字幕</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
+          </div>
+            </div>
+          </details>
+
+          <div class="toggles span-all">
+            <label><input id="embedSubtitles" name="embedSubtitles" type="checkbox" checked /> 输出字幕视频</label>
             <label><input id="downloadOnly" name="downloadOnly" type="checkbox" /> 只下载</label>
           </div>
 
@@ -287,6 +297,7 @@
       </dialog>
     </main>
 
+    <script src="/language_catalog.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

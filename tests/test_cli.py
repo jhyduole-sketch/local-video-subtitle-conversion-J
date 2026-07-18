@@ -10,6 +10,20 @@ from subtitle_tool.errors import SubtitleToolError  # noqa: E402
 
 
 class CliTests(unittest.TestCase):
+    def test_screen_ocr_source_is_passed_to_pipeline(self):
+        with patch("subtitle_tool.cli.run_pipeline") as run_pipeline:
+            run_pipeline.return_value.source_subtitle_path = Path("/tmp/source.ja.srt")
+            run_pipeline.return_value.translated_paths = {}
+            run_pipeline.return_value.failed_languages = {}
+            run_pipeline.return_value.source_kind = "screen-ocr-macos-vision"
+            run_pipeline.return_value.downloaded_video_path = None
+            run_pipeline.return_value.subtitled_video_paths = None
+
+            exit_code = main(["input.mp4", "--source", "screen-ocr"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run_pipeline.call_args.args[0].source, "screen-ocr")
+
     def test_missing_input_returns_error(self):
         with patch("subtitle_tool.cli.run_pipeline", side_effect=SubtitleToolError("missing")):
             exit_code = main(["missing.mp4", "--target-lang", "zh-CN"])

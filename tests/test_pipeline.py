@@ -9,19 +9,167 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from subtitle_tool.pipeline import (  # noqa: E402
     PipelineOptions,
+    _load_source_segments,
     _resolve_input,
     render_edited_subtitle_video,
     run_pipeline,
 )
 from subtitle_tool.asset_cache import AssetCache  # noqa: E402
 from subtitle_tool.youtube import DownloadedVideo  # noqa: E402
-from subtitle_tool.errors import SubtitleToolError  # noqa: E402
+from subtitle_tool.errors import MediaError, SubtitleToolError  # noqa: E402
 from subtitle_tool.media import EncodingProgress  # noqa: E402
 from subtitle_tool.srt import SubtitleSegment, read_srt  # noqa: E402
+from subtitle_tool.translation_cache import TranslationCacheEntry  # noqa: E402
 from subtitle_tool.video_subtitle_detection import SubtitleRegionDetection  # noqa: E402
 
 
 class PipelineTests(unittest.TestCase):
+    def test_explicit_screen_ocr_uses_available_engine(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            expected = [SubtitleSegment(1, 0, 1_000, "画面字幕")]
+            engine = unittest.mock.Mock(
+                engine_id="macos-vision",
+                recognize_video=unittest.mock.Mock(return_value=expected),
+            )
+            options = PipelineOptions(
+                input_value=str(video),
+                target_langs=[],
+                source_lang="ja",
+                out_dir=root / "output",
+                source="screen-ocr",
+                output_format="srt",
+            )
+
+            with patch(
+                "subtitle_tool.pipeline.get_screen_ocr_engine", return_value=engine
+            ), patch("subtitle_tool.pipeline.find_subtitle_streams") as find_streams:
+                segments, source_kind = _load_source_segments(
+                    options, video, AssetCache(root / "cache")
+                )
+
+        self.assertEqual(segments, expected)
+        self.assertEqual(source_kind, "screen-ocr-macos-vision")
+        engine.recognize_video.assert_called_once()
+        find_streams.assert_not_called()
+
+    def test_auto_falls_back_to_screen_ocr_for_repeated_whisper_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            repeated = [
+                SubtitleSegment(index, index * 1_000, index * 1_000 + 900, "请上汤。")
+                for index in range(1, 30)
+            ]
+            expected = [SubtitleSegment(1, 0, 1_000, "ただでさえ暑いのに")]
+            engine = unittest.mock.Mock(
+                engine_id="macos-vision",
+                recognize_video=unittest.mock.Mock(return_value=expected),
+            )
+            options = PipelineOptions(
+                input_value=str(video),
+                target_langs=[],
+                source_lang="ja",
+                out_dir=root / "output",
+                source="auto",
+                output_format="srt",
+                transcriber="local-whisper",
+                whisper_model=root / "model.bin",
+            )
+
+            def fake_extract(_video, audio, _cancel=None):
+                audio.parent.mkdir(parents=True, exist_ok=True)
+                audio.write_bytes(b"audio")
+
+            with patch(
+                "subtitle_tool.pipeline.find_subtitle_streams", return_value=[]
+            ), patch("subtitle_tool.pipeline.extract_audio", side_effect=fake_extract), patch(
+                "subtitle_tool.pipeline.transcribe_with_whisper_cpp",
+                return_value=repeated,
+            ), patch(
+                "subtitle_tool.pipeline.get_screen_ocr_engine", return_value=engine
+            ):
+                segments, source_kind = _load_source_segments(
+                    options, video, AssetCache(root / "cache")
+                )
+
+        self.assertEqual(segments, expected)
+        self.assertEqual(source_kind, "screen-ocr-macos-vision")
+
+    def test_auto_rejects_repeated_cached_transcript_and_uses_ocr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            cache = AssetCache(root / "cache")
+            fingerprint = cache.file_fingerprint(video)
+            audio_path = cache.audio_path(fingerprint)
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
+            audio_path.write_bytes(b"audio")
+            transcript_path = cache.transcript_path(
+                fingerprint, "local-whisper", "ja", root / "model.bin", "standard"
+            )
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            repeated = [
+                SubtitleSegment(index, index * 1_000, index * 1_000 + 900, "請上湯。")
+                for index in range(1, 20)
+            ]
+            from subtitle_tool.srt import write_srt
+
+            write_srt(transcript_path, repeated)
+            expected = [SubtitleSegment(1, 0, 1_000, "料理で発散")]
+            engine = unittest.mock.Mock(
+                engine_id="macos-vision",
+                recognize_video=unittest.mock.Mock(return_value=expected),
+            )
+            options = PipelineOptions(
+                input_value=str(video),
+                target_langs=[],
+                source_lang="ja",
+                out_dir=root / "output",
+                source="auto",
+                output_format="srt",
+                transcriber="local-whisper",
+                whisper_model=root / "model.bin",
+                whisper_use_vad=False,
+            )
+
+            with patch(
+                "subtitle_tool.pipeline.find_subtitle_streams", return_value=[]
+            ), patch(
+                "subtitle_tool.pipeline.transcribe_with_whisper_cpp"
+            ) as transcribe, patch(
+                "subtitle_tool.pipeline.get_screen_ocr_engine", return_value=engine
+            ):
+                segments, source_kind = _load_source_segments(options, video, cache)
+
+        self.assertEqual(segments, expected)
+        self.assertEqual(source_kind, "screen-ocr-macos-vision")
+        transcribe.assert_not_called()
+
+    def test_explicit_screen_ocr_reports_unavailable_engine(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            options = PipelineOptions(
+                input_value=str(video),
+                target_langs=[],
+                source_lang=None,
+                out_dir=root / "output",
+                source="screen-ocr",
+                output_format="srt",
+            )
+
+            with patch(
+                "subtitle_tool.pipeline.get_screen_ocr_engine", return_value=None
+            ):
+                with self.assertRaisesRegex(MediaError, "OCR.*不可用"):
+                    _load_source_segments(options, video, AssetCache(root / "cache"))
+
     def test_unknown_https_url_uses_generic_downloader(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -165,6 +313,48 @@ class PipelineTests(unittest.TestCase):
             translate_segments_with_nllb.call_args.kwargs["progress_callback"]
         )
 
+    def test_local_nllb_resumes_partial_cache_and_uses_shared_provider(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="こんにちは"),
+                SubtitleSegment(index=2, start_ms=1000, end_ms=2000, text="世界"),
+            ]
+            partial = TranslationCacheEntry(
+                translations={1: "Hello"}, engine="本地 NLLB 1.3B", complete=False
+            )
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.TranslationCache"
+            ) as cache_class, patch(
+                "subtitle_tool.pipeline.translate_segments_with_nllb",
+                return_value={1: "Hello", 2: "World"},
+            ) as nllb_translate:
+                cache = cache_class.return_value
+                cache.load.return_value = None
+                cache.load_partial.return_value = partial
+                run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["en"],
+                        source_lang="ja",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="local-nllb",
+                    )
+                )
+
+        self.assertEqual(cache.load_partial.call_args.args[-1], "local-nllb-quality")
+        self.assertEqual(
+            nllb_translate.call_args.kwargs["initial_translations"], {1: "Hello"}
+        )
+        self.assertTrue(callable(nllb_translate.call_args.kwargs["checkpoint_callback"]))
+
     def test_same_source_and_target_language_reuses_source_subtitles(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "input.mp4"
@@ -265,6 +455,151 @@ class PipelineTests(unittest.TestCase):
         openai_translate.assert_not_called()
         self.assertEqual(result.translation_engines["ja"], "本地模型")
         self.assertTrue(any("已自动切换本地模型" in item for item in progress_messages))
+
+    def test_zai_failure_opens_circuit_for_remaining_target_languages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
+            ]
+            progress_messages = []
+
+            def fake_local(segments, source_lang, target_lang):
+                return {segment.index: f"{target_lang}: {segment.text}" for segment in segments}
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments_with_zai",
+                side_effect=SubtitleToolError("Request timed out"),
+            ) as zai_translate, patch(
+                "subtitle_tool.pipeline.translate_segments_locally",
+                side_effect=fake_local,
+            ):
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["ja", "de"],
+                        source_lang="en",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="z-ai",
+                        progress_callback=lambda message, percent: progress_messages.append(
+                            message
+                        ),
+                    )
+                )
+
+        zai_translate.assert_called_once()
+        self.assertEqual(set(result.translated_paths), {"ja", "de"})
+        self.assertTrue(any("熔断" in message for message in progress_messages))
+
+    def test_nllb_checkpoint_updates_real_translation_progress(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(
+                    index=index,
+                    start_ms=(index - 1) * 1000,
+                    end_ms=index * 1000,
+                    text=f"text {index}",
+                )
+                for index in range(1, 5)
+            ]
+            progress_updates = []
+
+            def fake_nllb(segments, source_lang, target_lang, **kwargs):
+                kwargs["checkpoint_callback"]({1: "one", 2: "two"})
+                return {
+                    segment.index: f"translated {segment.index}"
+                    for segment in segments
+                }
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments_with_nllb",
+                side_effect=fake_nllb,
+            ):
+                run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["ja"],
+                        source_lang="en",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="local-nllb-quality",
+                        progress_callback=lambda message, percent: progress_updates.append(
+                            (message, percent)
+                        ),
+                    )
+                )
+
+        matching = [
+            (message, percent)
+            for message, percent in progress_updates
+            if "翻译进度: ja · 2/4" in message
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertGreater(matching[0][1], 56)
+        self.assertLess(matching[0][1], 76)
+
+    def test_duplicate_subtitles_are_translated_once_and_expanded_to_timeline(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.mp4"
+            input_path.write_bytes(b"video")
+            source_segments = [
+                SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="Hello"),
+                SubtitleSegment(index=2, start_ms=1000, end_ms=2000, text="Hello"),
+                SubtitleSegment(index=3, start_ms=2000, end_ms=3000, text="World"),
+            ]
+            progress_messages = []
+
+            def fake_translate(segments, target_lang, source_lang=None):
+                return {
+                    segment.index: {"Hello": "こんにちは", "World": "世界"}[
+                        segment.text
+                    ]
+                    for segment in segments
+                }
+
+            with patch(
+                "subtitle_tool.pipeline._load_source_segments",
+                return_value=(source_segments, "audio-local-whisper"),
+            ), patch(
+                "subtitle_tool.pipeline.translate_segments",
+                side_effect=fake_translate,
+            ) as translate:
+                result = run_pipeline(
+                    PipelineOptions(
+                        input_value=str(input_path),
+                        target_langs=["ja"],
+                        source_lang="en",
+                        out_dir=Path(tmpdir),
+                        source="audio",
+                        output_format="srt",
+                        translator="openai",
+                        progress_callback=lambda message, percent: progress_messages.append(
+                            message
+                        ),
+                    )
+                )
+
+            translated = read_srt(result.translated_paths["ja"])
+
+        requested_segments = translate.call_args.args[0]
+        self.assertEqual([segment.index for segment in requested_segments], [1, 3])
+        self.assertEqual(
+            [segment.text for segment in translated],
+            ["こんにちは", "こんにちは", "世界"],
+        )
+        self.assertTrue(any("复用 1 条" in message for message in progress_messages))
 
     def test_bad_local_fallback_continues_to_openai(self):
         with tempfile.TemporaryDirectory() as tmpdir:

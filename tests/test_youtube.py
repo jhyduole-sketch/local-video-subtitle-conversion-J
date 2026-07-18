@@ -22,11 +22,33 @@ class YouTubeTests(unittest.TestCase):
     def test_detects_youtube_urls(self):
         self.assertTrue(is_youtube_url("https://www.youtube.com/watch?v=abc123"))
         self.assertTrue(is_youtube_url("https://youtu.be/abc123"))
+        self.assertTrue(is_youtube_url("https://www.youtube.com/shorts/abc123"))
+        self.assertTrue(is_youtube_url("https://music.youtube.com/watch?v=abc123"))
+        self.assertTrue(is_youtube_url("https://www.youtube-nocookie.com/embed/abc123"))
         self.assertFalse(is_youtube_url("https://example.com/watch?v=abc123"))
 
     def test_extracts_video_id(self):
         self.assertEqual(extract_youtube_id("https://www.youtube.com/watch?v=abc123"), "abc123")
         self.assertEqual(extract_youtube_id("https://youtu.be/abc123"), "abc123")
+
+    def test_extracts_video_id_from_common_youtube_paths(self):
+        urls = (
+            "https://www.youtube.com/shorts/HJ2T9Twqfy0",
+            "https://www.youtube.com/live/HJ2T9Twqfy0?feature=share",
+            "https://www.youtube.com/embed/HJ2T9Twqfy0",
+            "https://www.youtube-nocookie.com/embed/HJ2T9Twqfy0",
+            "https://www.youtube.com/v/HJ2T9Twqfy0",
+        )
+
+        for value in urls:
+            with self.subTest(value=value):
+                self.assertEqual(extract_youtube_id(value), "HJ2T9Twqfy0")
+
+    def test_extracts_video_id_from_music_youtube(self):
+        self.assertEqual(
+            extract_youtube_id("https://music.youtube.com/watch?v=HJ2T9Twqfy0"),
+            "HJ2T9Twqfy0",
+        )
 
     def test_ignores_trailing_sentence_punctuation(self):
         value = "https://www.youtube.com/watch?v=ftWe_pVrtho。"

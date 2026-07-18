@@ -100,6 +100,26 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.advanced-settings {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.advanced-settings summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 0;
+}
+
+.advanced-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding-top: 12px;
+}
+
 label {
   color: var(--muted);
   font-size: 13px;
@@ -863,6 +883,7 @@ textarea:focus {
 @media (max-width: 900px) {
   .workspace,
   .form-panel,
+  .advanced-settings-grid,
   .results-grid {
     grid-template-columns: 1fr;
   }

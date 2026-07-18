@@ -7,6 +7,7 @@ from pathlib import Path
 from .env import load_dotenv
 from .errors import SubtitleToolError, actionable_error_message
 from .pipeline import PipelineOptions, run_pipeline
+from .translation_engines import TRANSLATOR_IDS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,9 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=["auto", "embedded", "audio"],
+        choices=["auto", "embedded", "audio", "screen-ocr"],
         default="auto",
-        help="Subtitle source strategy. Defaults to auto.",
+        help="Subtitle source strategy. screen-ocr reads hardcoded text from video frames. Defaults to auto.",
     )
     parser.add_argument(
         "--format",
@@ -85,13 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--translator",
-        choices=[
-            "openai",
-            "z-ai",
-            "local-transformer",
-            "local-nllb",
-            "local-nllb-quality",
-        ],
+        choices=TRANSLATOR_IDS,
         default="openai",
         help="Subtitle translation engine. local-nllb and local-nllb-quality both use NLLB 1.3B; local-nllb is retained for compatibility.",
     )

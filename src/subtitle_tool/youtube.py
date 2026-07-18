@@ -13,6 +13,17 @@ from .process_control import CancelCheck, run_process, timeout_seconds_from_env
 
 
 TRAILING_URL_PUNCTUATION = "。．.，,、；;：:！!？?）)]}＞>」』”’\"'"
+YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "gaming.youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "www.youtube-nocookie.com",
+}
+YOUTUBE_PATH_VIDEO_PREFIXES = {"shorts", "live", "embed", "v", "e", "clip"}
 
 
 @dataclass(frozen=True)
@@ -29,10 +40,8 @@ class DownloadedVideo:
 
 def is_youtube_url(value: str) -> bool:
     parsed = urlparse(clean_youtube_url(value))
-    host = parsed.netloc.lower()
-    return parsed.scheme in {"http", "https"} and (
-        host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
-    )
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme in {"http", "https"} and host in YOUTUBE_HOSTS
 
 
 def is_bilibili_url(value: str) -> bool:
@@ -45,11 +54,16 @@ def is_bilibili_url(value: str) -> bool:
 
 def extract_youtube_id(value: str) -> str:
     parsed = urlparse(clean_youtube_url(value))
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     if host == "youtu.be":
         video_id = parsed.path.strip("/").split("/")[0]
     else:
-        video_id = parse_qs(parsed.query).get("v", [""])[0]
+        query = parse_qs(parsed.query)
+        video_id = query.get("v", query.get("vi", [""]))[0]
+        if not video_id:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2 and parts[0].lower() in YOUTUBE_PATH_VIDEO_PREFIXES:
+                video_id = parts[1]
     if not video_id:
         raise SubtitleToolError("Invalid YouTube URL: missing video id.")
     return video_id

@@ -3,13 +3,14 @@ from __future__ import annotations
 from functools import lru_cache
 import os
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 from .errors import DependencyError, SubtitleToolError
 from .srt import SubtitleSegment
+from .translation_engines import NLLB_MODEL_NAME
 
 
-NLLB_MODEL_NAME = "facebook/nllb-200-distilled-1.3B"
 NLLB_QUALITY_MODEL_NAME = NLLB_MODEL_NAME
 NLLB_MODEL_VARIANTS = (
     ("NLLB 1.3B", NLLB_QUALITY_MODEL_NAME),
@@ -116,6 +117,7 @@ def translate_segments_locally(
                 target,
                 lambda text: f"{prompt_prefix}{text}",
                 {"max_new_tokens": 128, "num_beams": 4},
+                batch_size=_local_translation_batch_size(model_name),
             )
         )
     return translations
@@ -127,6 +129,8 @@ def translate_segments_with_nllb(
     target_lang: str,
     model_name: str = NLLB_MODEL_NAME,
     progress_callback: Callable[[str], None] | None = None,
+    initial_translations: dict[int, str] | None = None,
+    checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
 ) -> dict[int, str]:
     source = normalize_lang(source_lang)
     target = normalize_lang(target_lang)
@@ -167,6 +171,9 @@ def translate_segments_with_nllb(
                     "repetition_penalty": 1.15,
                     "early_stopping": True,
                 },
+                initial_translations=initial_translations,
+                checkpoint_callback=checkpoint_callback,
+                batch_size=_local_translation_batch_size(model_name),
             )
         )
     return translations
@@ -183,17 +190,40 @@ def _translate_batches(
     progress_callback: Callable[[str], None] | None = None,
     model_label: str = "本地模型",
     retry_generation_options: dict[str, Any] | None = None,
+    initial_translations: dict[int, str] | None = None,
+    checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
+    batch_size: int | None = None,
 ) -> dict[int, str]:
-    translations: dict[int, str] = {}
-    batch_size = _local_translation_batch_size()
-    total_batches = max(1, (len(segments) + batch_size - 1) // batch_size)
-    for offset in range(0, len(segments), batch_size):
-        batch = segments[offset : offset + batch_size]
-        batch_number = offset // batch_size + 1
+    expected_indexes = {segment.index for segment in segments}
+    translations = {
+        index: text
+        for index, text in (initial_translations or {}).items()
+        if index in expected_indexes and text.strip()
+    }
+    pending_segments = [
+        segment for segment in segments if segment.index not in translations
+    ]
+    if not pending_segments:
+        if progress_callback:
+            progress_callback(f"{model_label} 已复用全部 {len(segments)} 条翻译缓存")
+        return translations
+
+    current_batch_size = max(1, batch_size or _local_translation_batch_size())
+    started_at = time.monotonic()
+    offset = 0
+    batch_number = 0
+    while offset < len(pending_segments):
+        batch = pending_segments[offset : offset + current_batch_size]
+        estimated_total_batches = batch_number + max(
+            1,
+            (len(pending_segments) - offset + current_batch_size - 1)
+            // current_batch_size,
+        )
         if progress_callback:
             progress_callback(
-                f"{model_label} 翻译第 {batch_number}/{total_batches} 批 "
-                f"（{offset + 1}-{offset + len(batch)}/{len(segments)}）"
+                f"{model_label} 翻译第 {batch_number + 1}/{estimated_total_batches} 批 "
+                f"（待处理 {offset + 1}-{offset + len(batch)}/"
+                f"{len(pending_segments)}）"
             )
         source_texts = [segment.text.replace("\n", " ").strip() for segment in batch]
         prompts = [prompt_builder(text) for text in source_texts]
@@ -204,9 +234,21 @@ def _translate_batches(
             truncation=True,
             max_length=256,
         )
-        outputs = _generate_local_batch(
-            model, inputs, torch, generation_options
-        )
+        try:
+            outputs = _generate_local_batch(
+                model, inputs, torch, generation_options
+            )
+        except Exception as exc:
+            if _is_out_of_memory_error(exc) and len(batch) > 1:
+                reduced_batch_size = max(1, len(batch) // 2)
+                if progress_callback:
+                    progress_callback(
+                        f"{model_label} 内存不足，批次从 {len(batch)} "
+                        f"调整为 {reduced_batch_size} 后重试"
+                    )
+                current_batch_size = reduced_batch_size
+                continue
+            raise
         translated_texts = tokenizer.batch_decode(
             outputs, skip_special_tokens=True
         )
@@ -268,6 +310,20 @@ def _translate_batches(
                         f"{model_label} 第 {segment.index} 条单句重试成功"
                     )
             translations[segment.index] = translated or source_text
+        offset += len(batch)
+        batch_number += 1
+        if checkpoint_callback:
+            checkpoint_callback(dict(translations))
+        if progress_callback:
+            elapsed = max(time.monotonic() - started_at, 0.001)
+            remaining = len(pending_segments) - offset
+            rate = offset / elapsed
+            eta = remaining / rate if rate > 0 else None
+            progress_callback(
+                f"{model_label} 已完成 {len(translations)}/{len(segments)} 条 "
+                f"· 已用 {_format_duration(elapsed)} · "
+                f"预计剩余 {_format_duration(eta)}"
+            )
     return translations
 
 
@@ -311,12 +367,49 @@ def _generate_local_batch(
         return model.generate(**inputs, **generation_options)
 
 
-def _local_translation_batch_size() -> int:
+def _local_translation_batch_size(model_name: str = "") -> int:
     value = os.environ.get("LOCAL_TRANSLATION_BATCH_SIZE", "").strip()
     try:
-        return max(1, int(value)) if value else DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE
+        if value:
+            return max(1, int(value))
     except ValueError:
+        pass
+
+    if "1.3B" not in model_name:
         return DEFAULT_LOCAL_TRANSLATION_BATCH_SIZE
+    if os.environ.get("LOCAL_TRANSLATION_DEVICE", "cpu").strip().lower() == "mps":
+        return 8
+    memory = _system_memory_bytes()
+    if memory >= 24 * 1024**3:
+        return 8
+    if memory >= 12 * 1024**3:
+        return 4
+    return 2
+
+
+def _system_memory_bytes() -> int:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (OSError, TypeError, ValueError):
+        return 0
+
+
+def _is_out_of_memory_error(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "cannot allocate memory" in message
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "计算中"
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def normalize_lang(value: str | None) -> str:

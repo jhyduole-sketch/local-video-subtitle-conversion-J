@@ -29,10 +29,17 @@ from .media import (
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .process_control import CancelCheck
 from .runtime_paths import cache_root
+from .screen_ocr import get_screen_ocr_engine, is_suspicious_transcript
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .subtitle_layout import layout_subtitles, write_ass
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
 from .translation_cache import TranslationCache
+from .translation_engines import (
+    TRANSLATOR_IDS,
+    canonical_translator_id,
+    translation_cache_provider,
+    translator_label,
+)
 from .video_subtitle_detection import (
     SubtitleRegionDetection,
     detect_video_subtitle_region,
@@ -88,21 +95,23 @@ class PipelineResult:
     input_video_path: Path | None = None
 
 
+@dataclass
+class _TranslationRunState:
+    zai_circuit_open: bool = False
+    zai_failure_reason: str | None = None
+
+
 def run_pipeline(options: PipelineOptions) -> PipelineResult:
     _progress(options, "检查参数", 2)
     if options.output_format != "srt":
         raise SubtitleToolError("v1 only supports --format srt.")
-    if options.source not in {"auto", "embedded", "audio"}:
-        raise SubtitleToolError("--source must be one of: auto, embedded, audio.")
+    if options.source not in {"auto", "embedded", "audio", "screen-ocr"}:
+        raise SubtitleToolError(
+            "--source must be one of: auto, embedded, audio, screen-ocr."
+        )
     if options.transcriber not in {"openai", "local-whisper"}:
         raise SubtitleToolError("--transcriber must be one of: openai, local-whisper.")
-    if options.translator not in {
-        "openai",
-        "z-ai",
-        "local-transformer",
-        "local-nllb",
-        "local-nllb-quality",
-    }:
+    if options.translator not in TRANSLATOR_IDS:
         raise SubtitleToolError(
             "--translator must be one of: openai, z-ai, local-transformer, "
             "local-nllb, local-nllb-quality."
@@ -156,6 +165,9 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     failed_languages: dict[str, str] = {}
     translation_engines: dict[str, str] = {}
     translation_cache = TranslationCache(asset_cache.root / "translations")
+    cache_provider = translation_cache_provider(options.translator)
+    resumable_translation = cache_provider in {"z-ai", "local-nllb-quality"}
+    translation_run_state = _TranslationRunState()
     subtitle_video_mode = _resolved_subtitle_video_mode(options)
     if (
         options.embed_subtitles
@@ -211,13 +223,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                         source_segments,
                         options.source_lang,
                         target_lang,
-                        options.translator,
+                        cache_provider,
                     )
                     cached = translation_cache.load(
                         source_segments,
                         options.source_lang,
                         target_lang,
-                        options.translator,
+                        cache_provider,
                     )
                     if cached:
                         translations = cached.translations
@@ -230,7 +242,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                     else:
                         initial_translations = (
                             partial.translations
-                            if partial and options.translator == "z-ai"
+                            if partial and resumable_translation
                             else None
                         )
                         if initial_translations:
@@ -250,16 +262,18 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                                 source_segments,
                                 options.source_lang,
                                 target_lang,
-                                options.translator,
+                                cache_provider,
                                 values,
-                                "z.ai",
+                                translator_label(cache_provider),
                             ),
+                            final_progress_percent=translated_percent,
+                            run_state=translation_run_state,
                         )
                         translation_cache.store(
                             source_segments,
                             options.source_lang,
                             target_lang,
-                            options.translator,
+                            cache_provider,
                             translations,
                             engine,
                         )
@@ -531,67 +545,126 @@ def _translate_target(
     progress_percent: int,
     initial_translations: dict[int, str] | None = None,
     checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
+    final_progress_percent: int | None = None,
+    run_state: _TranslationRunState | None = None,
 ) -> tuple[dict[int, str], str]:
-    if options.translator == "local-transformer":
+    translation_segments, representative_indexes = _deduplicate_translation_segments(
+        source_segments
+    )
+    duplicate_count = len(source_segments) - len(translation_segments)
+    if duplicate_count:
+        _progress(
+            options,
+            f"重复字幕复用: {len(source_segments)} 条合并为 "
+            f"{len(translation_segments)} 条翻译，复用 {duplicate_count} 条",
+            progress_percent,
+        )
+
+    collapsed_initial = _collapse_initial_translations(
+        initial_translations, representative_indexes
+    )
+    live_progress = [progress_percent]
+    progress_end = max(progress_percent, final_progress_percent or progress_percent)
+
+    def report_checkpoint(values: dict[int, str]) -> None:
+        expanded = _expand_deduplicated_translations(values, representative_indexes)
+        if checkpoint_callback:
+            checkpoint_callback(expanded)
+        completed = min(len(expanded), len(source_segments))
+        if source_segments:
+            fraction = completed / len(source_segments)
+            live_progress[0] = max(
+                live_progress[0],
+                progress_percent + round((progress_end - progress_percent) * fraction),
+            )
+        _progress(
+            options,
+            f"翻译进度: {target_lang} · {completed}/{len(source_segments)}",
+            live_progress[0],
+        )
+
+    def engine_progress(message: str) -> None:
+        _progress(options, message, live_progress[0])
+
+    def finish(
+        values: dict[int, str], engine: str
+    ) -> tuple[dict[int, str], str]:
         return (
+            _expand_deduplicated_translations(values, representative_indexes),
+            engine,
+        )
+
+    translator = canonical_translator_id(options.translator)
+    if translator == "local-transformer":
+        return finish(
             translate_segments_locally(
-                source_segments, options.source_lang, target_lang
+                translation_segments, options.source_lang, target_lang
             ),
             "本地快速模型",
         )
-    if options.translator in {"local-nllb", "local-nllb-quality"}:
+    if translator == "local-nllb-quality":
         model_name = NLLB_QUALITY_MODEL_NAME
-        engine = "本地 NLLB 1.3B"
+        engine = translator_label(translator)
         _progress(options, f"加载{engine}并开始批量翻译", progress_percent)
-        return (
+        return finish(
             translate_segments_with_nllb(
-                source_segments,
+                translation_segments,
                 options.source_lang,
                 target_lang,
                 model_name=model_name,
-                progress_callback=lambda message: _progress(
-                    options, message, progress_percent
-                ),
+                progress_callback=engine_progress,
+                initial_translations=collapsed_initial,
+                checkpoint_callback=report_checkpoint,
             ),
             engine,
         )
-    if options.translator == "openai":
-        return (
+    if translator == "openai":
+        return finish(
             translate_segments(
-                source_segments,
+                translation_segments,
                 target_lang=target_lang,
                 source_lang=options.source_lang,
             ),
             "OpenAI",
         )
 
-    try:
-        return (
-            translate_segments_with_zai(
-                source_segments,
-                target_lang=target_lang,
-                source_lang=options.source_lang,
-                progress_callback=lambda message: _progress(
-                    options, message, progress_percent
-                ),
-                initial_translations=initial_translations,
-                checkpoint_callback=checkpoint_callback,
-            ),
-            "z.ai",
-        )
-    except Exception as zai_error:
+    state = run_state or _TranslationRunState()
+    if state.zai_circuit_open:
+        reason = state.zai_failure_reason or "前一目标语言请求失败"
         _progress(
             options,
-            f"z.ai 翻译未完成，已自动切换本地模型: {zai_error}",
-            progress_percent,
+            f"z.ai 已熔断，本语言直接使用本地模型: {reason}",
+            live_progress[0],
         )
+    else:
+        try:
+            return finish(
+                translate_segments_with_zai(
+                    translation_segments,
+                    target_lang=target_lang,
+                    source_lang=options.source_lang,
+                    progress_callback=engine_progress,
+                    initial_translations=collapsed_initial,
+                    checkpoint_callback=report_checkpoint,
+                ),
+                "z.ai",
+            )
+        except Exception as zai_error:
+            state.zai_circuit_open = True
+            state.zai_failure_reason = str(zai_error)
+            _progress(
+                options,
+                f"z.ai 翻译未完成，已自动切换本地模型并为后续语言熔断: "
+                f"{zai_error}",
+                live_progress[0],
+            )
 
     local_errors: list[str] = []
     try:
         translations = translate_segments_locally(
-            source_segments, options.source_lang, target_lang
+            translation_segments, options.source_lang, target_lang
         )
-        return translations, "本地模型"
+        return finish(translations, "本地模型")
     except Exception as local_error:
         local_errors.append(str(local_error))
         _progress(
@@ -602,15 +675,14 @@ def _translate_target(
 
     try:
         translations = translate_segments_with_nllb(
-            source_segments,
+            translation_segments,
             options.source_lang,
             target_lang,
             model_name=NLLB_QUALITY_MODEL_NAME,
-            progress_callback=lambda message: _progress(
-                options, message, progress_percent
-            ),
+            progress_callback=engine_progress,
+            checkpoint_callback=report_checkpoint,
         )
-        return translations, "本地 NLLB 1.3B"
+        return finish(translations, "本地 NLLB 1.3B")
     except Exception as nllb_error:
         local_errors.append(str(nllb_error))
 
@@ -620,14 +692,56 @@ def _translate_target(
         + " | ".join(local_errors),
         progress_percent,
     )
-    return (
+    return finish(
         translate_segments(
-            source_segments,
+            translation_segments,
             target_lang=target_lang,
             source_lang=options.source_lang,
         ),
         "OpenAI",
     )
+
+
+def _deduplicate_translation_segments(
+    segments: list[SubtitleSegment],
+) -> tuple[list[SubtitleSegment], dict[int, int]]:
+    representatives: dict[str, int] = {}
+    representative_indexes: dict[int, int] = {}
+    unique_segments: list[SubtitleSegment] = []
+    for segment in segments:
+        normalized_text = " ".join(segment.text.split())
+        representative_index = representatives.get(normalized_text)
+        if representative_index is None:
+            representative_index = segment.index
+            representatives[normalized_text] = representative_index
+            unique_segments.append(segment)
+        representative_indexes[segment.index] = representative_index
+    return unique_segments, representative_indexes
+
+
+def _collapse_initial_translations(
+    translations: dict[int, str] | None,
+    representative_indexes: dict[int, int],
+) -> dict[int, str] | None:
+    if not translations:
+        return None
+    collapsed: dict[int, str] = {}
+    for index, text in translations.items():
+        representative_index = representative_indexes.get(index)
+        if representative_index is not None and text.strip():
+            collapsed.setdefault(representative_index, text)
+    return collapsed or None
+
+
+def _expand_deduplicated_translations(
+    translations: dict[int, str],
+    representative_indexes: dict[int, int],
+) -> dict[int, str]:
+    return {
+        index: translations[representative_index]
+        for index, representative_index in representative_indexes.items()
+        if representative_index in translations
+    }
 
 
 def _resolve_input(
@@ -708,6 +822,11 @@ def _load_source_segments(
     options: PipelineOptions, input_path: Path, asset_cache: AssetCache
 ) -> tuple[list[SubtitleSegment], str]:
     video_fingerprint = asset_cache.file_fingerprint(input_path)
+    if options.source == "screen-ocr":
+        return _load_screen_ocr_segments(
+            options, input_path, asset_cache, video_fingerprint
+        )
+
     if options.source in {"auto", "embedded"}:
         cached_embedded_path = asset_cache.source_subtitle_path(
             video_fingerprint, "embedded"
@@ -760,30 +879,108 @@ def _load_source_segments(
         if transcript_path.exists():
             segments = read_srt(transcript_path)
             if segments:
+                if is_suspicious_transcript(segments):
+                    if options.source == "audio":
+                        raise MediaError(
+                            "语音转写结果高度重复，可能没有有效对白。"
+                            "请改用 --source screen-ocr 读取画面字幕。"
+                        )
+                    _progress(
+                        options,
+                        "缓存的语音字幕高度重复，自动切换画面字幕 OCR",
+                        40,
+                    )
+                    return _load_screen_ocr_segments(
+                        options, input_path, asset_cache, video_fingerprint
+                    )
                 _progress(options, "使用缓存的语音转写字幕", 48)
                 return segments, f"audio-{options.transcriber}-cache"
-        if options.transcriber == "local-whisper":
-            segments = transcribe_with_whisper_cpp(
-                audio_path,
-                options.source_lang,
-                options.whisper_model,
-                options.cancel_check,
-                progress_callback=lambda message: _progress(options, message, 40),
-                use_gpu=options.whisper_use_gpu,
-                use_vad=options.whisper_use_vad,
-                vad_model_path=options.whisper_vad_model,
+        try:
+            if options.transcriber == "local-whisper":
+                segments = transcribe_with_whisper_cpp(
+                    audio_path,
+                    options.source_lang,
+                    options.whisper_model,
+                    options.cancel_check,
+                    progress_callback=lambda message: _progress(options, message, 40),
+                    use_gpu=options.whisper_use_gpu,
+                    use_vad=options.whisper_use_vad,
+                    vad_model_path=options.whisper_vad_model,
+                )
+                source_kind = "audio-local-whisper"
+                _progress(options, "本地 Whisper 转写完成", 48)
+            else:
+                segments = transcribe_audio(audio_path, options.source_lang)
+                source_kind = "audio"
+                _progress(options, "OpenAI 转写完成", 48)
+        except CancellationError:
+            raise
+        except Exception as exc:
+            if options.source != "auto":
+                raise
+            _progress(
+                options,
+                f"语音转写未得到可用字幕，自动切换画面字幕 OCR: {exc}",
+                40,
             )
-            source_kind = "audio-local-whisper"
-            _progress(options, "本地 Whisper 转写完成", 48)
-        else:
-            segments = transcribe_audio(audio_path, options.source_lang)
-            source_kind = "audio"
-            _progress(options, "OpenAI 转写完成", 48)
+            return _load_screen_ocr_segments(
+                options, input_path, asset_cache, video_fingerprint
+            )
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         write_srt(transcript_path, segments)
+        if not segments or is_suspicious_transcript(segments):
+            if options.source == "audio":
+                raise MediaError(
+                    "语音转写结果为空或高度重复，可能没有有效对白。"
+                    "请改用 --source screen-ocr 读取画面字幕。"
+                )
+            _progress(
+                options,
+                "语音字幕为空或高度重复，自动切换画面字幕 OCR",
+                48,
+            )
+            return _load_screen_ocr_segments(
+                options, input_path, asset_cache, video_fingerprint
+            )
         return segments, source_kind
 
     raise MediaError("No usable subtitle source found. Try --source audio.")
+
+
+def _load_screen_ocr_segments(
+    options: PipelineOptions,
+    input_path: Path,
+    asset_cache: AssetCache,
+    video_fingerprint: str,
+) -> tuple[list[SubtitleSegment], str]:
+    engine = get_screen_ocr_engine(asset_cache.root)
+    if engine is None:
+        raise MediaError(
+            "画面字幕 OCR 引擎不可用。macOS 请确认已安装 Command Line Tools；"
+            "其他系统可接入兼容的 OCR 引擎。"
+        )
+
+    source_kind = f"screen-ocr-{engine.engine_id}"
+    cached_path = asset_cache.source_subtitle_path(video_fingerprint, source_kind)
+    if cached_path.exists():
+        cached_segments = read_srt(cached_path)
+        if cached_segments:
+            _progress(options, f"使用缓存的画面字幕 OCR（{engine.label}）", 48)
+            return cached_segments, f"{source_kind}-cache"
+
+    _progress(options, f"启动画面字幕 OCR：{engine.label}", 40)
+    segments = engine.recognize_video(
+        input_path,
+        options.source_lang,
+        cancel_check=options.cancel_check,
+        progress_callback=lambda message: _progress(options, message, 44),
+    )
+    if not segments:
+        raise MediaError("画面字幕 OCR 没有生成可用字幕")
+    cached_path.parent.mkdir(parents=True, exist_ok=True)
+    write_srt(cached_path, segments)
+    _progress(options, f"画面字幕 OCR 完成：{len(segments)} 条", 48)
+    return segments, source_kind
 
 
 def _mp4_language_code(language: str) -> str:
