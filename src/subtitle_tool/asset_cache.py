@@ -6,6 +6,8 @@ import os
 import shutil
 from pathlib import Path
 
+from .atomic_files import atomic_write_text
+
 
 class AssetCache:
     CATEGORY_DIRS = {
@@ -85,9 +87,8 @@ class AssetCache:
         self, video_fingerprint: str, payload: dict[str, object]
     ) -> Path:
         path = self.root / "analysis" / f"{video_fingerprint}.subtitle-region.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        atomic_write_text(
+            path, json.dumps(payload, ensure_ascii=False, sort_keys=True)
         )
         return path
 

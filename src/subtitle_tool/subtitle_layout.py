@@ -4,6 +4,7 @@ import re
 import unicodedata
 from pathlib import Path
 
+from .atomic_files import atomic_write_text
 from .srt import SubtitleSegment
 
 
@@ -101,8 +102,7 @@ def write_ass(
             f"{_format_ass_timestamp(segment.end_ms)},"
             f"Default,,0,0,0,,{text}"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def _wrap_text(text: str, max_width: int) -> list[str]:

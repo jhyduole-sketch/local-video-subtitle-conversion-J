@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import threading
 
+from .atomic_files import atomic_write_text
 from .srt import SubtitleSegment
 
 
@@ -131,13 +132,10 @@ class TranslationCache:
             },
         }
         with self._lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = path.with_suffix(".tmp")
-            temporary_path.write_text(
+            atomic_write_text(
+                path,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                encoding="utf-8",
             )
-            temporary_path.replace(path)
 
     def _path(
         self,

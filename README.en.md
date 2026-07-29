@@ -15,6 +15,7 @@ The project includes both a local Web UI and a CLI.
 - Translation validation, sentence-level retry, rate-limit handling, engine fallback, and cache reuse.
 - Multiple target languages in a single job.
 - SRT, switchable soft-subtitle MP4, or fixed-position burned-in subtitle MP4 output.
+- A multi-language soft-subtitle job muxes all tracks into one MP4 instead of copying the video once per language.
 - Original-subtitle position detection and placement of new burned-in subtitles above or below it.
 - Browser-based video preview, synchronized subtitle editing, and video regeneration.
 - Live progress, timestamps, cancellation, persistent job history, resume support, and categorized caches.
@@ -115,11 +116,13 @@ output/<video-name>.<timestamp>/
   <video-name>.<timestamp>.<target-language>.srt
   <video-name>.<timestamp>.<target-language>.default-sub.mp4
   <video-name>.<timestamp>.<target-language>.fixed-sub.mp4
+  <video-name>.<timestamp>.multilingual.default-sub.mp4
 ```
 
 - `*.srt`: external subtitle file.
 - `*.default-sub.mp4`: switchable soft subtitle; the original video stream is preserved.
 - `*.fixed-sub.mp4`: burned-in subtitle at a stable position; video re-encoding is required.
+- `*.multilingual.default-sub.mp4`: one original-quality video with multiple switchable subtitle tracks.
 
 Use IINA or VLC to verify soft subtitles. QuickTime may not display some MP4 subtitle tracks even when they are present.
 
@@ -132,7 +135,7 @@ Use IINA or VLC to verify soft subtitles. QuickTime may not display some MP4 sub
 
 ## Limitations
 
-- No OCR for subtitles already burned into video pixels.
+- Burned-in subtitle OCR currently ships with a macOS Vision engine; other platforms need another compatible engine.
 - Generic URL downloads do not bypass login, DRM, payment, or regional restrictions.
 - Small local transcription and translation models prioritize speed over maximum quality.
 - Burned-in subtitles require video re-encoding and can take a long time for high-resolution videos.

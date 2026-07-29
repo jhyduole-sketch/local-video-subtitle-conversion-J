@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .atomic_files import atomic_write_text
+
 
 TIMESTAMP_RE = re.compile(
     r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})"
@@ -98,8 +100,7 @@ def render_srt(segments: list[SubtitleSegment]) -> str:
 
 
 def write_srt(path: Path, segments: list[SubtitleSegment]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_srt(segments), encoding="utf-8")
+    atomic_write_text(path, render_srt(segments))
 
 
 def replace_text(

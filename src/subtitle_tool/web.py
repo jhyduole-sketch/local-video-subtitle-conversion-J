@@ -199,6 +199,11 @@ def result_to_dict(result: PipelineResult) -> dict[str, object]:
             for language, path in (result.subtitled_video_paths or {}).items()
         },
         "inputVideoPath": _path_or_none(result.input_video_path),
+        "stageDurations": result.stage_durations or {},
+        "totalDurationSeconds": result.total_duration_seconds,
+        "multilingualSubtitledVideoPath": _path_or_none(
+            result.multilingual_subtitled_video_path
+        ),
     }
 
 

@@ -468,6 +468,12 @@ function renderJob(job) {
 function renderResults(result) {
   lastResult = result;
   const items = [];
+  if (Number.isFinite(result.totalDurationSeconds)) {
+    const stages = Object.entries(result.stageDurations || {})
+      .map(([name, seconds]) => `${stageLabel(name)} ${formatDurationSeconds(seconds)}`)
+      .join(" · ");
+    items.push(["处理耗时", `总计 ${formatDurationSeconds(result.totalDurationSeconds)}${stages ? ` · ${stages}` : ""}`]);
+  }
   if (result.downloadedVideoPath) {
     items.push(["下载视频", result.downloadedVideoPath]);
   }
@@ -483,6 +489,9 @@ function renderResults(result) {
     const videoKind = path.endsWith(".fixed-sub.mp4") ? "稳定硬字幕视频" : "软字幕视频";
     items.push([`${videoKind} ${lang}${engine ? ` · ${engine}` : ""}`, path]);
   });
+  if (result.multilingualSubtitledVideoPath) {
+    items.push(["多语言软字幕视频（播放器内切换）", result.multilingualSubtitledVideoPath]);
+  }
   Object.entries(result.failedLanguages || {}).forEach(([lang, message]) => {
     items.push([`失败 ${lang}`, message]);
   });
@@ -494,6 +503,21 @@ function renderResults(result) {
   results.querySelectorAll("[data-edit-subtitle]").forEach((button) => {
     button.addEventListener("click", () => openSubtitleEditor(button.dataset.editSubtitle || ""));
   });
+}
+
+function stageLabel(name) {
+  if (name === "input") return "输入";
+  if (name === "source") return "源字幕";
+  if (name === "video-output") return "视频输出";
+  if (name.startsWith("translation:")) return `翻译 ${name.slice("translation:".length)}`;
+  return name;
+}
+
+function formatDurationSeconds(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes ? `${minutes}分${String(remainder).padStart(2, "0")}秒` : `${remainder}秒`;
 }
 
 async function openSubtitleEditor(path) {

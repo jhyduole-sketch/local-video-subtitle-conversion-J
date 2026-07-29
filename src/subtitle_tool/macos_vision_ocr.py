@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -21,6 +23,17 @@ from .screen_ocr import (
     build_ocr_subtitle_segments,
 )
 from .srt import SubtitleSegment
+
+
+def adaptive_sample_interval_ms(
+    duration_seconds: float,
+    base_interval_ms: int,
+    max_frames: int,
+) -> int:
+    if max_frames <= 0:
+        return base_interval_ms
+    capped_interval = math.ceil(max(0.0, duration_seconds) * 1000 / max_frames)
+    return max(base_interval_ms, capped_interval)
 
 
 class MacVisionOcrEngine:
@@ -73,8 +86,15 @@ class MacVisionOcrEngine:
         helper_path.chmod(0o755)
         return helper_path
 
-    def frame_extraction_command(self, video_path: Path, frame_dir: Path) -> list[str]:
-        frames_per_second = 1_000 / self.sample_interval_ms
+    def frame_extraction_command(
+        self,
+        video_path: Path,
+        frame_dir: Path,
+        *,
+        sample_interval_ms: int | None = None,
+    ) -> list[str]:
+        interval_ms = sample_interval_ms or self.sample_interval_ms
+        frames_per_second = 1_000 / interval_ms
         fps_value = f"{frames_per_second:g}"
         return [
             "ffmpeg",
@@ -91,7 +111,9 @@ class MacVisionOcrEngine:
             str(frame_dir / "frame-%08d.jpg"),
         ]
 
-    def parse_helper_line(self, line: str) -> FrameOcrResult:
+    def parse_helper_line(
+        self, line: str, sample_interval_ms: int | None = None
+    ) -> FrameOcrResult:
         try:
             payload = json.loads(line)
             frame_index = int(payload["frameIndex"])
@@ -110,7 +132,8 @@ class MacVisionOcrEngine:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError(f"Vision OCR 返回了无法解析的数据: {line[:120]}") from exc
         return FrameOcrResult(
-            timestamp_ms=max(0, frame_index - 1) * self.sample_interval_ms,
+            timestamp_ms=max(0, frame_index - 1)
+            * (sample_interval_ms or self.sample_interval_ms),
             observations=observations,
         )
 
@@ -129,6 +152,19 @@ class MacVisionOcrEngine:
         if progress_callback:
             progress_callback("画面字幕 OCR：准备 macOS Vision 引擎")
         helper_path = self.ensure_helper()
+        duration_seconds = self._video_duration_seconds(video_path, cancel_check)
+        try:
+            max_frames = max(100, int(os.environ.get("SUBTITLE_TOOL_OCR_MAX_FRAMES", "3600")))
+        except ValueError:
+            max_frames = 3600
+        effective_interval_ms = adaptive_sample_interval_ms(
+            duration_seconds, self.sample_interval_ms, max_frames
+        )
+        if progress_callback and effective_interval_ms > self.sample_interval_ms:
+            progress_callback(
+                "画面字幕 OCR：长视频已自动降低抽帧密度，"
+                f"间隔 {effective_interval_ms / 1000:g} 秒，预计不超过 {max_frames} 帧"
+            )
 
         with TemporaryDirectory(prefix="subtitle-screen-ocr-") as temporary_dir:
             frame_dir = Path(temporary_dir) / "frames"
@@ -136,7 +172,11 @@ class MacVisionOcrEngine:
             if progress_callback:
                 progress_callback("画面字幕 OCR：正在抽取视频帧")
             extraction = run_process(
-                self.frame_extraction_command(video_path, frame_dir),
+                self.frame_extraction_command(
+                    video_path,
+                    frame_dir,
+                    sample_interval_ms=effective_interval_ms,
+                ),
                 cancel_check=cancel_check,
                 timeout_seconds=timeout_seconds_from_env(
                     "SUBTITLE_TOOL_OCR_FRAME_TIMEOUT_SECONDS", 1_800
@@ -166,7 +206,7 @@ class MacVisionOcrEngine:
             def receive_line(line: str) -> None:
                 if not line.strip():
                     return
-                frames.append(self.parse_helper_line(line))
+                frames.append(self.parse_helper_line(line, effective_interval_ms))
                 if progress_callback and (
                     len(frames) == 1
                     or len(frames) == frame_count
@@ -206,13 +246,38 @@ class MacVisionOcrEngine:
                 raise MediaError(f"macOS Vision OCR 识别失败: {detail}")
 
         segments = build_ocr_subtitle_segments(
-            frames, sample_interval_ms=self.sample_interval_ms
+            frames, sample_interval_ms=effective_interval_ms
         )
         if not segments:
             raise MediaError("画面字幕 OCR 没有识别到可用字幕，请检查画面文字是否清晰")
         if progress_callback:
             progress_callback(f"画面字幕 OCR：已合并为 {len(segments)} 条源字幕")
         return segments
+
+    def _video_duration_seconds(
+        self, video_path: Path, cancel_check: CancelCheck | None
+    ) -> float:
+        completed = run_process(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            cancel_check=cancel_check,
+            timeout_seconds=60,
+            operation_name="读取 OCR 视频时长",
+        )
+        if completed.returncode != 0:
+            return 0.0
+        try:
+            return max(0.0, float(completed.stdout.strip()))
+        except ValueError:
+            return 0.0
 
     @staticmethod
     def _swift_source_path() -> Path:

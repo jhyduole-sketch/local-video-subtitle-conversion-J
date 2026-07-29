@@ -8,10 +8,17 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from subtitle_tool.macos_vision_ocr import MacVisionOcrEngine  # noqa: E402
+from subtitle_tool.macos_vision_ocr import (  # noqa: E402
+    MacVisionOcrEngine,
+    adaptive_sample_interval_ms,
+)
 
 
 class MacVisionOcrEngineTests(unittest.TestCase):
+    def test_adaptive_interval_caps_long_video_frame_count(self):
+        self.assertEqual(adaptive_sample_interval_ms(600, 500, 3600), 500)
+        self.assertEqual(adaptive_sample_interval_ms(7200, 500, 3600), 2000)
+
     def test_availability_is_optional_outside_macos(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "subtitle_tool.macos_vision_ocr.sys.platform", "linux"
@@ -54,6 +61,15 @@ class MacVisionOcrEngineTests(unittest.TestCase):
         self.assertEqual(command[0], "ffmpeg")
         self.assertIn("fps=2,scale=720:-2", command)
         self.assertEqual(command[-1], "/frames/frame-%08d.jpg")
+
+    def test_frame_command_accepts_adaptive_interval(self):
+        engine = MacVisionOcrEngine(Path("/cache"), sample_interval_ms=500)
+
+        command = engine.frame_extraction_command(
+            Path("/video/input.mp4"), Path("/frames"), sample_interval_ms=2000
+        )
+
+        self.assertIn("fps=0.5,scale=720:-2", command)
 
     def test_parses_helper_json_line_into_frame_result(self):
         engine = MacVisionOcrEngine(Path("/cache"), sample_interval_ms=500)

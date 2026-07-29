@@ -166,8 +166,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Translated subtitles [{language}]: {path}")
     for language, path in (result.subtitled_video_paths or {}).items():
         print(f"Subtitle video [{language}]: {path}")
+    if isinstance(result.multilingual_subtitled_video_path, Path):
+        print(f"Multilingual subtitle video: {result.multilingual_subtitled_video_path}")
     for language, message in result.failed_languages.items():
         print(f"Translation failed [{language}]: {message}", file=sys.stderr)
+    if isinstance(result.total_duration_seconds, (int, float)):
+        print(f"Total duration: {result.total_duration_seconds:.1f}s")
     return 0 if not result.failed_languages else 2
 
 

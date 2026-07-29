@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .atomic_files import atomic_output_path, commit_output
+
 from .errors import DependencyError, MediaError
 from .process_control import (
     CancelCheck,
@@ -258,8 +260,10 @@ def mux_subtitle_track(
 ) -> Path:
     ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    _run(
-        [
+    temporary_path = atomic_output_path(output_path)
+    try:
+        _run(
+            [
             "ffmpeg",
             "-y",
             "-i",
@@ -284,10 +288,52 @@ def mux_subtitle_track(
             f"title={title}",
             "-disposition:s:0",
             "default",
-            str(output_path),
-        ],
-        cancel_check,
-    )
+                str(temporary_path),
+            ],
+            cancel_check,
+        )
+        if temporary_path.exists():
+            commit_output(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return output_path
+
+
+def mux_subtitle_tracks(
+    video_path: Path,
+    subtitle_tracks: list[tuple[Path, str, str]],
+    output_path: Path,
+    cancel_check: CancelCheck | None = None,
+) -> Path:
+    if not subtitle_tracks:
+        raise MediaError("At least one subtitle track is required.")
+    ensure_ffmpeg()
+    temporary_path = atomic_output_path(output_path)
+    command = ["ffmpeg", "-y", "-i", str(video_path)]
+    for subtitle_path, _language, _title in subtitle_tracks:
+        command.extend(["-i", str(subtitle_path)])
+    command.extend(["-map", "0:v", "-map", "0:a?"])
+    for input_index in range(1, len(subtitle_tracks) + 1):
+        command.extend(["-map", f"{input_index}:0"])
+    command.extend(["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text"])
+    for track_index, (_path, language, title) in enumerate(subtitle_tracks):
+        command.extend(
+            [
+                f"-metadata:s:s:{track_index}",
+                f"language={language}",
+                f"-metadata:s:s:{track_index}",
+                f"title={title}",
+                f"-disposition:s:{track_index}",
+                "default" if track_index == 0 else "0",
+            ]
+        )
+    command.append(str(temporary_path))
+    try:
+        _run(command, cancel_check)
+        if temporary_path.exists():
+            commit_output(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return output_path
 
 
@@ -304,6 +350,7 @@ def burn_subtitle_track(
         raise MediaError(f"Unknown hard subtitle encoding profile: {encoding_profile}")
     ffmpeg_binary = ass_ffmpeg_binary()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = atomic_output_path(output_path)
     ass_filter_path = _escape_filter_path(ass_path)
     duration = _probe_duration_seconds(video_path, cancel_check)
     selected_profile = encoding_profile
@@ -317,42 +364,47 @@ def burn_subtitle_track(
             if status_callback:
                 status_callback("VideoToolbox 不可用，已切换快速 CPU 编码")
 
-    completed = _run_burn_command(
-        _burn_command(
-            ffmpeg_binary,
-            video_path,
-            ass_filter_path,
-            output_path,
-            selected_profile,
-        ),
-        duration,
-        cancel_check,
-        progress_callback,
-        status_callback,
-    )
-    if completed.returncode != 0 and selected_profile == "hardware":
-        output_path.unlink(missing_ok=True)
-        if status_callback:
-            detail = _short_error(completed.stderr or completed.stdout)
-            status_callback(
-                f"VideoToolbox 编码失败（{detail}），已切换快速 CPU 编码重试"
-            )
+    try:
         completed = _run_burn_command(
             _burn_command(
                 ffmpeg_binary,
                 video_path,
                 ass_filter_path,
-                output_path,
-                "fast",
+                temporary_path,
+                selected_profile,
             ),
             duration,
             cancel_check,
             progress_callback,
             status_callback,
         )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise MediaError(f"{ffmpeg_binary} failed: {detail}")
+        if completed.returncode != 0 and selected_profile == "hardware":
+            temporary_path.unlink(missing_ok=True)
+            if status_callback:
+                detail = _short_error(completed.stderr or completed.stdout)
+                status_callback(
+                    f"VideoToolbox 编码失败（{detail}），已切换快速 CPU 编码重试"
+                )
+            completed = _run_burn_command(
+                _burn_command(
+                    ffmpeg_binary,
+                    video_path,
+                    ass_filter_path,
+                    temporary_path,
+                    "fast",
+                ),
+                duration,
+                cancel_check,
+                progress_callback,
+                status_callback,
+            )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise MediaError(f"{ffmpeg_binary} failed: {detail}")
+        if temporary_path.exists():
+            commit_output(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return output_path
 
 

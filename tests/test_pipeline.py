@@ -680,29 +680,15 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(cached_result.translation_engines["ja"], "OpenAI（缓存）")
         self.assertTrue(any("使用翻译缓存" in item for item in progress_messages))
 
-    def test_soft_subtitle_mux_overlaps_next_language_translation(self):
+    def test_multiple_soft_subtitles_are_muxed_into_one_video(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             input_path = Path(tmpdir) / "input.mp4"
             input_path.write_bytes(b"video")
             source_segments = [
                 SubtitleSegment(index=1, start_ms=0, end_ms=1000, text="hello"),
             ]
-            second_translation_started = threading.Event()
-            mux_observed_overlap = []
-            translation_calls = 0
-
             def fake_translate(segments, target_lang, source_lang=None):
-                nonlocal translation_calls
-                translation_calls += 1
-                if translation_calls == 2:
-                    second_translation_started.set()
                 return {1: f"translated {target_lang}"}
-
-            def fake_mux(*args, **kwargs):
-                if not mux_observed_overlap:
-                    mux_observed_overlap.append(
-                        second_translation_started.wait(timeout=0.5)
-                    )
 
             with patch(
                 "subtitle_tool.pipeline._load_source_segments",
@@ -711,9 +697,10 @@ class PipelineTests(unittest.TestCase):
                 "subtitle_tool.pipeline.translate_segments",
                 side_effect=fake_translate,
             ), patch(
-                "subtitle_tool.pipeline.mux_subtitle_track",
-                side_effect=fake_mux,
-            ) as mux:
+                "subtitle_tool.pipeline.mux_subtitle_track"
+            ) as single_mux, patch(
+                "subtitle_tool.pipeline.mux_subtitle_tracks"
+            ) as multi_mux:
                 result = run_pipeline(
                     PipelineOptions(
                         input_value=str(input_path),
@@ -727,9 +714,12 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(mux.call_count, 2)
-        self.assertEqual(mux_observed_overlap, [True])
-        self.assertEqual(set(result.subtitled_video_paths), {"ja", "fr"})
+        single_mux.assert_not_called()
+        multi_mux.assert_called_once()
+        tracks = multi_mux.call_args.args[1]
+        self.assertEqual([track[2] for track in tracks], ["ja", "fr"])
+        self.assertEqual(result.subtitled_video_paths, {})
+        self.assertTrue(result.multilingual_subtitled_video_path.name.endswith(".multilingual.default-sub.mp4"))
 
     def test_translated_srt_is_wrapped_and_timing_overlap_is_repaired(self):
         with tempfile.TemporaryDirectory() as tmpdir:

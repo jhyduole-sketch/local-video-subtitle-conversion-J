@@ -13,11 +13,37 @@ from subtitle_tool.media import (  # noqa: E402
     ass_ffmpeg_binary,
     burn_subtitle_track,
     extract_audio,
+    mux_subtitle_tracks,
     sample_video_edge_frames,
 )
 
 
 class MediaTests(unittest.TestCase):
+    def test_mux_subtitle_tracks_adds_all_tracks_in_one_ffmpeg_call(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "subtitle_tool.media.ensure_ffmpeg"
+        ), patch(
+            "subtitle_tool.media._run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            output = mux_subtitle_tracks(
+                Path(tmpdir) / "video.mp4",
+                [
+                    (Path(tmpdir) / "ja.srt", "jpn", "ja"),
+                    (Path(tmpdir) / "en.srt", "eng", "en"),
+                ],
+                Path(tmpdir) / "multilingual.mp4",
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("-c:s"), 1)
+        self.assertEqual(command[command.index("-c:s") + 1], "mov_text")
+        self.assertIn("language=jpn", command)
+        self.assertIn("language=eng", command)
+        self.assertIn("-disposition:s:0", command)
+        self.assertIn("-disposition:s:1", command)
+        self.assertEqual(output.name, "multilingual.mp4")
+
     def test_extract_audio_forwards_cancel_check(self):
         cancel_check = lambda: False
         with tempfile.TemporaryDirectory() as tmpdir, patch(
