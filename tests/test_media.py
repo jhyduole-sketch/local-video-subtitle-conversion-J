@@ -13,12 +13,19 @@ from subtitle_tool.media import (  # noqa: E402
     ass_ffmpeg_binary,
     burn_subtitle_track,
     extract_audio,
+    extract_first_subtitle,
     mux_subtitle_tracks,
     sample_video_edge_frames,
 )
 
 
 class MediaTests(unittest.TestCase):
+    def test_extract_subtitle_uses_selected_absolute_stream_index(self):
+        with tempfile.TemporaryDirectory() as directory, patch("subtitle_tool.media.ensure_ffmpeg"), patch("subtitle_tool.media._run") as run:
+            extract_first_subtitle(Path(directory) / "video.mp4", Path(directory) / "selected.srt", stream_index=3)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-map") + 1], "0:3")
+
     def test_mux_subtitle_tracks_adds_all_tracks_in_one_ffmpeg_call(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "subtitle_tool.media.ensure_ffmpeg"

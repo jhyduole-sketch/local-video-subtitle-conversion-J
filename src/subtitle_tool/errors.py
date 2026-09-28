@@ -31,7 +31,7 @@ class ProcessTimeoutError(SubtitleToolError):
 
 
 def actionable_error_message(exc: Exception) -> str:
-    detail = str(exc).strip() or exc.__class__.__name__
+    detail = sanitize_diagnostic_text(str(exc).strip() or exc.__class__.__name__)
     normalized = detail.lower()
     if isinstance(exc, ProcessTimeoutError):
         return detail
@@ -53,11 +53,10 @@ def actionable_error_message(exc: Exception) -> str:
         )
     elif "local translation model is not cached" in normalized:
         advice = "所选本地翻译模型尚未安装。请按页面环境区给出的下载命令安装，或切换在线翻译。"
-    elif "download" in normalized and "failed" in normalized:
-        advice = (
-            "视频下载失败。请确认链接可以公开播放；如果网站需要登录、Cookie 或 DRM，"
-            "请先下载视频后通过上传功能处理。"
-        )
+    elif "download" in normalized or "extractor" in normalized or "drm" in normalized:
+        advice = classify_download_error(detail).user_message
     else:
         return detail
     return f"{advice} 技术信息：{detail}"
+from .download_capabilities import classify_download_error
+from .log_sanitizer import sanitize_diagnostic_text

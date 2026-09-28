@@ -20,6 +20,28 @@ class AssetCacheTests(unittest.TestCase):
 
         self.assertNotEqual(first, second)
 
+    def test_middle_content_changes_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "video.mp4"
+            path.write_bytes(b"a" * (3 * 1024 * 1024))
+            cache = AssetCache(Path(tmpdir) / "cache")
+            before = cache.file_fingerprint(path)
+            with path.open("r+b") as handle:
+                handle.seek(1500000)
+                handle.write(b"b")
+            self.assertNotEqual(before, cache.file_fingerprint(path))
+
+    def test_summary_tolerates_file_disappearing_during_stat(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache = AssetCache(root)
+            (root / "audio").mkdir()
+            vanished = root / "audio" / "missing.mp3"
+            with patch.object(Path, "rglob", return_value=iter([vanished])), patch.object(Path, "is_file", return_value=True):
+                summary = cache.summary()
+            self.assertEqual(summary["totalFiles"], 0)
+
     def test_materialize_video_keeps_cached_source_and_task_copy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

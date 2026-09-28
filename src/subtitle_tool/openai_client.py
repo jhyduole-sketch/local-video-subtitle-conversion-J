@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import math
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import OpenAIConfigError, ProviderRateLimitError, SubtitleToolError
+from .errors import CancellationError, OpenAIConfigError, ProviderRateLimitError, SubtitleToolError
 from .srt import SubtitleSegment
 
 
@@ -24,6 +26,7 @@ DEFAULT_ZAI_RATE_LIMIT_RETRY_SECONDS = 20.0
 DEFAULT_ZAI_RATE_LIMIT_RETRY_LIMIT = 3
 ProgressCallback = Callable[[str], None]
 CheckpointCallback = Callable[[dict[int, str]], None]
+CancelCheck = Callable[[], bool]
 _ZAI_REQUEST_LOCK = threading.Lock()
 
 
@@ -120,7 +123,9 @@ def translate_segments(
     target_lang: str,
     source_lang: str | None = None,
     model: str | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[int, str]:
+    _check_cancelled(cancel_check)
     client = build_client()
     translate_model = model or os.environ.get(
         "SUBTITLE_TOOL_TRANSLATE_MODEL", DEFAULT_TRANSLATE_MODEL
@@ -160,10 +165,17 @@ def translate_segments(
     }
 
     try:
-        content = _responses_json(client, translate_model, system_prompt, user_prompt, schema)
-    except AttributeError:
-        content = _chat_json(client, translate_model, system_prompt, user_prompt, schema)
+        _check_cancelled(cancel_check)
+        try:
+            content = _responses_json(client, translate_model, system_prompt, user_prompt, schema)
+        except AttributeError:
+            _check_cancelled(cancel_check)
+            content = _chat_json(client, translate_model, system_prompt, user_prompt, schema)
+        _check_cancelled(cancel_check)
+    except CancellationError:
+        raise
     except Exception as exc:
+        _check_cancelled(cancel_check)
         raise SubtitleToolError(f"OpenAI translation to {target_lang} failed: {exc}") from exc
 
     return _parse_translation_json(content, target_lang, segments, "OpenAI")
@@ -177,7 +189,9 @@ def translate_segments_with_zai(
     progress_callback: ProgressCallback | None = None,
     initial_translations: dict[int, str] | None = None,
     checkpoint_callback: CheckpointCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[int, str]:
+    _check_cancelled(cancel_check)
     client = build_zai_client()
     translate_model = model or os.environ.get(
         "ZAI_MODEL", DEFAULT_ZAI_TRANSLATE_MODEL
@@ -191,6 +205,7 @@ def translate_segments_with_zai(
         progress_callback,
         initial_translations,
         checkpoint_callback,
+        cancel_check,
     )
 
 
@@ -203,7 +218,9 @@ def _translate_segments_with_zai_batches(
     progress_callback: ProgressCallback | None = None,
     initial_translations: dict[int, str] | None = None,
     checkpoint_callback: CheckpointCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[int, str]:
+    _check_cancelled(cancel_check)
     expected_indexes = {segment.index for segment in segments}
     translations: dict[int, str] = {
         index: text
@@ -227,8 +244,9 @@ def _translate_segments_with_zai_batches(
         remaining_segments, max_segments, max_characters
     )
     for batch_index, batch in enumerate(batches, start=1):
+        _check_cancelled(cancel_check)
         if batch_index > 1:
-            _sleep_between_zai_requests(progress_callback)
+            _sleep_between_zai_requests(progress_callback, cancel_check)
         if progress_callback:
             progress_callback(
                 f"z.ai 翻译 {target_lang}: 第 {batch_index}/{len(batches)} 批"
@@ -241,6 +259,7 @@ def _translate_segments_with_zai_batches(
                 target_lang,
                 source_lang,
                 progress_callback,
+                cancel_check,
             )
         )
         if checkpoint_callback:
@@ -264,7 +283,7 @@ def _translate_segments_with_zai_batches(
             max(1, max_segments // 2),
             max(1, max_characters // 2),
         ):
-            _sleep_between_zai_requests(progress_callback)
+            _sleep_between_zai_requests(progress_callback, cancel_check)
             translations.update(
                 _translate_zai_batch(
                     client,
@@ -273,11 +292,13 @@ def _translate_segments_with_zai_batches(
                     target_lang,
                     source_lang,
                     progress_callback,
+                    cancel_check,
                 )
             )
             if checkpoint_callback:
                 checkpoint_callback(dict(translations))
 
+    _check_cancelled(cancel_check)
     _raise_if_missing(translations, target_lang, segments, "z.ai")
     return translations
 
@@ -289,7 +310,9 @@ def _translate_zai_batch(
     target_lang: str,
     source_lang: str | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> dict[int, str]:
+    _check_cancelled(cancel_check)
     payload = {
         "source_language": source_lang or "auto",
         "target_language": target_lang,
@@ -305,7 +328,7 @@ def _translate_zai_batch(
     )
     user_prompt = json.dumps(payload, ensure_ascii=False)
 
-    with _ZAI_REQUEST_LOCK:
+    with _zai_request_lock(cancel_check):
         content = _chat_json_object_with_rate_limit_retry(
             client,
             translate_model,
@@ -313,6 +336,7 @@ def _translate_zai_batch(
             user_prompt,
             target_lang,
             progress_callback,
+            cancel_check,
         )
 
     translations = _parse_translation_items(content, target_lang, "z.ai")
@@ -390,14 +414,21 @@ def _chat_json_object_with_rate_limit_retry(
     user_prompt: str,
     target_lang: str,
     progress_callback: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> str:
     retry_limit = _int_env(
         "ZAI_RATE_LIMIT_RETRY_LIMIT", DEFAULT_ZAI_RATE_LIMIT_RETRY_LIMIT, minimum=0
     )
     for attempt in range(retry_limit + 1):
         try:
-            return _chat_json_object(client, model, system_prompt, user_prompt)
+            _check_cancelled(cancel_check)
+            content = _chat_json_object(client, model, system_prompt, user_prompt)
+            _check_cancelled(cancel_check)
+            return content
+        except CancellationError:
+            raise
         except Exception as exc:
+            _check_cancelled(cancel_check)
             is_rate_limit = _is_rate_limit_error(exc)
             if not is_rate_limit:
                 raise SubtitleToolError(
@@ -415,7 +446,7 @@ def _chat_json_object_with_rate_limit_retry(
                     f"z.ai 触发限流，等待 {delay:g} 秒后重试 "
                     f"({attempt + 1}/{retry_limit})"
                 )
-            time.sleep(delay)
+            _interruptible_sleep(delay, cancel_check)
 
     raise SubtitleToolError(f"z.ai translation to {target_lang} failed after retries.")
 
@@ -507,12 +538,16 @@ def _api_timeout_seconds(env_name: str) -> float:
     if not value:
         return DEFAULT_API_TIMEOUT_SECONDS
     try:
-        return max(1.0, float(value))
+        parsed = float(value)
+        return max(1.0, parsed) if math.isfinite(parsed) else DEFAULT_API_TIMEOUT_SECONDS
     except ValueError:
         return DEFAULT_API_TIMEOUT_SECONDS
 
 
-def _sleep_between_zai_requests(progress_callback: ProgressCallback | None = None) -> None:
+def _sleep_between_zai_requests(
+    progress_callback: ProgressCallback | None = None,
+    cancel_check: CancelCheck | None = None,
+) -> None:
     delay = _float_env(
         "ZAI_REQUEST_DELAY_SECONDS", DEFAULT_ZAI_REQUEST_DELAY_SECONDS, minimum=0.0
     )
@@ -520,7 +555,44 @@ def _sleep_between_zai_requests(progress_callback: ProgressCallback | None = Non
         return
     if progress_callback:
         progress_callback(f"z.ai 控制请求频率，等待 {delay:g} 秒")
-    time.sleep(delay)
+    _interruptible_sleep(delay, cancel_check)
+
+
+def _check_cancelled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check and cancel_check():
+        raise CancellationError("Task was cancelled by user.")
+
+
+def _interruptible_sleep(delay: float, cancel_check: CancelCheck | None) -> None:
+    if cancel_check is None:
+        time.sleep(delay)
+        return
+    # 分段等待以响应取消；正在执行的同步 SDK 请求仍需返回或超时。
+    # Wait in short intervals for cancellation; an active synchronous SDK request must still return or time out.
+    remaining = delay
+    while remaining > 0:
+        _check_cancelled(cancel_check)
+        interval = min(0.1, remaining)
+        time.sleep(interval)
+        remaining -= interval
+    _check_cancelled(cancel_check)
+
+
+@contextmanager
+def _zai_request_lock(cancel_check: CancelCheck | None):
+    if cancel_check is None:
+        with _ZAI_REQUEST_LOCK:
+            yield
+        return
+    while True:
+        _check_cancelled(cancel_check)
+        if _ZAI_REQUEST_LOCK.acquire(timeout=0.1):
+            break
+    try:
+        _check_cancelled(cancel_check)
+        yield
+    finally:
+        _ZAI_REQUEST_LOCK.release()
 
 
 def _zai_rate_limit_retry_seconds(attempt: int) -> float:
@@ -552,6 +624,8 @@ def _float_env(env_name: str, default: float, minimum: float | None = None) -> f
     try:
         parsed = float(value)
     except ValueError:
+        return default
+    if not math.isfinite(parsed):
         return default
     if minimum is not None:
         return max(minimum, parsed)

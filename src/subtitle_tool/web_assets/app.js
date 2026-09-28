@@ -5,6 +5,7 @@ const copyLogButton = document.querySelector("#copyLogButton");
 const refreshHealth = document.querySelector("#refreshHealth");
 const healthList = document.querySelector("#healthList");
 const healthSummary = document.querySelector("#healthSummary");
+const firstRunHint = document.querySelector("#firstRunHint");
 const jobBadge = document.querySelector("#jobBadge");
 const activeJobId = document.querySelector("#activeJobId");
 const logBox = document.querySelector("#logBox");
@@ -37,6 +38,11 @@ const subtitlePosition = document.querySelector("#subtitlePosition");
 const subtitleVideoModeHint = document.querySelector("#subtitleVideoModeHint");
 const subtitleEncodingHint = document.querySelector("#subtitleEncodingHint");
 const avoidSubtitleOverlap = document.querySelector("#avoidSubtitleOverlap");
+const whisperUseGpu = document.querySelector("#whisperUseGpu");
+const whisperUseVad = document.querySelector("#whisperUseVad");
+const cacheLimitGb = document.querySelector("#cacheLimitGb");
+const saveSettingsButton = document.querySelector("#saveSettingsButton");
+const settingsStatus = document.querySelector("#settingsStatus");
 const subtitleEditorDialog = document.querySelector("#subtitleEditorDialog");
 const subtitleEditorPath = document.querySelector("#subtitleEditorPath");
 const subtitleEditorRows = document.querySelector("#subtitleEditorRows");
@@ -71,6 +77,7 @@ let editingSubtitlePath = "";
 let editingVideoPath = "";
 let lastResult = null;
 let confirmationResolver = null;
+let maxUploadBytes = 2 * 1024 ** 3;
 
 const cacheCategoryLabels = {
   videos: "视频",
@@ -100,6 +107,7 @@ clearHistoryButton.addEventListener("click", clearHistory);
 subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
 subtitleEncodingProfile.addEventListener("change", updateSubtitleEncodingHint);
 avoidSubtitleOverlap.addEventListener("change", handleAvoidOverlapChange);
+saveSettingsButton.addEventListener("click", saveLocalSettings);
 closeSubtitleEditorButton.addEventListener("click", closeSubtitleEditor);
 saveSubtitleButton.addEventListener("click", () => saveEditedSubtitles(false));
 saveRenderSubtitleButton.addEventListener("click", () => saveEditedSubtitles(true));
@@ -118,8 +126,10 @@ confirmationDialog.addEventListener("cancel", (event) => {
 });
 
 loadHealth();
-loadCache();
-loadHistory();
+loadFirstRunGuidance();
+// 先加载已保存的输出目录，再读取该目录的缓存与历史，避免启动时读取旧目录。
+// Load the saved output directory before its cache and history to avoid reading the previous directory.
+loadLocalSettings().then(() => Promise.all([loadCache(), loadHistory()]));
 renderLanguagePicker();
 syncWhisperPreset();
 updateSubtitleVideoModeHint();
@@ -240,11 +250,11 @@ async function cancelCurrentJob() {
 }
 
 async function uploadVideo(file) {
-  const data = new FormData();
-  data.append("video", file);
+  if (file.size > maxUploadBytes) throw new Error(`视频超过 ${formatBytes(maxUploadBytes)} 上传上限。`);
   const response = await fetch("/api/upload", {
     method: "POST",
-    body: data,
+    headers: { "Content-Type": "application/octet-stream", "X-Filename": encodeURIComponent(file.name) },
+    body: file,
   });
   const payload = await response.json();
   if (!response.ok) {
@@ -278,6 +288,69 @@ function formPayload() {
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
+}
+
+function localSettingsPayload() {
+  return {
+    outputDir: String(document.querySelector("#outDir").value || "output").trim(),
+    whisperModel: whisperModelInput.value.trim(),
+    whisperUseGpu: whisperUseGpu.checked,
+    whisperUseVad: whisperUseVad.checked,
+    subtitleVideoMode: subtitleVideoMode.value,
+    subtitlePosition: subtitlePosition.value,
+    subtitleEncodingProfile: subtitleEncodingProfile.value,
+    cacheLimitGb: cacheLimitGb.value,
+  };
+}
+
+function applyLocalSettings(settings) {
+  if (!settings || typeof settings !== "object") return;
+  const outputDir = document.querySelector("#outDir");
+  outputDir.value = settings.outputDir || outputDir.value;
+  whisperModelInput.value = settings.whisperModel || whisperModelInput.value;
+  whisperUseGpu.checked = settings.whisperUseGpu !== false;
+  whisperUseVad.checked = settings.whisperUseVad !== false;
+  subtitleVideoMode.value = settings.subtitleVideoMode || subtitleVideoMode.value;
+  subtitlePosition.value = settings.subtitlePosition || subtitlePosition.value;
+  subtitleEncodingProfile.value = settings.subtitleEncodingProfile || subtitleEncodingProfile.value;
+  cacheLimitGb.value = settings.cacheLimitGb || cacheLimitGb.value;
+  syncWhisperPreset();
+  updateSubtitleVideoModeHint();
+  updateSubtitleEncodingHint();
+}
+
+async function loadLocalSettings() {
+  try {
+    const response = await fetch("/api/settings");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "本地偏好读取失败");
+    applyLocalSettings(data.settings);
+    if (Number.isFinite(data.maxUploadBytes)) maxUploadBytes = data.maxUploadBytes;
+    if (Array.isArray(data.allowedOutputDirs)) {
+      document.querySelector("#outDir").title = `可用输出目录：${data.allowedOutputDirs.join("、")}`;
+    }
+  } catch (error) {
+    settingsStatus.textContent = `本地偏好读取失败：${error.message}`;
+  }
+}
+
+async function saveLocalSettings() {
+  saveSettingsButton.disabled = true;
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(localSettingsPayload()),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "保存本地偏好失败");
+    applyLocalSettings(data.settings);
+    settingsStatus.textContent = "本地偏好已保存。API Key、Cookie 和密码不会写入这里。";
+  } catch (error) {
+    settingsStatus.textContent = error.message;
+  } finally {
+    saveSettingsButton.disabled = false;
+  }
 }
 
 function applyWhisperPreset() {
@@ -445,6 +518,18 @@ function renderHealth(data) {
     .join("");
 }
 
+async function loadFirstRunGuidance() {
+  try {
+    const response = await fetch("/api/first-run-guidance");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "首次使用提示读取失败");
+    const steps = Array.isArray(data.steps) ? data.steps : [];
+    firstRunHint.textContent = steps.length ? `开始前：${steps.join("；")}` : "";
+  } catch (error) {
+    firstRunHint.textContent = "";
+  }
+}
+
 function renderJob(job) {
   activeJob = job;
   renderElapsed();
@@ -468,6 +553,21 @@ function renderJob(job) {
 function renderResults(result) {
   lastResult = result;
   const items = [];
+  if (Number.isFinite(result.processingEstimateSeconds)) {
+    const factors = Array.isArray(result.processingEstimateFactors)
+      ? result.processingEstimateFactors.join("、")
+      : "";
+    const range = Number.isFinite(result.processingEstimateLowerSeconds) && Number.isFinite(result.processingEstimateUpperSeconds)
+      ? `${formatDurationSeconds(result.processingEstimateLowerSeconds)}–${formatDurationSeconds(result.processingEstimateUpperSeconds)}`
+      : formatDurationSeconds(result.processingEstimateSeconds);
+    items.push(["处理预估", `${range}${factors ? ` · ${factors}` : ""}`]);
+  }
+  if (result.sourceQuality?.score !== undefined) {
+    const reasons = Array.isArray(result.sourceQuality.reasons)
+      ? result.sourceQuality.reasons.join("、")
+      : "";
+    items.push(["源字幕质量", `${result.sourceQuality.score} 分${reasons ? ` · ${reasons}` : ""}`]);
+  }
   if (Number.isFinite(result.totalDurationSeconds)) {
     const stages = Object.entries(result.stageDurations || {})
       .map(([name, seconds]) => `${stageLabel(name)} ${formatDurationSeconds(seconds)}`)
@@ -494,6 +594,12 @@ function renderResults(result) {
   }
   Object.entries(result.failedLanguages || {}).forEach(([lang, message]) => {
     items.push([`失败 ${lang}`, message]);
+  });
+  Object.entries(result.translationAttempts || {}).forEach(([lang, attempts]) => {
+    const summary = Array.isArray(attempts)
+      ? attempts.map((item) => `${item.engine || "翻译引擎"}:${item.outcome || "完成"}`).join(" → ")
+      : "";
+    if (summary) items.push([`翻译尝试 ${lang}`, summary]);
   });
   resultSummary.textContent = items.length ? `${items.length} 个结果` : "暂无结果";
   results.innerHTML = items.map(([kind, path, action]) => resultItem(kind, path, action)).join("");
@@ -702,7 +808,10 @@ async function loadCache() {
 }
 
 function renderCache(data) {
-  cacheSummaryLabel.textContent = formatBytes(data.totalBytes || 0);
+  const totalBytes = Number(data.totalBytes || 0);
+  const limitBytes = Math.max(1, Number(cacheLimitGb.value || 10)) * 1024 ** 3;
+  const overLimit = totalBytes > limitBytes;
+  cacheSummaryLabel.textContent = `${formatBytes(totalBytes)}${overLimit ? " · 超过提醒上限" : ""}`;
   cacheList.innerHTML = Object.entries(data.categories || {})
     .map(([category, detail]) => `
       <div class="data-row">
@@ -714,6 +823,12 @@ function renderCache(data) {
       </div>
     `)
     .join("");
+  if (overLimit) {
+    cacheList.insertAdjacentHTML(
+      "afterbegin",
+      `<div class="empty-row">缓存超过 ${escapeHtml(String(cacheLimitGb.value || 10))} GB 提醒上限。可按类别清理；成品输出目录不会被自动删除。</div>`,
+    );
+  }
   cacheList.querySelectorAll("[data-clear-cache]").forEach((button) => {
     button.addEventListener("click", () => clearCacheCategory(button.dataset.clearCache));
   });

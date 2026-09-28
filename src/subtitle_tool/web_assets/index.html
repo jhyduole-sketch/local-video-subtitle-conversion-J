@@ -162,6 +162,18 @@
             <p class="field-hint">固定位置仅在稳定硬字幕模式中保证生效。</p>
           </div>
 
+          <div class="field">
+            <label for="cacheLimitGb">缓存容量提醒（GB）</label>
+            <input id="cacheLimitGb" name="cacheLimitGb" type="number" min="1" max="500" value="10" />
+            <p class="field-hint">仅在缓存超过此容量时提示；不会自动删除你的文件。</p>
+          </div>
+
+          <div class="field settings-actions">
+            <label>本地偏好</label>
+            <button id="saveSettingsButton" class="small-button" type="button">保存本地偏好</button>
+            <p id="settingsStatus" class="field-hint">仅保存界面偏好，不保存 API Key、Cookie 或密码。</p>
+          </div>
+
           <div class="toggles span-all">
             <label><input id="whisperUseGpu" name="whisperUseGpu" type="checkbox" checked /> Metal/GPU 加速</label>
             <label><input id="whisperUseVad" name="whisperUseVad" type="checkbox" checked /> VAD 跳过静音</label>
@@ -210,6 +222,7 @@
               <span id="healthSummary" class="badge">检查中</span>
             </div>
             <div id="healthList" class="check-list"></div>
+            <p id="firstRunHint" class="field-hint"></p>
           </section>
 
           <section class="panel">

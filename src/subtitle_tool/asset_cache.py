@@ -4,12 +4,16 @@ from hashlib import sha256
 import json
 import os
 import shutil
+import stat
 from pathlib import Path
 
 from .atomic_files import atomic_write_text
 
 
 class AssetCache:
+    SCHEMA_VERSION = 2
+    FINGERPRINT_VERSION = "content-sha256-v2"
+
     CATEGORY_DIRS = {
         "videos": "videos",
         "audio": "audio",
@@ -27,15 +31,14 @@ class AssetCache:
         return self.root / "videos"
 
     def file_fingerprint(self, path: Path) -> str:
-        stat = path.stat()
+        # 流式读取全部字节；相同大小和首尾内容不能证明文件相同。
+        # Stream every byte: matching size and file ends do not identify content.
         digest = sha256()
-        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update((self.FINGERPRINT_VERSION + "\0").encode("ascii"))
         with path.open("rb") as handle:
-            digest.update(handle.read(1024 * 1024))
-            if stat.st_size > 1024 * 1024:
-                handle.seek(max(0, stat.st_size - 1024 * 1024))
-                digest.update(handle.read(1024 * 1024))
-        return digest.hexdigest()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return f"v{self.SCHEMA_VERSION}-" + digest.hexdigest()
 
     def audio_path(self, video_fingerprint: str) -> Path:
         return self.root / "audio" / f"{video_fingerprint}.mp3"
@@ -52,6 +55,7 @@ class AssetCache:
         transcription_profile: str | None = None,
     ) -> Path:
         identity = {
+            "schema": self.SCHEMA_VERSION,
             "video": video_fingerprint,
             "transcriber": transcriber,
             "source": source_lang or "auto",
@@ -98,12 +102,24 @@ class AssetCache:
         total_files = 0
         for name, directory_name in self.CATEGORY_DIRS.items():
             directory = self.root / directory_name
-            files = [path for path in directory.rglob("*") if path.is_file()] if directory.exists() else []
-            size = sum(path.stat().st_size for path in files)
-            categories[name] = {"bytes": size, "files": len(files)}
+            size = 0
+            count = 0
+            try:
+                for path in directory.rglob("*"):
+                    try:
+                        info = path.stat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        size += info.st_size
+                        count += 1
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            categories[name] = {"bytes": size, "files": count}
             total_bytes += size
-            total_files += len(files)
+            total_files += count
         return {
+            "schemaVersion": self.SCHEMA_VERSION,
             "root": str(self.root),
             "totalBytes": total_bytes,
             "totalFiles": total_files,

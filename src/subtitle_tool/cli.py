@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .env import load_dotenv
 from .errors import SubtitleToolError, actionable_error_message
+from .log_sanitizer import sanitize_diagnostic_text
 from .pipeline import PipelineOptions, run_pipeline
 from .translation_engines import TRANSLATOR_IDS
 
@@ -169,7 +170,29 @@ def main(argv: list[str] | None = None) -> int:
     if isinstance(result.multilingual_subtitled_video_path, Path):
         print(f"Multilingual subtitle video: {result.multilingual_subtitled_video_path}")
     for language, message in result.failed_languages.items():
-        print(f"Translation failed [{language}]: {message}", file=sys.stderr)
+        print(
+            f"Translation failed [{language}]: {sanitize_diagnostic_text(message, Path.home())}",
+            file=sys.stderr,
+        )
+    if isinstance(result.processing_estimate_seconds, int):
+        if isinstance(result.processing_estimate_lower_seconds, int):
+            print(f"Processing estimate: {result.processing_estimate_lower_seconds}–{result.processing_estimate_upper_seconds}s")
+        else:
+            print(f"Processing estimate: {result.processing_estimate_seconds}s")
+    if isinstance(result.source_quality, dict):
+        print(f"Source subtitle quality: {result.source_quality.get('score', '?')}/100")
+    attempts_by_language = (
+        result.translation_attempts
+        if isinstance(result.translation_attempts, dict)
+        else {}
+    )
+    for language, attempts in attempts_by_language.items():
+        summary = " -> ".join(
+            f"{item.get('engine', 'engine')}:{item.get('outcome', 'complete')}"
+            for item in attempts
+        )
+        if summary:
+            print(f"Translation attempts [{language}]: {summary}")
     if isinstance(result.total_duration_seconds, (int, float)):
         print(f"Total duration: {result.total_duration_seconds:.1f}s")
     return 0 if not result.failed_languages else 2

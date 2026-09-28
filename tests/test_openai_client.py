@@ -14,6 +14,7 @@ from subtitle_tool.openai_client import (  # noqa: E402
     _float_env,
     _parse_translation_json,
     translate_segments_with_zai,
+    translate_segments,
 )
 from subtitle_tool.srt import SubtitleSegment  # noqa: E402
 
@@ -202,6 +203,65 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual(requested_indexes, [2, 3])
         self.assertEqual(translations, {1: "ja 1", 2: "ja 2", 3: "ja 3"})
         self.assertEqual(checkpoints[-1], translations)
+
+    def test_cancel_before_provider_creation_makes_no_request(self):
+        from subtitle_tool.errors import CancellationError
+        for translate, builder in ((translate_segments_with_zai, "build_zai_client"), (translate_segments, "build_client")):
+            with self.subTest(provider=builder), patch("subtitle_tool.openai_client." + builder) as build:
+                with self.assertRaises(CancellationError):
+                    translate([], "ja", cancel_check=lambda: True)
+                build.assert_not_called()
+
+    def test_zai_rate_limit_wait_is_interruptible(self):
+        from subtitle_tool.errors import CancellationError
+        cancelled = False
+        def sleep(delay):
+            nonlocal cancelled
+            self.assertLessEqual(delay, 0.1)
+            cancelled = True
+        segments = [SubtitleSegment(1, 0, 1000, "hello")]
+        with patch("subtitle_tool.openai_client.build_zai_client", return_value=object()), patch(
+            "subtitle_tool.openai_client._chat_json_object", side_effect=RuntimeError("429")
+        ) as request, patch("subtitle_tool.openai_client.time.sleep", side_effect=sleep):
+            with self.assertRaises(CancellationError):
+                translate_segments_with_zai(segments, "ja", cancel_check=lambda: cancelled)
+            self.assertEqual(request.call_count, 1)
+
+    def test_cancellation_during_response_is_observed_before_return(self):
+        from subtitle_tool.errors import CancellationError
+        for translate, builder, request_name in (
+            (translate_segments_with_zai, "build_zai_client", "_chat_json_object"),
+            (translate_segments, "build_client", "_responses_json"),
+        ):
+            cancelled = False
+            def response(*args):
+                nonlocal cancelled
+                cancelled = True
+                return '{"items":[{"index":1,"text":"translated"}]}'
+            with self.subTest(provider=builder), patch("subtitle_tool.openai_client." + builder, return_value=object()), patch(
+                "subtitle_tool.openai_client." + request_name, side_effect=response
+            ):
+                with self.assertRaises(CancellationError):
+                    translate([SubtitleSegment(1, 0, 1000, "hello")], "ja", cancel_check=lambda: cancelled)
+
+    def test_cancellation_error_is_not_wrapped(self):
+        from subtitle_tool.errors import CancellationError
+        for translate, builder, request_name in (
+            (translate_segments_with_zai, "build_zai_client", "_chat_json_object"),
+            (translate_segments, "build_client", "_responses_json"),
+        ):
+            cancelled = CancellationError("cancel now")
+            with self.subTest(provider=builder), patch("subtitle_tool.openai_client." + builder, return_value=object()), patch(
+                "subtitle_tool.openai_client." + request_name, side_effect=cancelled
+            ):
+                with self.assertRaises(CancellationError) as raised:
+                    translate([SubtitleSegment(1, 0, 1000, "hello")], "ja")
+                self.assertIs(raised.exception, cancelled)
+
+    def test_nonfinite_timeout_falls_back_to_bounded_default(self):
+        for value in ("inf", "nan"):
+            with patch.dict("subtitle_tool.openai_client.os.environ", {"ZAI_TIMEOUT_SECONDS": value}):
+                self.assertEqual(_api_timeout_seconds("ZAI_TIMEOUT_SECONDS"), DEFAULT_API_TIMEOUT_SECONDS)
 
 
 if __name__ == "__main__":

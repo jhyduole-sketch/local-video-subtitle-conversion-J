@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import cgi
 import json
 import mimetypes
-import shutil
-import tempfile
+import os
+import sys
 import threading
 import time
 import uuid
@@ -22,8 +21,14 @@ from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError, actionable_error_message
 from .health import collect_health
 from .job_store import JobStore
+from .log_sanitizer import sanitize_diagnostic_text, sanitize_result_diagnostics
 from .runtime_paths import cache_root, state_database_path
-from .media_preview import build_media_response
+from .user_settings import default_settings_path, load_user_settings, save_user_settings
+from .user_settings import parse_boolean
+from .media_preview import build_media_response, VIDEO_SUFFIXES
+from .web_security import AccessPolicy, RequestError, content_length, is_loopback
+from .upload_store import UploadStore
+from .onboarding import first_run_guidance
 from .pipeline import (
     PipelineOptions,
     PipelineResult,
@@ -64,6 +69,12 @@ JOBS: dict[str, JobState] = {}
 JOB_LOCK = threading.Lock()
 JOB_STORE: JobStore | None = None
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running", "canceling"})
+UPLOADS = UploadStore(Path.cwd() / ".subtitle-tool-state" / "uploads")
+
+
+def default_access_policy() -> AccessPolicy:
+    root = Path.cwd().resolve()
+    return AccessPolicy(((root / "output").resolve(),), (root,))
 
 
 def _active_job_unlocked() -> JobState | None:
@@ -100,8 +111,19 @@ def _reserve_job(
 def create_pipeline_job(
     payload: dict[str, object], options: PipelineOptions
 ) -> JobState:
-    job = _reserve_job(dict(payload))
-    JOB_EXECUTOR.submit(_run_job, job.id, options)
+    input_path = Path(options.input_value)
+    managed_upload = UPLOADS.owns(input_path)
+    if managed_upload:
+        UPLOADS.claim(input_path)
+    try:
+        job = _reserve_job(dict(payload))
+        JOB_EXECUTOR.submit(_run_job, job.id, options)
+    except Exception:
+        if managed_upload:
+            # 任务冲突或提交失败时仅解除占用，保留上传供重试。
+            # On a job conflict or submission failure, release the claim but keep the upload for retry.
+            UPLOADS.release(input_path, delete=False)
+        raise
     return job
 
 
@@ -119,16 +141,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind.")
     parser.add_argument("--port", type=int, default=7860, help="Port to bind.")
+    parser.add_argument("--allow-output-dir", action="append", default=[], help="Additional allowed output directory.")
+    parser.add_argument("--allow-input-dir", action="append", default=[], help="Additional allowed local video directory.")
+    parser.add_argument("--max-upload-mb", type=int, default=2048, help="Maximum upload request size in MiB.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path.cwd() / ".env")
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     project_root = Path.cwd()
+    token = os.environ.get("SUBTITLE_TOOL_WEB_TOKEN") or None
+    if not is_loopback(args.host) and (not token or len(token) < 24):
+        parser.error("局域网模式需要在环境变量 SUBTITLE_TOOL_WEB_TOKEN 中设置至少 24 字符的访问口令。")
+    if args.max_upload_mb < 1:
+        parser.error("--max-upload-mb 必须大于零。")
+    settings = load_user_settings(_settings_path())
+    output_roots = tuple(Path(value).expanduser().resolve() for value in ["output", settings["outputDir"], *args.allow_output_dir])
+    policy = AccessPolicy(
+        output_roots, tuple(Path(value).expanduser().resolve() for value in [str(project_root), *args.allow_input_dir, *map(str, output_roots)]),
+        token=token, max_upload_bytes=args.max_upload_mb * 1024 ** 2,
+    )
     state_path = state_database_path(project_root, project_root / "output")
     configure_job_store(state_path)
+    UPLOADS.cleanup()
     server = ThreadingHTTPServer((args.host, args.port), SubtitleToolHandler)
+    server.access_policy = policy
     print(f"Subtitle tool web UI: http://{args.host}:{args.port}")
     try:
         server.serve_forever()
@@ -149,8 +188,8 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
     whisper_model_value = str(payload.get("whisperModel") or "").strip()
     whisper_vad_model_value = str(payload.get("whisperVadModel") or "").strip()
     source_lang = str(payload.get("sourceLang") or "").strip() or None
-    embed_subtitles = bool(payload.get("embedSubtitles"))
-    avoid_subtitle_overlap = bool(payload.get("avoidSubtitleOverlap"))
+    embed_subtitles = parse_boolean(payload.get("embedSubtitles", False), "embedSubtitles")
+    avoid_subtitle_overlap = parse_boolean(payload.get("avoidSubtitleOverlap", False), "avoidSubtitleOverlap")
     subtitle_video_mode = str(payload.get("subtitleVideoMode") or "soft")
     if embed_subtitles and avoid_subtitle_overlap:
         subtitle_video_mode = "hard"
@@ -162,14 +201,14 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         out_dir=out_dir,
         source=str(payload.get("source") or "auto"),
         output_format="srt",
-        force_download=bool(payload.get("forceDownload")),
-        download_only=bool(payload.get("downloadOnly")),
+        force_download=parse_boolean(payload.get("forceDownload", False), "forceDownload"),
+        download_only=parse_boolean(payload.get("downloadOnly", False), "downloadOnly"),
         transcriber=str(payload.get("transcriber") or "local-whisper"),
         whisper_model=Path(whisper_model_value).expanduser().resolve()
         if whisper_model_value
         else None,
-        whisper_use_gpu=bool(payload.get("whisperUseGpu", True)),
-        whisper_use_vad=bool(payload.get("whisperUseVad", True)),
+        whisper_use_gpu=parse_boolean(payload.get("whisperUseGpu", True), "whisperUseGpu"),
+        whisper_use_vad=parse_boolean(payload.get("whisperUseVad", True), "whisperUseVad"),
         whisper_vad_model=Path(whisper_vad_model_value).expanduser().resolve()
         if whisper_vad_model_value
         else None,
@@ -204,6 +243,13 @@ def result_to_dict(result: PipelineResult) -> dict[str, object]:
         "multilingualSubtitledVideoPath": _path_or_none(
             result.multilingual_subtitled_video_path
         ),
+        "processingEstimateSeconds": result.processing_estimate_seconds,
+        "processingEstimateFactors": result.processing_estimate_factors or [],
+        "processingEstimateLowerSeconds": result.processing_estimate_lower_seconds,
+        "processingEstimateUpperSeconds": result.processing_estimate_upper_seconds,
+        "processingEstimateHistorySamples": result.processing_estimate_history_samples,
+        "sourceQuality": result.source_quality or {},
+        "translationAttempts": result.translation_attempts or {},
     }
 
 
@@ -231,270 +277,6 @@ def create_subtitle_render_job(payload: dict[str, object]) -> JobState:
     JOB_EXECUTOR.submit(_run_subtitle_render_job, job.id, render_payload)
     return job
 
-
-class SubtitleToolHandler(BaseHTTPRequestHandler):
-    server_version = "SubtitleToolWeb/0.1"
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/":
-            self._serve_asset("index.html")
-            return
-        if parsed.path == "/api/health":
-            self._send_json(collect_health())
-            return
-        if parsed.path == "/api/jobs":
-            self._send_json(jobs_payload())
-            return
-        if parsed.path == "/api/cache":
-            query = parse_qs(parsed.query)
-            out_dir = Path(query.get("outDir", ["output"])[0]).expanduser().resolve()
-            self._send_json(cache_summary(out_dir))
-            return
-        if parsed.path == "/api/subtitles":
-            query = parse_qs(parsed.query)
-            try:
-                payload = subtitle_document_payload(
-                    query.get("outDir", ["output"])[0],
-                    query.get("path", [""])[0],
-                )
-                self._send_json(payload)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=400)
-            return
-        if parsed.path == "/api/media":
-            self._serve_media(parsed)
-            return
-        if parsed.path.startswith("/api/jobs/"):
-            self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
-            return
-        if parsed.path in {"/app.js", "/language_catalog.js", "/styles.css"}:
-            self._serve_asset(parsed.path.lstrip("/"))
-            return
-        self.send_error(404, "Not found")
-
-    def do_HEAD(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/media":
-            self._serve_media(parsed, include_body=False)
-            return
-        self.send_error(404, "Not found")
-
-    def do_POST(self) -> None:
-        path = urlparse(self.path).path
-        if path == "/api/subtitles/render":
-            try:
-                job = create_subtitle_render_job(self._read_json())
-                self._send_json({"jobId": job.id, "status": job.status}, status=202)
-            except ActiveJobError as exc:
-                self._send_active_job_conflict(exc.job)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=400)
-            return
-        if path == "/api/upload":
-            self._handle_upload()
-            return
-        if path == "/api/cache/clear":
-            try:
-                payload = self._read_json()
-                out_dir = Path(str(payload.get("outDir") or "output")).expanduser().resolve()
-                categories = [str(item) for item in payload.get("categories", [])]
-                self._send_json(clear_cache(out_dir, categories))
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=400)
-            return
-        if path == "/api/jobs/clear":
-            try:
-                self._send_json(clear_finished_jobs())
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=400)
-            return
-        if path.startswith("/api/jobs/") and path.endswith("/cancel"):
-            job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/cancel"))
-            self._cancel_job(job_id)
-            return
-        if path.startswith("/api/jobs/") and path.endswith("/resume"):
-            job_id = unquote(path.removeprefix("/api/jobs/").removesuffix("/resume"))
-            try:
-                resumed = resume_job(job_id)
-            except ActiveJobError as exc:
-                self._send_active_job_conflict(exc.job)
-                return
-            if not resumed:
-                self._send_json({"error": "Job cannot be resumed."}, status=409)
-                return
-            self._send_json({"jobId": resumed.id, "status": resumed.status}, status=202)
-            return
-        if path != "/api/run":
-            self.send_error(404, "Not found")
-            return
-        try:
-            payload = self._read_json()
-            options = options_from_payload(payload)
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=400)
-            return
-
-        try:
-            job = create_pipeline_job(payload, options)
-        except ActiveJobError as exc:
-            self._send_active_job_conflict(exc.job)
-            return
-        self._send_json({"jobId": job.id, "status": job.status}, status=202)
-
-    def do_PUT(self) -> None:
-        path = urlparse(self.path).path
-        if path != "/api/subtitles":
-            self.send_error(404, "Not found")
-            return
-        try:
-            payload = save_subtitle_payload(self._read_json())
-            self._send_json(payload)
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=400)
-
-    def _handle_upload(self) -> None:
-        try:
-            field = self._read_upload_file()
-            filename = safe_upload_filename(field.filename or "uploaded-video.mp4")
-            upload_dir = Path(tempfile.gettempdir()) / "subtitle-tool-uploads" / uuid.uuid4().hex
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            output_path = upload_dir / filename
-            with output_path.open("wb") as handle:
-                shutil.copyfileobj(field.file, handle)
-            if output_path.stat().st_size == 0:
-                raise SubtitleToolError("Uploaded video is empty.")
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=400)
-            return
-        self._send_json(
-            {
-                "path": str(output_path),
-                "filename": filename,
-                "size": output_path.stat().st_size,
-            }
-        )
-
-    def _serve_media(self, parsed, include_body: bool = True) -> None:
-        query = parse_qs(parsed.query)
-        try:
-            out_dir = Path(query.get("outDir", ["output"])[0]).expanduser().resolve()
-            path = Path(query.get("path", [""])[0])
-            response = build_media_response(out_dir, path, self.headers.get("Range"))
-        except Exception as exc:
-            self._send_json({"error": str(exc)}, status=400)
-            return
-
-        self.send_response(response.status)
-        self.send_header("Content-Type", response.content_type)
-        self.send_header("Content-Length", str(response.length))
-        self.send_header("Accept-Ranges", "bytes")
-        if response.content_range:
-            self.send_header("Content-Range", response.content_range)
-        self.end_headers()
-        if not include_body:
-            return
-        try:
-            with response.path.open("rb") as handle:
-                handle.seek(response.start)
-                remaining = response.length
-                while remaining > 0:
-                    chunk = handle.read(min(256 * 1024, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def log_message(self, format: str, *args: object) -> None:
-        print(f"[web] {self.address_string()} - {format % args}")
-
-    def _send_job(self, job_id: str) -> None:
-        with JOB_LOCK:
-            job = JOBS.get(job_id)
-            payload = _job_to_dict(job) if job else None
-        if not payload:
-            self._send_json({"error": "Job not found."}, status=404)
-            return
-        self._send_json(payload)
-
-    def _cancel_job(self, job_id: str) -> None:
-        cancelled = request_job_cancel(job_id)
-        with JOB_LOCK:
-            job = JOBS.get(job_id)
-            payload = _job_to_dict(job) if job else None
-        if not payload:
-            self._send_json({"error": "Job not found."}, status=404)
-            return
-        self._send_json({"cancelled": cancelled, "job": payload})
-
-    def _read_json(self) -> dict[str, object]:
-        length = int(self.headers.get("Content-Length") or "0")
-        raw = self.rfile.read(length)
-        if not raw:
-            return {}
-        payload = json.loads(raw.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("JSON body must be an object.")
-        return payload
-
-    def _read_upload_file(self) -> cgi.FieldStorage:
-        content_type = self.headers.get("Content-Type", "")
-        if "multipart/form-data" not in content_type:
-            raise SubtitleToolError("Upload request must use multipart/form-data.")
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": content_type,
-                "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
-            },
-        )
-        field = form["video"] if "video" in form else None
-        if isinstance(field, list):
-            field = field[0] if field else None
-        if field is None or not getattr(field, "filename", None):
-            raise SubtitleToolError("Upload request is missing a video file.")
-        return field
-
-    def _send_json(self, payload: dict[str, object], status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_active_job_conflict(self, job: JobState) -> None:
-        self._send_json(
-            {
-                "error": f"已有任务正在运行: {job.id}",
-                "activeJob": _job_to_dict(job),
-            },
-            status=409,
-        )
-
-    def _serve_asset(self, name: str) -> None:
-        try:
-            asset = resources.files("subtitle_tool").joinpath("web_assets").joinpath(name)
-            data = asset.read_bytes()
-        except FileNotFoundError:
-            self.send_error(404, "Not found")
-            return
-        content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        if name.endswith(".html"):
-            content_type = "text/html; charset=utf-8"
-        elif name.endswith(".css"):
-            content_type = "text/css; charset=utf-8"
-        elif name.endswith(".js"):
-            content_type = "application/javascript; charset=utf-8"
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
 
 def _run_subtitle_render_job(job_id: str, payload: dict[str, object]) -> None:
@@ -582,8 +364,19 @@ def _web_duration(seconds: float | None) -> str:
 
 
 def _run_job(job_id: str, options: PipelineOptions) -> None:
+    uploaded_input = Path(options.input_value)
+    input_retained = False
     try:
         _update_job(job_id, status="running", log="任务已启动", progress=1)
+        if UPLOADS.owns(uploaded_input):
+            # 先保留文件并持久化新路径，再允许清理原上传；失败后仍可重试。
+            # Retain the file and persist its new path before deleting the upload so failures remain retryable.
+            retained = UPLOADS.retain(uploaded_input, options.out_dir / ".inputs" / job_id, release_source=False)
+            options = replace(options, input_value=str(retained))
+            with JOB_LOCK:
+                JOBS[job_id].payload["input"] = str(retained)
+                _persist_job(JOBS[job_id])
+            input_retained = True
         options = replace(
             options,
             cancel_check=JOBS[job_id].cancel_event.is_set,
@@ -620,6 +413,8 @@ def _run_job(job_id: str, options: PipelineOptions) -> None:
             progress_message="任务失败",
         )
         return
+    finally:
+        UPLOADS.release(uploaded_input, delete=input_retained)
     _update_job(
         job_id,
         status="succeeded",
@@ -683,12 +478,12 @@ def _job_to_dict(job: JobState | None) -> dict[str, object] | None:
     return {
         "id": job.id,
         "status": job.status,
-        "logs": job.logs,
+        "logs": [sanitize_diagnostic_text(item, Path.home()) for item in job.logs],
         "progress": job.progress,
-        "progressMessage": job.progress_message,
+        "progressMessage": sanitize_diagnostic_text(job.progress_message, Path.home()),
         "cancelRequested": job.cancel_requested,
-        "result": job.result,
-        "error": job.error,
+        "result": sanitize_result_diagnostics(job.result),
+        "error": sanitize_diagnostic_text(job.error, Path.home()) if job.error else None,
         "createdAt": job.created_at,
         "updatedAt": job.updated_at,
         "resumedFrom": job.resumed_from,
@@ -728,8 +523,19 @@ def cache_summary(out_dir: Path) -> dict[str, object]:
     return AssetCache(cache_root(out_dir)).summary()
 
 
+def _settings_path() -> Path:
+    return default_settings_path(Path.cwd())
+
+
+def _first_run_guidance() -> dict[str, object]:
+    return first_run_guidance(collect_health(), _settings_path())
+
+
 def clear_cache(out_dir: Path, categories: list[str]) -> dict[str, object]:
-    return AssetCache(cache_root(out_dir)).clear(categories)
+    with JOB_LOCK:
+        if _active_job_unlocked():
+            raise RequestError("任务正在使用缓存，请在任务结束后清理。", 409)
+        return AssetCache(cache_root(out_dir)).clear(categories)
 
 
 def clear_finished_jobs() -> dict[str, int]:
@@ -848,6 +654,13 @@ def _format_elapsed(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+from . import web_http
+# 绑定当前服务实例，兼容导入与 python -m 启动共用同一任务状态。
+# Bind the active service instance so imports and python -m use the same job state.
+web_http.service = sys.modules[__name__]
+SubtitleToolHandler = web_http.SubtitleToolHandler
 
 
 if __name__ == "__main__":

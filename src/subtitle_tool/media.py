@@ -114,6 +114,31 @@ def _run(
     return completed
 
 
+def probe_duration_seconds(
+    video_path: Path, cancel_check: CancelCheck | None = None
+) -> float | None:
+    """尽力读取视频时长；无法预估不应阻止任务。
+    Read duration opportunistically; estimates must never block a task.
+    """
+    try:
+        completed = _run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            cancel_check,
+        )
+        return max(0.0, float(completed.stdout.strip()))
+    except (MediaError, ValueError):
+        return None
+
+
 def find_subtitle_streams(
     video_path: Path, cancel_check: CancelCheck | None = None
 ) -> list[SubtitleStream]:
@@ -152,6 +177,8 @@ def extract_first_subtitle(
     video_path: Path,
     output_path: Path,
     cancel_check: CancelCheck | None = None,
+    *,
+    stream_index: int | None = None,
 ) -> Path:
     ensure_ffmpeg()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +191,7 @@ def extract_first_subtitle(
             "-i",
             str(video_path),
             "-map",
-            "0:s:0",
+            f"0:{stream_index}" if stream_index is not None else "0:s:0",
             str(output_path),
         ],
         cancel_check,

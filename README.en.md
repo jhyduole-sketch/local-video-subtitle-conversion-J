@@ -6,6 +6,12 @@ A local-first subtitle workflow for macOS. Give it a local video, an uploaded fi
 
 The project includes both a local Web UI and a CLI.
 
+The Web service restricts local paths to server-configured directories and rejects cross-site requests. LAN mode requires `SUBTITLE_TOOL_WEB_TOKEN` (at least 24 characters); browser access uses an HttpOnly session cookie. Uploads are streamed with a default 2 GiB limit (`--max-upload-mb`), and task inputs are retained for resume. Add trusted directories using `--allow-input-dir` and `--allow-output-dir`.
+
+Source selection now respects embedded track languages and retains manual choices. Translation fallback preserves completed batches and checks cancellation between batches. Estimates show a range calibrated against local successful runs; cache identity hashes the full video content. Existing fingerprint-based analysis caches are rebuilt on first use after this upgrade.
+
+- [Development and maintenance (bilingual architecture, comment convention, and verification)](docs/开发与维护.md)
+
 ## Main Features
 
 - Local files, browser uploads, YouTube, Bilibili, and best-effort public URL downloads.
@@ -21,6 +27,9 @@ The project includes both a local Web UI and a CLI.
 - Live progress, timestamps, cancellation, persistent job history, resume support, and categorized caches.
 - Confirmed cleanup actions for finished job history, individual cache categories, or all caches without deleting generated outputs.
 - Duplicate-job protection across repeated clicks, page refreshes, and multiple LAN clients.
+- A local processing-time estimate, source-subtitle quality score, and per-language translation fallback record.
+- Safe local UI preferences for non-sensitive defaults only; API keys, cookies, and passwords are never stored there.
+- Download failures are categorized as DRM, login/Cookie, unsupported page, or network issues. The app does not read browser cookies or bypass protection.
 
 ## Requirements
 
@@ -88,7 +97,7 @@ Trusted local network access:
 env PYTHONPATH=src python3 -m subtitle_tool.web --host 0.0.0.0 --port 7860
 ```
 
-The current Web UI has no login layer. Do not expose it directly to the public Internet.
+Set `SUBTITLE_TOOL_WEB_TOKEN` before starting LAN mode and enter it on the access page. Use the machine's LAN IP address; the HTTP service is intended for a trusted local network.
 
 ## CLI Example
 

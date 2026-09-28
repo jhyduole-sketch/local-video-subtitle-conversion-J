@@ -6,6 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from random import randint
 import re
+import sys
+from time import monotonic
+from .estimate_history import record_processing_time
+from .processing_diagnostics import estimate_input
+from .input_resolution import resolve_input
+from .source_selection import load_source_segments
 from tempfile import TemporaryDirectory
 from typing import Callable, TypeVar
 
@@ -26,14 +32,17 @@ from .media import (
     find_subtitle_streams,
     mux_subtitle_track,
     mux_subtitle_tracks,
+    probe_duration_seconds,
 )
 from .openai_client import transcribe_audio, translate_segments, translate_segments_with_zai
 from .performance import StageTimer
 from .preflight import validate_processing_space
+from .processing_estimate import estimate_processing, format_estimate
 from .resource_scheduler import HEAVY_RESOURCE_SCHEDULER
 from .process_control import CancelCheck
 from .runtime_paths import cache_root
 from .screen_ocr import get_screen_ocr_engine, is_suspicious_transcript
+from .source_quality import score_source_segments
 from .srt import SubtitleSegment, read_srt, replace_text, write_srt
 from .subtitle_layout import layout_subtitles, write_ass
 from .talksmith import extract_scenario_id, is_talksmith_url, is_url, resolve_talksmith_input
@@ -43,6 +52,11 @@ from .translation_engines import (
     canonical_translator_id,
     translation_cache_provider,
     translator_label,
+)
+from .translation_scheduler import (
+    TranslationAttempt, classify_translation_failure, schedule_translation,
+    _deduplicate_translation_segments, _collapse_initial_translations,
+    _expand_deduplicated_translations,
 )
 from .video_subtitle_detection import (
     SubtitleRegionDetection,
@@ -101,17 +115,28 @@ class PipelineResult:
     stage_durations: dict[str, float] | None = None
     total_duration_seconds: float | None = None
     multilingual_subtitled_video_path: Path | None = None
+    processing_estimate_seconds: int | None = None
+    processing_estimate_factors: list[str] | None = None
+    processing_estimate_lower_seconds: int | None = None
+    processing_estimate_upper_seconds: int | None = None
+    processing_estimate_history_samples: int = 0
+    source_quality: dict[str, object] | None = None
+    translation_attempts: dict[str, list[dict[str, str]]] | None = None
 
 
 @dataclass
 class _TranslationRunState:
     zai_circuit_open: bool = False
     zai_failure_reason: str | None = None
+    checkpoint_engine: str | None = None
 
 
 def run_pipeline(options: PipelineOptions) -> PipelineResult:
     timer = StageTimer()
     _progress(options, "检查参数", 2)
+    for language in [options.source_lang, *options.target_langs]:
+        if language is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", language):
+            raise SubtitleToolError("语言标识只能包含字母、数字、连字符和下划线，长度不超过 32。")
     if options.output_format != "srt":
         raise SubtitleToolError("v1 only supports --format srt.")
     if options.source not in {"auto", "embedded", "audio", "screen-ocr"}:
@@ -146,21 +171,31 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         input_path, downloaded_video_path = _resolve_input(
             options, task_out_dir, timestamp, asset_cache
         )
-    video_fingerprint = asset_cache.file_fingerprint(input_path)
     _progress(options, f"视频已准备: {input_path.name}", 15)
-
     if options.download_only:
         _progress(options, "下载任务完成", 100)
         return PipelineResult(
-            source_subtitle_path=None,
-            translated_paths={},
-            failed_languages={},
-            source_kind="download",
-            downloaded_video_path=downloaded_video_path or input_path,
-            input_video_path=input_path,
-            stage_durations=timer.durations(),
-            total_duration_seconds=timer.total_duration_seconds(),
+            source_subtitle_path=None, translated_paths={}, failed_languages={}, source_kind="download",
+            downloaded_video_path=downloaded_video_path or input_path, input_video_path=input_path,
+            stage_durations=timer.durations(), total_duration_seconds=timer.total_duration_seconds(),
         )
+    video_fingerprint = asset_cache.file_fingerprint(input_path)
+    with timer.stage("input-analysis"):
+        duration_seconds = probe_duration_seconds(input_path, options.cancel_check)
+        processing_estimate, estimate_history_path = estimate_input(
+            options, input_path, asset_cache, video_fingerprint, duration_seconds,
+            _resolved_subtitle_video_mode(options),
+        )
+    processing_started = monotonic()
+    estimate_text = format_estimate(processing_estimate.seconds)
+    if processing_estimate.lower_seconds is not None:
+        estimate_text = f"约 {processing_estimate.lower_seconds}–{processing_estimate.upper_seconds} 秒"
+    _progress(
+        options,
+        f"处理预估: {estimate_text} · "
+        + "、".join(processing_estimate.factors),
+        15,
+    )
 
     required_bytes = validate_processing_space(
         input_path,
@@ -180,6 +215,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         source_segments, source_kind = _load_source_segments(
             options, input_path, asset_cache
         )
+    source_quality = score_source_segments(source_segments, options.source_lang).to_dict()
+    _progress(
+        options,
+        f"源字幕质量: {source_quality['score']} 分 · "
+        + "、".join(list(source_quality["reasons"])[:2]),
+        53,
+    )
     _progress(options, f"得到源字幕片段: {len(source_segments)} 条", 52)
     lang_suffix = options.source_lang or "auto"
     source_path = task_out_dir / f"{output_stem}.{timestamp}.source.{lang_suffix}.srt"
@@ -190,9 +232,9 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     subtitled_video_paths: dict[str, Path] = {}
     failed_languages: dict[str, str] = {}
     translation_engines: dict[str, str] = {}
+    translation_attempts: dict[str, list[dict[str, str]]] = {}
     translation_cache = TranslationCache(asset_cache.root / "translations")
     cache_provider = translation_cache_provider(options.translator)
-    resumable_translation = cache_provider in {"z-ai", "local-nllb-quality"}
     translation_run_state = _TranslationRunState()
     subtitle_video_mode = _resolved_subtitle_video_mode(options)
     multi_language_soft_video = (
@@ -239,6 +281,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     total_targets = max(len(options.target_langs), 1)
     try:
         for target_index, target_lang in enumerate(options.target_langs, start=1):
+            attempts: list[dict[str, str]] = []
             try:
                 timer.start(f"translation:{target_lang}")
                 base_percent = 56 + round((target_index - 1) * 36 / total_targets)
@@ -255,6 +298,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                         segment.index: segment.text for segment in source_segments
                     }
                     engine = "源字幕直出"
+                    attempts.append(TranslationAttempt(engine, "success").to_dict())
                 else:
                     partial = translation_cache.load_partial(
                         source_segments,
@@ -279,7 +323,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                     else:
                         initial_translations = (
                             partial.translations
-                            if partial and resumable_translation
+                            if partial
                             else None
                         )
                         if initial_translations:
@@ -301,10 +345,12 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                                 target_lang,
                                 cache_provider,
                                 values,
-                                translator_label(cache_provider),
+                                translation_run_state.checkpoint_engine or translator_label(cache_provider),
                             ),
                             final_progress_percent=translated_percent,
                             run_state=translation_run_state,
+                            attempt_callback=lambda attempt: attempts.append(attempt.to_dict()),
+                            initial_engine=partial.engine if partial and initial_translations else None,
                         )
                         translation_cache.store(
                             source_segments,
@@ -315,6 +361,9 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                             engine,
                         )
                 translation_engines[target_lang] = engine
+                if not attempts or attempts[-1].get("outcome") != "success":
+                    attempts.append(TranslationAttempt(engine, "success").to_dict())
+                translation_attempts[target_lang] = attempts
                 _progress(options, f"翻译完成: {target_lang}", translated_percent)
                 translated = layout_subtitles(
                     replace_text(source_segments, translations)
@@ -391,6 +440,14 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             except Exception as exc:
                 timer.finish(f"translation:{target_lang}")
                 failed_languages[target_lang] = str(exc)
+                if not attempts or attempts[-1].get("outcome") != "failed":
+                    attempts.append(
+                        TranslationAttempt(
+                            translator_label(canonical_translator_id(options.translator)),
+                            "failed", str(exc), classify_translation_failure(exc),
+                        ).to_dict()
+                    )
+                translation_attempts[target_lang] = attempts
                 _progress(options, f"翻译失败: {target_lang}: {exc}", 92)
     finally:
         if mux_executor:
@@ -473,6 +530,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         raise SubtitleToolError(f"All subtitle translations failed. {details}")
 
     _progress(options, "任务完成", 100)
+    if not failed_languages:
+        record_processing_time(estimate_history_path, processing_estimate, monotonic() - processing_started)
     stage_durations = timer.durations()
     total_duration_seconds = timer.total_duration_seconds()
     _progress(
@@ -493,6 +552,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
         stage_durations=stage_durations,
         total_duration_seconds=total_duration_seconds,
         multilingual_subtitled_video_path=multilingual_subtitled_video_path,
+        processing_estimate_seconds=processing_estimate.seconds,
+        processing_estimate_factors=processing_estimate.factors,
+        processing_estimate_lower_seconds=processing_estimate.lower_seconds,
+        processing_estimate_upper_seconds=processing_estimate.upper_seconds,
+        processing_estimate_history_samples=processing_estimate.history_samples,
+        source_quality=source_quality,
+        translation_attempts=translation_attempts,
     )
 
 
@@ -699,432 +765,34 @@ def _detection_from_payload(payload: dict[str, object]) -> SubtitleRegionDetecti
 
 
 def _translate_target(
-    options: PipelineOptions,
-    source_segments: list[SubtitleSegment],
-    target_lang: str,
-    progress_percent: int,
-    initial_translations: dict[int, str] | None = None,
-    checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
-    final_progress_percent: int | None = None,
-    run_state: _TranslationRunState | None = None,
-) -> tuple[dict[int, str], str]:
-    translation_segments, representative_indexes = _deduplicate_translation_segments(
-        source_segments
-    )
-    duplicate_count = len(source_segments) - len(translation_segments)
-    if duplicate_count:
-        _progress(
-            options,
-            f"重复字幕复用: {len(source_segments)} 条合并为 "
-            f"{len(translation_segments)} 条翻译，复用 {duplicate_count} 条",
-            progress_percent,
-        )
-
-    collapsed_initial = _collapse_initial_translations(
-        initial_translations, representative_indexes
-    )
-    live_progress = [progress_percent]
-    progress_end = max(progress_percent, final_progress_percent or progress_percent)
-
-    def report_checkpoint(values: dict[int, str]) -> None:
-        expanded = _expand_deduplicated_translations(values, representative_indexes)
-        if checkpoint_callback:
-            checkpoint_callback(expanded)
-        completed = min(len(expanded), len(source_segments))
-        if source_segments:
-            fraction = completed / len(source_segments)
-            live_progress[0] = max(
-                live_progress[0],
-                progress_percent + round((progress_end - progress_percent) * fraction),
-            )
-        _progress(
-            options,
-            f"翻译进度: {target_lang} · {completed}/{len(source_segments)}",
-            live_progress[0],
-        )
-
-    def engine_progress(message: str) -> None:
-        _progress(options, message, live_progress[0])
-
-    def finish(
-        values: dict[int, str], engine: str
-    ) -> tuple[dict[int, str], str]:
-        return (
-            _expand_deduplicated_translations(values, representative_indexes),
-            engine,
-        )
-
-    translator = canonical_translator_id(options.translator)
-    if translator == "local-transformer":
-        return finish(
-            _heavy_call(
-                options,
-                f"本地快速翻译 {target_lang}",
-                lambda: translate_segments_locally(
-                    translation_segments, options.source_lang, target_lang
-                ),
-            ),
-            "本地快速模型",
-        )
-    if translator == "local-nllb-quality":
-        model_name = NLLB_QUALITY_MODEL_NAME
-        engine = translator_label(translator)
-        _progress(options, f"加载{engine}并开始批量翻译", progress_percent)
-        return finish(
-            _heavy_call(
-                options,
-                f"本地 NLLB 翻译 {target_lang}",
-                lambda: translate_segments_with_nllb(
-                    translation_segments,
-                    options.source_lang,
-                    target_lang,
-                    model_name=model_name,
-                    progress_callback=engine_progress,
-                    initial_translations=collapsed_initial,
-                    checkpoint_callback=report_checkpoint,
-                ),
-            ),
-            engine,
-        )
-    if translator == "openai":
-        return finish(
-            translate_segments(
-                translation_segments,
-                target_lang=target_lang,
-                source_lang=options.source_lang,
-            ),
-            "OpenAI",
-        )
-
-    state = run_state or _TranslationRunState()
-    if state.zai_circuit_open:
-        reason = state.zai_failure_reason or "前一目标语言请求失败"
-        _progress(
-            options,
-            f"z.ai 已熔断，本语言直接使用本地模型: {reason}",
-            live_progress[0],
-        )
-    else:
-        try:
-            return finish(
-                translate_segments_with_zai(
-                    translation_segments,
-                    target_lang=target_lang,
-                    source_lang=options.source_lang,
-                    progress_callback=engine_progress,
-                    initial_translations=collapsed_initial,
-                    checkpoint_callback=report_checkpoint,
-                ),
-                "z.ai",
-            )
-        except Exception as zai_error:
-            state.zai_circuit_open = True
-            state.zai_failure_reason = str(zai_error)
-            _progress(
-                options,
-                f"z.ai 翻译未完成，已自动切换本地模型并为后续语言熔断: "
-                f"{zai_error}",
-                live_progress[0],
-            )
-
-    local_errors: list[str] = []
-    try:
-        translations = _heavy_call(
-            options,
-            f"本地快速翻译 {target_lang}",
-            lambda: translate_segments_locally(
-                translation_segments, options.source_lang, target_lang
-            ),
-        )
-        return finish(translations, "本地模型")
-    except Exception as local_error:
-        local_errors.append(str(local_error))
-        _progress(
-            options,
-            f"本地快速模型未完成，尝试本地 NLLB: {local_error}",
-            progress_percent,
-        )
-
-    try:
-        translations = _heavy_call(
-            options,
-            f"本地 NLLB 翻译 {target_lang}",
-            lambda: translate_segments_with_nllb(
-                translation_segments,
-                options.source_lang,
-                target_lang,
-                model_name=NLLB_QUALITY_MODEL_NAME,
-                progress_callback=engine_progress,
-                checkpoint_callback=report_checkpoint,
-            ),
-        )
-        return finish(translations, "本地 NLLB 1.3B")
-    except Exception as nllb_error:
-        local_errors.append(str(nllb_error))
-
-    _progress(
-        options,
-        "本地翻译未通过质量检查或不可用，已自动切换 OpenAI: "
-        + " | ".join(local_errors),
-        progress_percent,
-    )
-    return finish(
-        translate_segments(
-            translation_segments,
-            target_lang=target_lang,
-            source_lang=options.source_lang,
-        ),
-        "OpenAI",
+    options, source_segments, target_lang, progress_percent,
+    initial_translations=None, checkpoint_callback=None,
+    final_progress_percent=None, run_state=None, attempt_callback=None,
+    initial_engine=None,
+):
+    return schedule_translation(
+        options, source_segments, target_lang, progress_percent,
+        initial_translations=initial_translations,
+        checkpoint_callback=checkpoint_callback,
+        final_progress_percent=final_progress_percent,
+        run_state=run_state or _TranslationRunState(),
+        attempt_callback=attempt_callback, initial_engine=initial_engine,
+        dependencies=sys.modules[__name__],
     )
 
 
-def _deduplicate_translation_segments(
-    segments: list[SubtitleSegment],
-) -> tuple[list[SubtitleSegment], dict[int, int]]:
-    representatives: dict[str, int] = {}
-    representative_indexes: dict[int, int] = {}
-    unique_segments: list[SubtitleSegment] = []
-    for segment in segments:
-        normalized_text = " ".join(segment.text.split())
-        representative_index = representatives.get(normalized_text)
-        if representative_index is None:
-            representative_index = segment.index
-            representatives[normalized_text] = representative_index
-            unique_segments.append(segment)
-        representative_indexes[segment.index] = representative_index
-    return unique_segments, representative_indexes
+def _resolve_input(options, task_out_dir, timestamp, asset_cache):
+    return resolve_input(options, task_out_dir, timestamp, asset_cache, dependencies=sys.modules[__name__])
 
 
-def _collapse_initial_translations(
-    translations: dict[int, str] | None,
-    representative_indexes: dict[int, int],
-) -> dict[int, str] | None:
-    if not translations:
-        return None
-    collapsed: dict[int, str] = {}
-    for index, text in translations.items():
-        representative_index = representative_indexes.get(index)
-        if representative_index is not None and text.strip():
-            collapsed.setdefault(representative_index, text)
-    return collapsed or None
+def _load_source_segments(options, input_path, asset_cache):
+    return load_source_segments(options, input_path, asset_cache, dependencies=sys.modules[__name__])
 
 
-def _expand_deduplicated_translations(
-    translations: dict[int, str],
-    representative_indexes: dict[int, int],
-) -> dict[int, str]:
-    return {
-        index: translations[representative_index]
-        for index, representative_index in representative_indexes.items()
-        if representative_index in translations
-    }
-
-
-def _resolve_input(
-    options: PipelineOptions,
-    task_out_dir: Path,
-    timestamp: str,
-    asset_cache: AssetCache,
-) -> tuple[Path, Path | None]:
-    if is_talksmith_url(options.input_value):
-        _progress(options, "解析公开视频链接并下载视频", 8)
-        downloaded_path = resolve_talksmith_input(
-            options.input_value,
-            asset_cache.videos_dir,
-            options.force_download,
-            None,
-            options.cancel_check,
-        )
-        task_path = asset_cache.materialize_video(
-            downloaded_path,
-            task_out_dir / f"{extract_scenario_id(options.input_value)}.{timestamp}.mp4",
-        )
-        return task_path, task_path
-
-    if is_youtube_url(options.input_value):
-        _progress(options, "解析 YouTube 链接并下载视频", 8)
-        video = download_youtube_video(
-            options.input_value,
-            asset_cache.videos_dir,
-            options.force_download,
-            None,
-            options.cancel_check,
-            progress_callback=lambda message: _progress(options, message, 8),
-        )
-        task_path = asset_cache.materialize_video(
-            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
-        )
-        return task_path, task_path
-
-    if is_bilibili_url(options.input_value):
-        _progress(options, "解析 Bilibili 链接并下载视频", 8)
-        video = download_bilibili_video(
-            options.input_value,
-            asset_cache.videos_dir,
-            options.force_download,
-            None,
-            options.cancel_check,
-            progress_callback=lambda message: _progress(options, message, 8),
-        )
-        task_path = asset_cache.materialize_video(
-            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
-        )
-        return task_path, task_path
-
-    if is_url(options.input_value):
-        _progress(options, "未匹配专用站点，正在尝试通用网址解析", 8)
-        video = download_generic_video(
-            options.input_value,
-            asset_cache.videos_dir,
-            options.force_download,
-            None,
-            options.cancel_check,
-            progress_callback=lambda message: _progress(options, message, 8),
-        )
-        task_path = asset_cache.materialize_video(
-            video.path, task_out_dir / f"{video.video_id}.{timestamp}.mp4"
-        )
-        return task_path, task_path
-
-    input_path = Path(options.input_value).expanduser().resolve()
-    _progress(options, "检查本地视频文件", 8)
-    if not input_path.exists():
-        raise SubtitleToolError(f"Input video does not exist: {input_path}")
-    task_path = asset_cache.materialize_video(input_path, task_out_dir / input_path.name)
-    return task_path, None
-
-
-def _load_source_segments(
-    options: PipelineOptions, input_path: Path, asset_cache: AssetCache
-) -> tuple[list[SubtitleSegment], str]:
-    video_fingerprint = asset_cache.file_fingerprint(input_path)
-    if options.source == "screen-ocr":
-        return _load_screen_ocr_segments(
-            options, input_path, asset_cache, video_fingerprint
-        )
-
-    if options.source in {"auto", "embedded"}:
-        cached_embedded_path = asset_cache.source_subtitle_path(
-            video_fingerprint, "embedded"
-        )
-        if cached_embedded_path.exists():
-            cached_segments = read_srt(cached_embedded_path)
-            if cached_segments:
-                _progress(options, "使用缓存的内置源字幕", 48)
-                return cached_segments, "embedded-cache"
-        _progress(options, "检查视频内置字幕轨", 22)
-        streams = find_subtitle_streams(input_path, options.cancel_check)
-        if streams:
-            _progress(options, "发现内置字幕，正在导出", 30)
-            cached_embedded_path.parent.mkdir(parents=True, exist_ok=True)
-            extract_first_subtitle(
-                input_path, cached_embedded_path, options.cancel_check
-            )
-            segments = read_srt(cached_embedded_path)
-            if segments:
-                _progress(options, "已使用内置字幕作为源字幕", 48)
-                return segments, "embedded"
-            if options.source == "embedded":
-                raise MediaError("Embedded subtitle stream was found but produced no SRT segments.")
-        elif options.source == "embedded":
-            raise MediaError("No embedded subtitle stream found in the input video.")
-
-    if options.source in {"auto", "audio"}:
-        audio_path = asset_cache.audio_path(video_fingerprint)
-        if audio_path.exists() and audio_path.stat().st_size > 0:
-            _progress(options, "使用缓存音频", 34)
-        else:
-            audio_path.parent.mkdir(parents=True, exist_ok=True)
-            _progress(options, "正在抽取音频", 28)
-            try:
-                extract_audio(input_path, audio_path, options.cancel_check)
-            except Exception:
-                audio_path.unlink(missing_ok=True)
-                raise
-            _progress(options, "音频抽取完成，开始语音转写", 34)
-        transcription_profile = "standard"
-        if options.transcriber == "local-whisper" and options.whisper_use_vad:
-            transcription_profile = f"vad:{options.whisper_vad_model or DEFAULT_VAD_MODEL_PATH}"
-        transcript_path = asset_cache.transcript_path(
-            video_fingerprint,
-            options.transcriber,
-            options.source_lang,
-            options.whisper_model,
-            transcription_profile,
-        )
-        if transcript_path.exists():
-            segments = read_srt(transcript_path)
-            if segments:
-                if is_suspicious_transcript(segments):
-                    if options.source == "audio":
-                        raise MediaError(
-                            "语音转写结果高度重复，可能没有有效对白。"
-                            "请改用 --source screen-ocr 读取画面字幕。"
-                        )
-                    _progress(
-                        options,
-                        "缓存的语音字幕高度重复，自动切换画面字幕 OCR",
-                        40,
-                    )
-                    return _load_screen_ocr_segments(
-                        options, input_path, asset_cache, video_fingerprint
-                    )
-                _progress(options, "使用缓存的语音转写字幕", 48)
-                return segments, f"audio-{options.transcriber}-cache"
-        try:
-            if options.transcriber == "local-whisper":
-                segments = _heavy_call(
-                    options,
-                    "本地 Whisper 转写",
-                    lambda: transcribe_with_whisper_cpp(
-                        audio_path,
-                        options.source_lang,
-                        options.whisper_model,
-                        options.cancel_check,
-                        progress_callback=lambda message: _progress(options, message, 40),
-                        use_gpu=options.whisper_use_gpu,
-                        use_vad=options.whisper_use_vad,
-                        vad_model_path=options.whisper_vad_model,
-                    ),
-                )
-                source_kind = "audio-local-whisper"
-                _progress(options, "本地 Whisper 转写完成", 48)
-            else:
-                segments = transcribe_audio(audio_path, options.source_lang)
-                source_kind = "audio"
-                _progress(options, "OpenAI 转写完成", 48)
-        except CancellationError:
-            raise
-        except Exception as exc:
-            if options.source != "auto":
-                raise
-            _progress(
-                options,
-                f"语音转写未得到可用字幕，自动切换画面字幕 OCR: {exc}",
-                40,
-            )
-            return _load_screen_ocr_segments(
-                options, input_path, asset_cache, video_fingerprint
-            )
-        transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        write_srt(transcript_path, segments)
-        if not segments or is_suspicious_transcript(segments):
-            if options.source == "audio":
-                raise MediaError(
-                    "语音转写结果为空或高度重复，可能没有有效对白。"
-                    "请改用 --source screen-ocr 读取画面字幕。"
-                )
-            _progress(
-                options,
-                "语音字幕为空或高度重复，自动切换画面字幕 OCR",
-                48,
-            )
-            return _load_screen_ocr_segments(
-                options, input_path, asset_cache, video_fingerprint
-            )
-        return segments, source_kind
-
-    raise MediaError("No usable subtitle source found. Try --source audio.")
+def _source_quality_is_usable(
+    segments: list[SubtitleSegment], expected_language: str | None
+) -> bool:
+    return score_source_segments(segments, expected_language).score >= 35
 
 
 def _load_screen_ocr_segments(
@@ -1141,7 +809,8 @@ def _load_screen_ocr_segments(
         )
 
     source_kind = f"screen-ocr-{engine.engine_id}"
-    cached_path = asset_cache.source_subtitle_path(video_fingerprint, source_kind)
+    cache_kind = f"{source_kind}-{options.source_lang or 'auto'}"
+    cached_path = asset_cache.source_subtitle_path(video_fingerprint, cache_kind)
     if cached_path.exists():
         cached_segments = read_srt(cached_path)
         if cached_segments:

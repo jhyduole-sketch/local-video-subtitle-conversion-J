@@ -24,6 +24,144 @@ from subtitle_tool.video_subtitle_detection import SubtitleRegionDetection  # no
 
 
 class PipelineTests(unittest.TestCase):
+    def test_estimate_range_is_exposed_and_success_calibrates_history(self):
+        from subtitle_tool.estimate_history import load_history
+        from subtitle_tool.runtime_paths import cache_root
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "input.mp4"
+            video.write_bytes(b"video")
+            options = PipelineOptions(str(video), [], "en", root / "output", "embedded", "srt")
+            with patch("subtitle_tool.pipeline.probe_duration_seconds", return_value=10), patch("subtitle_tool.pipeline.monotonic", side_effect=[0, 5]), patch("subtitle_tool.pipeline._load_source_segments", return_value=([SubtitleSegment(1, 0, 1000, "Hello")], "embedded")):
+                result = run_pipeline(options)
+            self.assertIsInstance(getattr(result, "processing_estimate_lower_seconds", None), int)
+            self.assertGreaterEqual(result.processing_estimate_upper_seconds, result.processing_estimate_lower_seconds)
+            self.assertEqual(len(load_history(cache_root(options.out_dir) / "analysis" / "processing-estimates.json")), 1)
+
+    def test_language_path_traversal_is_rejected_before_creating_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            options = PipelineOptions("missing.mp4", ["../../escape"], "en", root / "output", "audio", "srt")
+            with self.assertRaises(SubtitleToolError):
+                run_pipeline(options)
+            self.assertFalse(options.out_dir.exists())
+
+    def test_embedded_prefers_matching_language_and_keeps_cache_separate(self):
+        from subtitle_tool.media import SubtitleStream
+        from subtitle_tool.srt import write_srt
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            cache = AssetCache(root / "cache")
+            options = PipelineOptions(str(video), [], "ja", root, "embedded", "srt")
+            expected = [SubtitleSegment(1, 0, 1000, "こんにちは")]
+            write_srt(cache.source_subtitle_path(cache.file_fingerprint(video), "embedded"), [SubtitleSegment(1, 0, 1000, "Hello")])
+            def extract(video, output, cancel, *, stream_index):
+                self.assertEqual(stream_index, 4)
+                write_srt(output, expected)
+            with patch("subtitle_tool.pipeline.find_subtitle_streams", return_value=[SubtitleStream(2, "subrip", "eng", None), SubtitleStream(4, "subrip", "jpn", None)]), patch("subtitle_tool.pipeline.extract_first_subtitle", side_effect=extract):
+                segments, _ = _load_source_segments(options, video, cache)
+            self.assertEqual(segments, expected)
+
+    def test_auto_compares_all_low_quality_candidates(self):
+        from subtitle_tool.srt import write_srt
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            cache = AssetCache(root / "cache")
+            embedded = [SubtitleSegment(i, i * 1000, i * 1000 + 900, "Repeat") for i in range(1, 10)]
+            audio = [SubtitleSegment(1, 0, 1000, "English caption")]
+            options = PipelineOptions(str(video), [], "ja", root, "auto", "srt")
+            write_srt(cache.source_subtitle_path(cache.file_fingerprint(video), "embedded-ja"), embedded)
+            with patch("subtitle_tool.pipeline.extract_audio"), patch("subtitle_tool.pipeline.transcribe_audio", return_value=audio), patch("subtitle_tool.pipeline._load_screen_ocr_segments", return_value=([SubtitleSegment(1, 0, 1000, "Bonjour")], "ocr")):
+                result, kind = _load_source_segments(options, video, cache)
+            self.assertEqual(result, audio)
+            self.assertEqual(kind, "audio")
+
+    def test_manual_whitespace_audio_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            options = PipelineOptions(str(video), [], "en", root, "audio", "srt")
+            with patch("subtitle_tool.pipeline.extract_audio"), patch("subtitle_tool.pipeline.transcribe_audio", return_value=[SubtitleSegment(1, 0, 1000, "  ")]):
+                with self.assertRaises(MediaError):
+                    _load_source_segments(options, video, AssetCache(root / "cache"))
+
+    def test_ocr_cache_is_specific_to_requested_language(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            cache = AssetCache(root / "cache")
+            options = PipelineOptions(str(video), [], "en", root, "screen-ocr", "srt")
+            engine = unittest.mock.Mock(engine_id="fixture", label="Fixture")
+            engine.recognize_video.side_effect = lambda video, language, **kw: [SubtitleSegment(1, 0, 1000, language)]
+            with patch("subtitle_tool.pipeline.get_screen_ocr_engine", return_value=engine):
+                _load_source_segments(options, video, cache)
+                result, _ = _load_source_segments(replace(options, source_lang="ja"), video, cache)
+            self.assertEqual(result[0].text, "ja")
+
+    def test_manual_audio_retains_low_quality_nonempty_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            expected = [SubtitleSegment(i, i * 1000, i * 1000 + 900, "Repeat") for i in range(1, 20)]
+            messages = []
+            options = PipelineOptions(str(video), [], "en", root, "audio", "srt", progress_callback=lambda message, _: messages.append(message))
+            with patch("subtitle_tool.pipeline.extract_audio"), patch("subtitle_tool.pipeline.transcribe_audio", return_value=expected):
+                segments, kind = _load_source_segments(options, video, AssetCache(root / "cache"))
+            self.assertEqual(segments, expected)
+            self.assertEqual(kind, "audio")
+            self.assertTrue(any("质量" in message for message in messages))
+
+    def test_auto_retains_embedded_candidate_when_later_sources_fail(self):
+        from subtitle_tool.srt import write_srt
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            expected = [SubtitleSegment(i, i * 1000, i * 1000 + 900, "Repeat") for i in range(1, 10)]
+            cache = AssetCache(root / "cache")
+            write_srt(cache.source_subtitle_path(cache.file_fingerprint(video), "embedded"), expected)
+            options = PipelineOptions(str(video), [], None, root, "auto", "srt")
+            with patch("subtitle_tool.pipeline.find_subtitle_streams", return_value=[]), patch("subtitle_tool.pipeline.extract_audio", side_effect=MediaError("No audio")), patch("subtitle_tool.pipeline.get_screen_ocr_engine", return_value=None):
+                segments, kind = _load_source_segments(options, video, cache)
+            self.assertEqual(segments, expected)
+            self.assertEqual(kind, "embedded-cache")
+
+    def test_translation_cancellation_never_invokes_fallback(self):
+        from subtitle_tool.pipeline import _translate_target
+        from subtitle_tool.errors import CancellationError
+        options = PipelineOptions("video", [], "en", Path("out"), "audio", "srt", translator="z-ai")
+        with patch("subtitle_tool.pipeline.translate_segments_with_zai", side_effect=CancellationError("cancel")), patch("subtitle_tool.pipeline.translate_segments_locally", side_effect=AssertionError("fallback after cancellation")):
+            with self.assertRaises(CancellationError):
+                _translate_target(options, [SubtitleSegment(1, 0, 1000, "Hello")], "ja", 60)
+
+    def test_translation_fallback_preserves_completed_checkpoints(self):
+        from subtitle_tool.pipeline import _translate_target
+        options = PipelineOptions("video", [], "en", Path("out"), "audio", "srt", translator="z-ai")
+        segments = [SubtitleSegment(1, 0, 1000, "Hello"), SubtitleSegment(2, 1000, 2000, "Goodbye")]
+        checkpoints = []
+        attempts = []
+        def interrupted(values, **kwargs):
+            kwargs["checkpoint_callback"]({1: "こんにちは"})
+            raise TimeoutError("connection lost")
+        def fallback(values, *_, **kwargs):
+            self.assertEqual([s.index for s in values], [2])
+            return {2: "さようなら"}
+        with patch("subtitle_tool.pipeline.translate_segments_with_zai", side_effect=interrupted), patch("subtitle_tool.pipeline.translate_segments_locally", side_effect=fallback):
+            result, engine = _translate_target(options, segments, "ja", 60, checkpoint_callback=checkpoints.append, attempt_callback=attempts.append)
+        self.assertEqual(result, {1: "こんにちは", 2: "さようなら"})
+        self.assertEqual(checkpoints[-1], result)
+        self.assertIn("z.ai", engine)
+        self.assertIn("本地", engine)
+        self.assertEqual([a.outcome for a in attempts], ["failed", "success"])
+
     def test_explicit_screen_ocr_uses_available_engine(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

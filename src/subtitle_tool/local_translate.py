@@ -96,7 +96,10 @@ MODEL_BY_PAIR = {
 
 
 def translate_segments_locally(
-    segments: list[SubtitleSegment], source_lang: str | None, target_lang: str
+    segments: list[SubtitleSegment], source_lang: str | None, target_lang: str,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+    checkpoint_callback: Callable[[dict[int, str]], None] | None = None,
 ) -> dict[int, str]:
     source = normalize_lang(source_lang)
     target = normalize_lang(target_lang)
@@ -118,6 +121,8 @@ def translate_segments_locally(
                 lambda text: f"{prompt_prefix}{text}",
                 {"max_new_tokens": 128, "num_beams": 4},
                 batch_size=_local_translation_batch_size(model_name),
+                progress_callback=progress_callback,
+                checkpoint_callback=checkpoint_callback,
             )
         )
     return translations
@@ -312,6 +317,8 @@ def _translate_batches(
             translations[segment.index] = translated or source_text
         offset += len(batch)
         batch_number += 1
+        # 每批发布断点，让后续失败仍可复用结果，并在调度回调处检查取消。
+        # Publish each batch checkpoint for reuse after failure and cancellation checks in the scheduler callback.
         if checkpoint_callback:
             checkpoint_callback(dict(translations))
         if progress_callback:

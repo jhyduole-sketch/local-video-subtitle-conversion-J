@@ -35,6 +35,24 @@ from subtitle_tool.web import (  # noqa: E402
 
 
 class WebTests(unittest.TestCase):
+    def test_result_payload_includes_estimate_quality_and_attempts(self):
+        result = PipelineResult(
+            source_subtitle_path=None,
+            translated_paths={},
+            failed_languages={},
+            source_kind="audio",
+            processing_estimate_seconds=42,
+            processing_estimate_factors=["本地视频"],
+            source_quality={"score": 88, "reasons": ["字幕文本结构正常"]},
+            translation_attempts={"ja": [{"engine": "z.ai", "outcome": "success"}]},
+        )
+
+        payload = result_to_dict(result)
+
+        self.assertEqual(payload["processingEstimateSeconds"], 42)
+        self.assertEqual(payload["sourceQuality"]["score"], 88)
+        self.assertEqual(payload["translationAttempts"]["ja"][0]["engine"], "z.ai")
+
     def test_web_source_selector_includes_screen_ocr(self):
         html = (
             Path(__file__).resolve().parents[1]
@@ -62,6 +80,14 @@ class WebTests(unittest.TestCase):
 
         self.assertIn("在线模型请求超时", message)
         self.assertIn("稍后重试", message)
+
+    def test_actionable_error_explains_protected_or_unsupported_download(self):
+        message = actionable_error_message(
+            SubtitleToolError("download failed: DRM protected content")
+        )
+
+        self.assertIn("DRM", message)
+        self.assertIn("本地视频", message)
 
     def test_web_ui_has_confirmed_history_and_cache_clear_actions(self):
         assets = (
@@ -153,6 +179,23 @@ class WebTests(unittest.TestCase):
             'runButton.textContent = isRunning ? "任务进行中" : "开始任务";',
             script,
         )
+
+    def test_web_ui_exposes_safe_local_settings_controls(self):
+        assets = Path(__file__).resolve().parents[1] / "src" / "subtitle_tool" / "web_assets"
+        html = (assets / "index.html").read_text(encoding="utf-8")
+        script = (assets / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="saveSettingsButton"', html)
+        self.assertIn('id="cacheLimitGb"', html)
+        self.assertIn('id="firstRunHint"', html)
+        self.assertIn('fetch("/api/settings"', script)
+        self.assertIn('fetch("/api/first-run-guidance"', script)
+
+    def test_first_run_guidance_reads_health_check_payload(self):
+        guidance = web._first_run_guidance()
+
+        self.assertIsInstance(guidance["steps"], list)
+        self.assertTrue(guidance["settingsPath"].endswith("settings.json"))
 
     def test_active_job_returns_newest_inflight_job(self):
         older = JobState(id="older-active", status="running", created_at=10.0)
