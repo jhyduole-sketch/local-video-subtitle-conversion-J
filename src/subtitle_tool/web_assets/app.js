@@ -32,6 +32,9 @@ const clearAllCacheButton = document.querySelector("#clearAllCacheButton");
 const historyList = document.querySelector("#historyList");
 const refreshHistoryButton = document.querySelector("#refreshHistoryButton");
 const clearHistoryButton = document.querySelector("#clearHistoryButton");
+const previousHistoryButton = document.querySelector("#previousHistoryButton");
+const nextHistoryButton = document.querySelector("#nextHistoryButton");
+const historyPageSummary = document.querySelector("#historyPageSummary");
 const subtitleVideoMode = document.querySelector("#subtitleVideoMode");
 const subtitleEncodingProfile = document.querySelector("#subtitleEncodingProfile");
 const subtitlePosition = document.querySelector("#subtitlePosition");
@@ -78,6 +81,14 @@ let editingVideoPath = "";
 let lastResult = null;
 let confirmationResolver = null;
 let maxUploadBytes = 2 * 1024 ** 3;
+const jobStream = new window.subtitleJobState.JobStream();
+const historyPages = new window.subtitleJobState.HistoryPages(50);
+let logTextNode = null;
+let logLineCount = 0;
+let logErrorNode = null;
+let activeMonitorTimer = null;
+let activeMonitorRequest = 0;
+let activeMonitorInFlight = false;
 
 const cacheCategoryLabels = {
   videos: "视频",
@@ -102,7 +113,9 @@ whisperPreset.addEventListener("change", applyWhisperPreset);
 whisperModelInput.addEventListener("input", syncWhisperPreset);
 refreshCacheButton.addEventListener("click", loadCache);
 clearAllCacheButton.addEventListener("click", clearAllCache);
-refreshHistoryButton.addEventListener("click", loadHistory);
+refreshHistoryButton.addEventListener("click", () => loadHistory(0));
+previousHistoryButton.addEventListener("click", () => loadHistory(historyPages.offset - historyPages.limit));
+nextHistoryButton.addEventListener("click", () => loadHistory(historyPages.offset + historyPages.limit));
 clearHistoryButton.addEventListener("click", clearHistory);
 subtitleVideoMode.addEventListener("change", handleSubtitleVideoModeChange);
 subtitleEncodingProfile.addEventListener("change", updateSubtitleEncodingHint);
@@ -183,6 +196,7 @@ async function submitJob(event) {
   event.preventDefault();
   if (submitInFlight || runButton.disabled) return;
   submitInFlight = true;
+  selectJob("", true);
   const payload = formPayload();
   setRunningState(true);
   updateProgress(0, "提交任务");
@@ -208,11 +222,12 @@ async function submitJob(event) {
     if (!response.ok) {
       if (data.activeJob) {
         adoptActiveJob(data.activeJob);
-        logBox.textContent = `${data.error || "已有任务正在运行"}\n已切换到当前任务。`;
+        progressMessage.textContent = data.error || "已切换到当前任务";
         return;
       }
       throw new Error(data.error || "任务提交失败");
     }
+    selectJob(data.jobId, true);
     currentJobId = data.jobId;
     activeJobId.textContent = data.jobId;
     setRunningState(true, "运行中", "running");
@@ -240,11 +255,11 @@ async function cancelCurrentJob() {
     if (!response.ok) {
       throw new Error(data.error || "停止任务失败");
     }
-    if (data.job) {
+    if (data.job && data.job.id === jobStream.jobId) {
       renderJob(data.job);
     }
   } catch (error) {
-    logBox.textContent += `\n停止失败: ${error.message}`;
+    progressMessage.textContent = `停止失败: ${error.message}`;
     stopButton.disabled = false;
   }
 }
@@ -470,31 +485,121 @@ function updateLanguagePickerSummary(selected) {
     extraCount > 0 ? `${visibleLabels} +${extraCount}` : visibleLabels;
 }
 
-async function pollJob(jobId) {
+function isJobRunning(job) {
+  return ["running", "queued", "canceling"].includes(job?.status);
+}
+
+function resetLogDisplay() {
+  logBox.textContent = "等待日志";
+  logTextNode = null;
+  logLineCount = 0;
+  logErrorNode = null;
+}
+
+function selectJob(jobId, reset = false) {
+  if (!jobStream.select(jobId, reset)) return false;
   window.clearTimeout(pollTimer);
+  stopActiveMonitor();
+  stopElapsedTimer();
+  activeJob = null;
+  activeJobId.textContent = jobId;
+  clearResults();
+  resetLogDisplay();
+  scheduleActiveMonitor();
+  return true;
+}
+
+function stopActiveMonitor() {
+  window.clearTimeout(activeMonitorTimer);
+  activeMonitorTimer = null;
+  activeMonitorRequest += 1;
+  activeMonitorInFlight = false;
+}
+
+function scheduleActiveMonitor() {
+  if (!currentJobId || currentJobId === jobStream.jobId) {
+    stopActiveMonitor();
+    return;
+  }
+  if (activeMonitorTimer !== null || activeMonitorInFlight) return;
+  const request = activeMonitorRequest;
+  activeMonitorTimer = window.setTimeout(() => monitorActiveJob(request), 1500);
+}
+
+async function monitorActiveJob(request) {
+  if (request !== activeMonitorRequest) return;
+  activeMonitorTimer = null;
+  activeMonitorInFlight = true;
   try {
-    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    // 查看旧任务时只读取运行状态，不改变历史分页、所选任务或日志游标。
+    // While viewing old tasks, read only active status without changing history pages, selection or log cursor.
+    const response = await fetch("/api/jobs?limit=1");
     const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data.error || "任务读取失败");
+    if (request !== activeMonitorRequest || submitInFlight) return;
+    if (!response.ok) throw new Error(data.error || "任务状态读取失败");
+    currentJobId = data.activeJob?.id || "";
+    setRunningState(Boolean(currentJobId), statusLabel(activeJob?.status), statusTone(activeJob?.status));
+    if (data.activeJob?.status === "canceling") stopButton.disabled = true;
+  } catch {
+    // 网络异常时保留运行锁，下一次轮询继续确认状态。
+    // Preserve the running lock on network errors and confirm status on the next poll.
+  } finally {
+    if (request === activeMonitorRequest) {
+      activeMonitorInFlight = false;
+      scheduleActiveMonitor();
     }
+  }
+}
+
+function appendJobLogs(chunk) {
+  if (chunk.reset) resetLogDisplay();
+  if (!chunk.lines.length) return;
+  if (!logTextNode) {
+    logTextNode = document.createTextNode("");
+    logBox.replaceChildren(logTextNode);
+  }
+  // 保留现有文本节点，仅追加新日志，避免每次轮询重建完整日志。
+  // Preserve the text node and append only new logs instead of rebuilding the full log on every poll.
+  logTextNode.appendData(`${logLineCount ? "\n" : ""}${chunk.lines.join("\n")}`);
+  logLineCount += chunk.lines.length;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+async function pollJob(jobId) {
+  if (jobStream.jobId !== jobId) return;
+  window.clearTimeout(pollTimer);
+  const request = jobStream.begin();
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}?logOffset=${request.offset}&logLimit=200`);
+    const data = await response.json();
+    if (!jobStream.isCurrent(request)) return;
+    if (!response.ok) throw new Error(data.error || "任务读取失败");
+    const chunk = jobStream.consume(request, data);
+    if (!chunk.accepted) return;
+    if (isJobRunning(data)) currentJobId = data.id;
+    else if (currentJobId === data.id) currentJobId = "";
     renderJob(data);
-    if (data.status === "running" || data.status === "queued" || data.status === "canceling") {
-      pollTimer = window.setTimeout(() => pollJob(jobId), 1500);
+    appendJobLogs(chunk);
+    if (chunk.hasMore || isJobRunning(data)) {
+      // 已结束任务也要读完剩余分块，再停止轮询。
+      // Drain remaining chunks even after the task reaches a terminal status.
+      pollTimer = window.setTimeout(() => pollJob(jobId), chunk.hasMore ? 0 : 1500);
     } else {
-      setRunningState(false, statusLabel(data.status), statusTone(data.status));
-      currentJobId = "";
-      stopElapsedTimer();
-      if (data.result) {
-        renderResults(data.result);
-        resultsPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (data.error && !logErrorNode) {
+        logErrorNode = document.createTextNode(`${logLineCount ? "\n" : ""}${data.error}`);
+        if (!logTextNode) logBox.replaceChildren(logErrorNode);
+        else logBox.appendChild(logErrorNode);
       }
+      stopElapsedTimer();
+      if (data.result) renderResults(data.result);
       loadHistory();
       loadCache();
     }
   } catch (error) {
-    setRunningState(true, "连接重试", "warn");
-    logBox.textContent += `\n状态读取失败，稍后重试: ${error.message}`;
+    if (!jobStream.isCurrent(request)) return;
+    jobBadge.textContent = "连接重试";
+    jobBadge.className = "badge warn";
+    progressMessage.textContent = `状态读取失败，稍后重试: ${error.message}`;
     pollTimer = window.setTimeout(() => pollJob(jobId), 3000);
   }
 }
@@ -534,20 +639,13 @@ function renderJob(job) {
   activeJob = job;
   renderElapsed();
   setRunningState(
-    job.status === "running" || job.status === "queued" || job.status === "canceling",
+    Boolean(currentJobId) || submitInFlight || isJobRunning(job),
     statusLabel(job.status),
     statusTone(job.status),
   );
-  if (job.status === "canceling") {
-    stopButton.disabled = true;
-  }
+  if (job.status === "canceling" && currentJobId === job.id) stopButton.disabled = true;
   updateProgress(job.progress || 0, job.progressMessage || statusLabel(job.status));
-  const lines = Array.isArray(job.logs) ? job.logs : [];
-  logBox.textContent = lines.length ? lines.join("\n") : "等待日志";
-  if (job.error) {
-    logBox.textContent += `\n${job.error}`;
-  }
-  logBox.scrollTop = logBox.scrollHeight;
+  if (isJobRunning(job) && !elapsedTimer) startElapsedTimer(job);
 }
 
 function renderResults(result) {
@@ -780,6 +878,7 @@ async function saveEditedSubtitles(regenerate) {
       const renderData = await renderResponse.json();
       if (!renderResponse.ok) throw new Error(renderData.error || "重新生成任务提交失败");
       subtitleEditorDialog.close();
+      selectJob(renderData.jobId, true);
       currentJobId = renderData.jobId;
       activeJobId.textContent = renderData.jobId;
       setRunningState(true, "排队", "running");
@@ -885,20 +984,47 @@ async function clearAllCache() {
   }
 }
 
-async function loadHistory() {
+async function loadHistory(offset = historyPages.offset) {
+  const request = historyPages.begin(offset);
+  const selectionGeneration = jobStream.generation;
+  previousHistoryButton.disabled = true;
+  nextHistoryButton.disabled = true;
+  historyPageSummary.textContent = "读取中";
   try {
-    const response = await fetch("/api/jobs");
+    const response = await fetch(`/api/jobs?offset=${request.offset}&limit=${historyPages.limit}`);
     const data = await response.json();
+    if (!historyPages.isCurrent(request)) return;
     if (!response.ok) throw new Error(data.error || "历史读取失败");
+    historyPages.accept(request, data);
+    if (historyPages.offset > 0 && historyPages.offset >= historyPages.total) {
+      return loadHistory(Math.max(0, Math.ceil(historyPages.total / historyPages.limit) - 1) * historyPages.limit);
+    }
     renderHistory(Array.isArray(data.jobs) ? data.jobs : []);
-    if (data.activeJob) {
-      adoptActiveJob(data.activeJob);
-    } else if (!currentJobId) {
-      setRunningState(false, "空闲", "idle");
+    renderHistoryPagination();
+    // 列表响应不能覆盖用户在请求期间新选中的任务。
+    // A list response must not override a task selected while that request was in flight.
+    if (selectionGeneration === jobStream.generation && !submitInFlight) {
+      if (data.activeJob) adoptActiveJob(data.activeJob);
+      else {
+        currentJobId = "";
+        stopActiveMonitor();
+        if (activeJob) renderJob(activeJob);
+        else setRunningState(false, "空闲", "idle");
+      }
     }
   } catch (error) {
+    if (!historyPages.isCurrent(request)) return;
     historyList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
+    renderHistoryPagination();
   }
+}
+
+function renderHistoryPagination() {
+  const page = historyPages.total ? Math.floor(historyPages.offset / historyPages.limit) + 1 : 0;
+  const count = Math.ceil(historyPages.total / historyPages.limit);
+  historyPageSummary.textContent = `第 ${page} / ${count} 页 · 共 ${historyPages.total} 个任务`;
+  previousHistoryButton.disabled = historyPages.offset === 0;
+  nextHistoryButton.disabled = !historyPages.hasMore;
 }
 
 function renderHistory(jobs) {
@@ -938,13 +1064,15 @@ async function clearHistory() {
     safetyNote: "不会删除 output 中生成的视频、字幕或任何缓存；正在排队和运行的任务会保留。",
   });
   if (!confirmed) return;
+  historyPages.begin(0);
   clearHistoryButton.disabled = true;
   clearHistoryButton.textContent = "清理中";
   try {
     const response = await fetch("/api/jobs/clear", { method: "POST" });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "历史清理失败");
-    await loadHistory();
+    if (jobStream.jobId && jobStream.jobId !== currentJobId) selectJob("", true);
+    await loadHistory(0);
   } catch (error) {
     historyList.innerHTML = `<div class="empty-row">${escapeHtml(error.message)}</div>`;
   } finally {
@@ -973,33 +1101,54 @@ function closeConfirmationDialog(confirmed) {
 }
 
 async function viewHistoryJob(jobId) {
-  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
-  const job = await response.json();
-  if (!response.ok) return;
-  renderJob(job);
-  if (job.result) renderResults(job.result);
+  selectJob(jobId, true);
+  return pollJob(jobId);
 }
 
 async function resumeHistoryJob(jobId) {
-  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" });
-  const data = await response.json();
-  if (!response.ok) {
-    if (data.activeJob) adoptActiveJob(data.activeJob);
-    return;
+  if (submitInFlight) return;
+  submitInFlight = true;
+  setRunningState(true, "提交中", "running");
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) {
+      if (data.activeJob) {
+        selectJob(data.activeJob.id, true);
+        adoptActiveJob(data.activeJob);
+        pollJob(data.activeJob.id);
+        return;
+      }
+      throw new Error(data.error || "继续任务失败");
+    }
+    selectJob(data.jobId, true);
+    currentJobId = data.jobId;
+    activeJobId.textContent = data.jobId;
+    setRunningState(true, "排队", "running");
+    startElapsedTimer({ id: data.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0 });
+    pollJob(data.jobId);
+    loadHistory(0);
+  } catch (error) {
+    progressMessage.textContent = error.message;
+    setRunningState(Boolean(currentJobId), "失败", "bad");
+  } finally {
+    submitInFlight = false;
   }
-  currentJobId = data.jobId;
-  activeJobId.textContent = data.jobId;
-  setRunningState(true, "排队", "running");
-  startElapsedTimer({ id: data.jobId, createdAt: Date.now() / 1000, elapsedSeconds: 0 });
-  pollJob(data.jobId);
-  loadHistory();
 }
 
 function adoptActiveJob(job) {
   if (!job || !job.id) return;
-  const changedJob = currentJobId !== job.id;
   currentJobId = job.id;
-  activeJobId.textContent = job.id;
+  // 浏览历史记录时只更新运行锁；同一任务的元数据刷新保留日志及游标。
+  // Update only the running lock while viewing history; same-job metadata preserves logs and cursor.
+  if (jobStream.jobId && jobStream.jobId !== job.id) {
+    runButton.disabled = true;
+    runButton.textContent = "任务进行中";
+    stopButton.disabled = job.status === "canceling";
+    scheduleActiveMonitor();
+    return;
+  }
+  const changedJob = selectJob(job.id);
   renderJob(job);
   startElapsedTimer(job);
   if (changedJob) pollJob(job.id);

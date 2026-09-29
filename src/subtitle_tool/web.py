@@ -20,7 +20,7 @@ from .env import load_dotenv
 from .asset_cache import AssetCache
 from .errors import CancellationError, SubtitleToolError, actionable_error_message
 from .health import collect_health
-from .job_store import JobStore
+from .job_store import JobStore, MissingJobError
 from .log_sanitizer import sanitize_diagnostic_text, sanitize_result_diagnostics
 from .runtime_paths import cache_root, state_database_path
 from .user_settings import default_settings_path, load_user_settings, save_user_settings
@@ -57,6 +57,7 @@ class JobState:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     payload: dict[str, object] = field(default_factory=dict)
     resumed_from: str | None = None
+    persisted_log_count: int = field(default=0, repr=False)
 
 
 class ActiveJobError(SubtitleToolError):
@@ -67,6 +68,7 @@ class ActiveJobError(SubtitleToolError):
 
 JOBS: dict[str, JobState] = {}
 JOB_LOCK = threading.Lock()
+SERVICE_STOPPING = threading.Event()
 JOB_STORE: JobStore | None = None
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running", "canceling"})
 UPLOADS = UploadStore(Path.cwd() / ".subtitle-tool-state" / "uploads")
@@ -94,6 +96,8 @@ def _reserve_job(
     logs: list[str] | None = None,
 ) -> JobState:
     with JOB_LOCK:
+        if SERVICE_STOPPING.is_set():
+            raise SubtitleToolError("服务正在停止，请重启后再提交任务。")
         existing = _active_job_unlocked()
         if existing:
             raise ActiveJobError(existing)
@@ -103,8 +107,10 @@ def _reserve_job(
             resumed_from=resumed_from,
             logs=list(logs or []),
         )
-        JOBS[job.id] = job
+        # 持久化成功后才发布任务，避免留下无人执行的占用。
+        # Publish only after persistence succeeds to avoid a reservation without a worker.
         _persist_job(job)
+        JOBS[job.id] = job
         return job
 
 
@@ -117,7 +123,7 @@ def create_pipeline_job(
         UPLOADS.claim(input_path)
     try:
         job = _reserve_job(dict(payload))
-        JOB_EXECUTOR.submit(_run_job, job.id, options)
+        _submit_job(job, _run_job, options)
     except Exception:
         if managed_upload:
             # 任务冲突或提交失败时仅解除占用，保留上传供重试。
@@ -125,6 +131,62 @@ def create_pipeline_job(
             UPLOADS.release(input_path, delete=False)
         raise
     return job
+
+
+def _submit_job(job: JobState, worker, argument) -> None:
+    try:
+        future = JOB_EXECUTOR.submit(worker, job.id, argument)
+    except Exception as exc:
+        _worker_failed(job.id, exc)
+        raise
+    # 捕获线程最终异常，保证没有执行者的任务不会继续占用队列。
+    # Observe final worker errors so a job without a worker cannot keep the queue occupied.
+    def completed(result):
+        if result.cancelled():
+            _worker_failed(job.id, CancellationError("Task cancelled before execution"))
+            return
+        error = result.exception()
+        if error is not None:
+            _worker_failed(job.id, error)
+    future.add_done_callback(completed)
+
+
+def _worker_failed(job_id: str, error: BaseException) -> None:
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return
+        canceled = job.cancel_requested or isinstance(error, CancellationError)
+        job.status = "canceled" if canceled else "failed"
+        job.error = None if canceled else actionable_error_message(error)
+        job.progress_message = "已停止" if canceled else "任务失败"
+        job.logs.append(_format_log_line(job, job.error or "任务已停止"))
+        job.updated_at = time.time()
+        try:
+            _persist_job(job)
+        except Exception as persist_error:
+            # 存储仍不可用时至少释放内存中的活动状态，并保留可见的诊断。
+            # If storage remains unavailable, release the active state and retain a visible diagnostic.
+            job.logs.append(_format_log_line(job, f"任务状态保存失败: {persist_error}"))
+
+
+def shutdown_jobs() -> None:
+    SERVICE_STOPPING.set()
+    with JOB_LOCK:
+        jobs = [job for job in JOBS.values() if job.status in ACTIVE_JOB_STATUSES]
+        for job in jobs:
+            job.cancel_requested = True
+            job.cancel_event.set()
+            job.status = "canceling"
+            job.progress_message = "服务正在停止，等待当前步骤结束"
+            job.updated_at = time.time()
+            try:
+                _persist_job(job)
+            except Exception as exc:
+                job.logs.append(_format_log_line(job, f"停止状态保存失败: {exc}"))
+    # 先通知取消，再等待线程收尾；已入队任务也运行取消检查以释放上传占用。
+    # Signal cancellation before joining; queued workers run their cancellation cleanup too.
+    JOB_EXECUTOR.shutdown(wait=True)
 
 
 def create_job_executor() -> ThreadPoolExecutor:
@@ -151,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path.cwd() / ".env")
     parser = build_parser()
     args = parser.parse_args(argv)
+    SERVICE_STOPPING.clear()
     project_root = Path.cwd()
     token = os.environ.get("SUBTITLE_TOOL_WEB_TOKEN") or None
     if not is_loopback(args.host) and (not token or len(token) < 24):
@@ -174,7 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\nStopping subtitle tool web UI.")
     finally:
-        server.server_close()
+        try:
+            shutdown_jobs()
+        finally:
+            server.server_close()
     return 0
 
 
@@ -274,7 +340,7 @@ def create_subtitle_render_job(payload: dict[str, object]) -> JobState:
     render_payload = dict(payload)
     render_payload["operation"] = "render-edited-subtitles"
     job = _reserve_job(render_payload)
-    JOB_EXECUTOR.submit(_run_subtitle_render_job, job.id, render_payload)
+    _submit_job(job, _run_subtitle_render_job, render_payload)
     return job
 
 
@@ -437,7 +503,13 @@ def _update_job(
     with JOB_LOCK:
         job = JOBS[job_id]
         if job.cancel_requested and status != "canceled":
-            raise CancellationError("Task was cancelled by user.")
+            if status in {"succeeded", "failed"}:
+                # 终态与取消在同一锁内裁决，完成瞬间的取消也必须落入终态。
+                # Resolve completion and cancellation under one lock so late cancellation is terminal.
+                status, log, progress_message = "canceled", "任务已停止", "已停止"
+                result, error, progress = None, None, None
+            else:
+                raise CancellationError("Task was cancelled by user.")
         if status:
             job.status = status
         if log:
@@ -472,13 +544,14 @@ def request_job_cancel(job_id: str) -> bool:
         return True
 
 
-def _job_to_dict(job: JobState | None) -> dict[str, object] | None:
+def _job_to_dict(job: JobState | None, *, include_logs: bool = True) -> dict[str, object] | None:
     if not job:
         return None
     return {
         "id": job.id,
         "status": job.status,
-        "logs": [sanitize_diagnostic_text(item, Path.home()) for item in job.logs],
+        "logs": [sanitize_diagnostic_text(item, Path.home()) for item in job.logs] if include_logs else [],
+        "logsIncluded": include_logs,
         "progress": job.progress,
         "progressMessage": sanitize_diagnostic_text(job.progress_message, Path.home()),
         "cancelRequested": job.cancel_requested,
@@ -495,27 +568,66 @@ def configure_job_store(path: Path) -> JobStore:
     global JOB_STORE
     store = JobStore(path)
     store.mark_inflight_interrupted()
-    restored = [_job_from_record(record) for record in store.list()]
     with JOB_LOCK:
         JOBS.clear()
-        JOBS.update({job.id: job for job in restored})
     JOB_STORE = store
     return store
 
 
+def _find_job_unlocked(job_id: str) -> JobState | None:
+    job = JOBS.get(job_id)
+    if job is None and JOB_STORE:
+        record = JOB_STORE.get(job_id, include_logs=False)
+        job = _job_from_record(record) if record else None
+    return job
+
+
+def job_payload(job_id: str, *, log_offset: int = 0, log_limit: int | None = None) -> dict[str, object] | None:
+    with JOB_LOCK:
+        job = _find_job_unlocked(job_id)
+        if job is None:
+            return None
+        payload = _job_to_dict(job, include_logs=False)
+        if job_id in JOBS:
+            total = len(job.logs)
+            start = min(log_offset, total)
+            lines = job.logs[start:] if log_limit is None else job.logs[start:start + log_limit]
+        else:
+            # 历史详情按需读日志，启动和列表请求不加载日志正文。
+            # Read historical logs on demand; startup and listing avoid loading log bodies.
+            if log_limit is None:
+                record = JOB_STORE.get(job_id)
+                all_logs = record["logs"] if record else []
+                total = len(all_logs)
+                lines = all_logs[log_offset:]
+            else:
+                lines, total = JOB_STORE.read_logs(job_id, start=log_offset, limit=log_limit)
+            start = min(log_offset, total)
+        payload.update(logs=[sanitize_diagnostic_text(line, Path.home()) for line in lines],
+                       logsIncluded=True, logOffset=start, nextLogOffset=start + len(lines),
+                       logTotal=total, hasMoreLogs=start + len(lines) < total)
+        return payload
+
+
 def list_job_payloads(limit: int = 50) -> list[dict[str, object]]:
-    with JOB_LOCK:
-        jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)
-        return [_job_to_dict(job) for job in jobs[:limit] if job is not None]
+    return jobs_payload(limit)["jobs"]
 
 
-def jobs_payload(limit: int = 50) -> dict[str, object]:
+def jobs_payload(limit: int = 50, offset: int = 0) -> dict[str, object]:
     with JOB_LOCK:
-        jobs = sorted(JOBS.values(), key=lambda item: item.created_at, reverse=True)
-        current = _active_job_unlocked()
+        if JOB_STORE:
+            records = JOB_STORE.list(limit=limit, offset=offset, include_logs=False)
+            jobs = [JOBS.get(str(record["id"])) or _job_from_record(record) for record in records]
+            total = JOB_STORE.count()
+        else:
+            ordered = sorted(JOBS.values(), key=lambda item: (item.created_at, item.id), reverse=True)
+            jobs = ordered[offset:offset + limit]
+            total = len(ordered)
         return {
-            "jobs": [_job_to_dict(job) for job in jobs[:limit] if job is not None],
-            "activeJob": _job_to_dict(current),
+            "jobs": [_job_to_dict(job, include_logs=False) for job in jobs],
+            "activeJob": _job_to_dict(_active_job_unlocked(), include_logs=False),
+            "offset": offset, "limit": limit, "total": total,
+            "hasMore": offset + len(jobs) < total,
         }
 
 
@@ -554,7 +666,7 @@ def clear_finished_jobs() -> dict[str, int]:
 
 def resume_job(job_id: str) -> JobState | None:
     with JOB_LOCK:
-        original = JOBS.get(job_id)
+        original = _find_job_unlocked(job_id)
         if not original or original.status not in {"failed", "canceled", "interrupted"}:
             return None
         payload = dict(original.payload)
@@ -570,22 +682,30 @@ def resume_job(job_id: str) -> JobState | None:
         logs=[f"继续任务: {original.id}"],
     )
     if is_render_job:
-        JOB_EXECUTOR.submit(_run_subtitle_render_job, resumed.id, payload)
+        _submit_job(resumed, _run_subtitle_render_job, payload)
     else:
-        JOB_EXECUTOR.submit(_run_job, resumed.id, options)
+        _submit_job(resumed, _run_job, options)
     return resumed
 
 
 def _persist_job(job: JobState) -> None:
     if JOB_STORE:
-        JOB_STORE.save(_job_record(job))
+        # 只发送新增日志；事务成功后再前移游标，失败重试不会漏记。
+        # Send only new entries and advance the cursor after commit so retries cannot lose logs.
+        try:
+            JOB_STORE.save(_job_record(job, log_start=job.persisted_log_count), log_start=job.persisted_log_count)
+        except MissingJobError:
+            # 状态库被重建时只恢复缺失任务，已有任务的游标冲突仍报错。
+            # Replay only a missing job after database recreation; existing cursor conflicts remain errors.
+            JOB_STORE.save(_job_record(job), log_start=0)
+        job.persisted_log_count = len(job.logs)
 
 
-def _job_record(job: JobState) -> dict[str, object]:
+def _job_record(job: JobState, *, log_start: int = 0) -> dict[str, object]:
     return {
         "id": job.id,
         "status": job.status,
-        "logs": list(job.logs),
+        "logs": job.logs[log_start:],
         "result": job.result,
         "error": job.error,
         "progress": job.progress,

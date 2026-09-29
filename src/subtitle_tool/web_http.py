@@ -60,7 +60,7 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             if parsed.path.endswith("/resume"):
                 job_id = unquote(parsed.path.removeprefix("/api/jobs/").removesuffix("/resume"))
                 with service.JOB_LOCK:
-                    original = service.JOBS.get(job_id)
+                    original = service._find_job_unlocked(job_id)
                     payload = dict(original.payload) if original else None
                 if payload:
                     self._validate_payload(payload, render=payload.get("operation") == "render-edited-subtitles")
@@ -122,7 +122,10 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             self._send_json(service._first_run_guidance())
             return
         if parsed.path == "/api/jobs":
-            self._send_json(service.jobs_payload())
+            query = parse_qs(parsed.query)
+            limit = self._query_integer(query, "limit", 50, 1, 100)
+            offset = self._query_integer(query, "offset", 0, 0, 1000000000)
+            self._send_json(service.jobs_payload(limit=limit, offset=offset))
             return
         if parsed.path == "/api/cache":
             query = parse_qs(parsed.query)
@@ -146,7 +149,7 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/jobs/"):
             self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
             return
-        if parsed.path in {"/app.js", "/language_catalog.js", "/styles.css"}:
+        if parsed.path in {"/app.js", "/job_state.js", "/language_catalog.js", "/styles.css"}:
             self._serve_asset(parsed.path.lstrip("/"))
             return
         self.send_error(404, "Not found")
@@ -203,6 +206,9 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
                 resumed = service.resume_job(job_id)
             except service.ActiveJobError as exc:
                 self._send_active_job_conflict(exc.job)
+                return
+            except Exception as exc:
+                self._send_json({"error": sanitize_diagnostic_text(str(exc), Path.home())}, status=getattr(exc, "status", 400))
                 return
             if not resumed:
                 self._send_json({"error": "Job cannot be resumed."}, status=409)
@@ -307,9 +313,10 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         print(f"[web] {self.address_string()} - {format % args}")
 
     def _send_job(self, job_id: str) -> None:
-        with service.JOB_LOCK:
-            job = service.JOBS.get(job_id)
-            payload = service._job_to_dict(job) if job else None
+        query = parse_qs(urlparse(self.path).query)
+        offset = self._query_integer(query, "logOffset", 0, 0, 1000000000)
+        limit = self._query_integer(query, "logLimit", 200, 1, 1000) if "logLimit" in query or "logOffset" in query else None
+        payload = service.job_payload(job_id, log_offset=offset, log_limit=limit)
         if not payload:
             self._send_json({"error": "Job not found."}, status=404)
             return
@@ -317,13 +324,23 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
 
     def _cancel_job(self, job_id: str) -> None:
         cancelled = service.request_job_cancel(job_id)
-        with service.JOB_LOCK:
-            job = service.JOBS.get(job_id)
-            payload = service._job_to_dict(job) if job else None
+        payload = service.job_payload(job_id, log_offset=0, log_limit=0)
         if not payload:
             self._send_json({"error": "Job not found."}, status=404)
             return
         self._send_json({"cancelled": cancelled, "job": payload})
+
+    @staticmethod
+    def _query_integer(query, key: str, default: int, minimum: int, maximum: int) -> int:
+        values = query.get(key)
+        if values is None:
+            return default
+        if len(values) != 1 or not values[0].isascii() or not values[0].isdigit():
+            raise RequestError(f"{key} 必须是整数。")
+        value = int(values[0])
+        if not minimum <= value <= maximum:
+            raise RequestError(f"{key} 超出允许范围。")
+        return value
 
     def _read_json(self) -> dict[str, object]:
         length = content_length(self.headers, self.policy.max_json_bytes)

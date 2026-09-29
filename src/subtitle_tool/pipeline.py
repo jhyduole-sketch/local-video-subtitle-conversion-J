@@ -179,7 +179,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
             downloaded_video_path=downloaded_video_path or input_path, input_video_path=input_path,
             stage_durations=timer.durations(), total_duration_seconds=timer.total_duration_seconds(),
         )
-    video_fingerprint = asset_cache.file_fingerprint(input_path)
+    video_fingerprint = asset_cache.file_fingerprint(
+        input_path,
+        cancel_check=options.cancel_check,
+        progress_callback=lambda done, total: _progress(
+            options, f"计算视频内容指纹: {done * 100 // max(total, 1)}%", 15
+        ),
+    )
     with timer.stage("input-analysis"):
         duration_seconds = probe_duration_seconds(input_path, options.cancel_check)
         processing_estimate, estimate_history_path = estimate_input(
@@ -213,7 +219,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
     _progress(options, "读取字幕来源", 18)
     with timer.stage("source"):
         source_segments, source_kind = _load_source_segments(
-            options, input_path, asset_cache
+            options, input_path, asset_cache, video_fingerprint=video_fingerprint
         )
     source_quality = score_source_segments(source_segments, options.source_lang).to_dict()
     _progress(
@@ -785,8 +791,11 @@ def _resolve_input(options, task_out_dir, timestamp, asset_cache):
     return resolve_input(options, task_out_dir, timestamp, asset_cache, dependencies=sys.modules[__name__])
 
 
-def _load_source_segments(options, input_path, asset_cache):
-    return load_source_segments(options, input_path, asset_cache, dependencies=sys.modules[__name__])
+def _load_source_segments(options, input_path, asset_cache, video_fingerprint=None):
+    return load_source_segments(
+        options, input_path, asset_cache,
+        dependencies=sys.modules[__name__], video_fingerprint=video_fingerprint,
+    )
 
 
 def _source_quality_is_usable(

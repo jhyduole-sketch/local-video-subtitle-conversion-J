@@ -22,9 +22,26 @@ if TYPE_CHECKING:
     from .asset_cache import AssetCache
 
 
-def load_source_segments(options: PipelineOptions, input_path: Path, asset_cache: AssetCache, *, dependencies) -> tuple[list[SubtitleSegment], str]:
+def load_source_segments(
+    options: PipelineOptions,
+    input_path: Path,
+    asset_cache: AssetCache,
+    *,
+    dependencies,
+    video_fingerprint: str | None = None,
+) -> tuple[list[SubtitleSegment], str]:
     d = dependencies
-    fingerprint = asset_cache.file_fingerprint(input_path)
+    # 同次流水线复用已算出的内容指纹，独立调用仍读取当前文件内容。
+    # Reuse the current pipeline's content fingerprint; standalone calls still read current bytes.
+    fingerprint = video_fingerprint
+    if fingerprint is None:
+        fingerprint = asset_cache.file_fingerprint(
+            input_path,
+            cancel_check=options.cancel_check,
+            progress_callback=lambda done, total: d._progress(
+                options, f"计算视频内容指纹: {done * 100 // max(total, 1)}%", 18
+            ),
+        )
     candidates = []
     errors = []
     sources = ("embedded", "audio", "screen-ocr") if options.source == "auto" else (options.source,)

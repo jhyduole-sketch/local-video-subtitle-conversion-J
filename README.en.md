@@ -135,6 +135,10 @@ output/<video-name>.<timestamp>/
 
 Use IINA or VLC to verify soft subtitles. QuickTime may not display some MP4 subtitle tracks even when they are present.
 
+## Task reliability and long-job performance
+
+Task completion and cancellation now resolve atomically, failed submissions release the active reservation, and Ctrl+C requests cooperative worker shutdown. Each pipeline hashes its video once with cancellable progress. Logs are appended and fetched incrementally; history pages can display and resume older jobs beyond the latest 50. See the [bilingual implementation record](docs/2026-09-29-priority-optimizations.md).
+
 ## Documentation
 
 - [Chinese project overview](README.md)

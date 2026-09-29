@@ -6,8 +6,12 @@ import os
 import shutil
 import stat
 from pathlib import Path
+from time import monotonic
+from typing import Callable
 
 from .atomic_files import atomic_write_text
+from .errors import CancellationError
+from .process_control import CancelCheck
 
 
 class AssetCache:
@@ -30,14 +34,47 @@ class AssetCache:
     def videos_dir(self) -> Path:
         return self.root / "videos"
 
-    def file_fingerprint(self, path: Path) -> str:
+    def file_fingerprint(
+        self,
+        path: Path,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> str:
         # 流式读取全部字节；相同大小和首尾内容不能证明文件相同。
         # Stream every byte: matching size and file ends do not identify content.
+        def check_cancelled() -> None:
+            if cancel_check and cancel_check():
+                raise CancellationError("Task was cancelled by user.")
+
+        check_cancelled()
         digest = sha256()
         digest.update((self.FINGERPRINT_VERSION + "\0").encode("ascii"))
         with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            total_bytes = os.fstat(handle.fileno()).st_size
+            processed_bytes = 0
+            last_progress = monotonic()
+            if progress_callback:
+                progress_callback(0, total_bytes)
+            while True:
+                check_cancelled()
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
                 digest.update(chunk)
+                processed_bytes += len(chunk)
+                check_cancelled()
+                # 每块检查取消，但最多每半秒通知进度，避免频繁写任务状态。
+                # Check cancellation each chunk, but limit progress writes to twice per second.
+                if progress_callback and processed_bytes < total_bytes:
+                    now = monotonic()
+                    if now - last_progress >= 0.5:
+                        progress_callback(processed_bytes, total_bytes)
+                        last_progress = now
+            check_cancelled()
+            if progress_callback:
+                progress_callback(processed_bytes, total_bytes)
+        check_cancelled()
         return f"v{self.SCHEMA_VERSION}-" + digest.hexdigest()
 
     def audio_path(self, video_fingerprint: str) -> Path:

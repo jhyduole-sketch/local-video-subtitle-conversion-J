@@ -212,6 +212,11 @@
               </div>
             </div>
             <div id="historyList" class="data-list"></div>
+            <nav class="panel-tools" aria-label="任务历史分页">
+              <button id="previousHistoryButton" class="small-button" type="button" disabled>上一页</button>
+              <span id="historyPageSummary" class="muted" aria-live="polite">读取中</span>
+              <button id="nextHistoryButton" class="small-button" type="button" disabled>下一页</button>
+            </nav>
           </section>
         </div>
 
@@ -311,6 +316,7 @@
     </main>
 
     <script src="/language_catalog.js"></script>
+    <script src="/job_state.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
