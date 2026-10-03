@@ -32,6 +32,10 @@
       const lines = Array.isArray(job.logs) ? job.logs : [];
       const start = Number.isInteger(job.logOffset) ? job.logOffset : 0;
       const total = Number.isInteger(job.logTotal) ? job.logTotal : start + lines.length;
+      if (job.logTruncated && start > this.offset) {
+        this.offset = start + lines.length;
+        return { accepted: true, reset: true, lines, hasMore: Boolean(job.hasMoreLogs) || this.offset < total };
+      }
       // 服务端游标回退时从头重载；不可跨过未收到的日志。
       // Reload from zero after a server cursor reset; never skip unreceived logs.
       if ((total < this.offset && start !== 0) || start > this.offset) {

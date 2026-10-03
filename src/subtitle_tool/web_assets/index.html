@@ -178,6 +178,7 @@
             <label><input id="whisperUseGpu" name="whisperUseGpu" type="checkbox" checked /> Metal/GPU 加速</label>
             <label><input id="whisperUseVad" name="whisperUseVad" type="checkbox" checked /> VAD 跳过静音</label>
             <label><input id="avoidSubtitleOverlap" name="avoidSubtitleOverlap" type="checkbox" checked /> 自动避让原字幕</label>
+            <label><input id="forceRegenerate" name="forceRegenerate" type="checkbox" /> 重新转写和翻译</label>
             <label><input id="forceDownload" name="forceDownload" type="checkbox" /> 重新下载</label>
           </div>
             </div>
@@ -235,7 +236,8 @@
               <h2>任务</h2>
               <div class="panel-tools">
                 <span id="activeJobId" class="muted"></span>
-                <button id="copyLogButton" class="small-button" type="button">复制日志</button>
+                <button id="copyLogButton" class="small-button" type="button">复制当前日志</button>
+                <a id="downloadLogLink" class="small-button" hidden download>下载完整日志</a>
               </div>
             </div>
             <div class="progress-wrap">
@@ -247,6 +249,7 @@
                 <div id="progressBar" class="progress-bar"></div>
               </div>
             </div>
+            <p id="logWindowHint" class="muted">显示最近 1000 条日志；完整日志可下载。</p>
             <div id="logBox" class="log-box">等待任务</div>
           </section>
 
@@ -260,6 +263,10 @@
               </div>
             </div>
             <div id="cacheList" class="data-list"></div>
+            <div class="data-row"><div class="row-main"><strong>保留的上传原视频</strong>
+              <span id="retainedInputSummary">检查中</span>
+              <span>任务历史引用的文件会保留；清空不需要的历史后，可清理无引用原视频。</span></div>
+              <button id="clearRetainedInputsButton" class="small-button" type="button">清理无引用原视频</button></div>
           </section>
         </aside>
       </section>

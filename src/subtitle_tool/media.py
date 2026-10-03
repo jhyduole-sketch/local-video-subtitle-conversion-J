@@ -106,7 +106,10 @@ def _ffmpeg_has_encoder(binary: str, encoder_name: str) -> bool:
 def _run(
     command: list[str], cancel_check: CancelCheck | None = None
 ) -> subprocess.CompletedProcess[str]:
-    completed = run_process(command, cancel_check=cancel_check)
+    # ffprobe 的结构化输出保留完整；FFmpeg 诊断仅保留末尾。
+    # Preserve complete structured ffprobe output; retain only a tail of FFmpeg diagnostics.
+    limit = 1024 * 1024 if Path(command[0]).stem == "ffmpeg" else None
+    completed = run_process(command, cancel_check=cancel_check, capture_limit_bytes=limit)
     if completed.returncode != 0:
         command_name = command[0]
         detail = completed.stderr.strip() or completed.stdout.strip()

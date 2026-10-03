@@ -127,7 +127,7 @@ def _audio(options, video, cache, fingerprint, d):
     if options.transcriber == "local-whisper" and options.whisper_use_vad:
         profile = f"vad:{options.whisper_vad_model or d.DEFAULT_VAD_MODEL_PATH}"
     transcript = cache.transcript_path(fingerprint, options.transcriber, options.source_lang, options.whisper_model, profile)
-    if transcript.exists():
+    if transcript.exists() and not options.force_regenerate:
         segments = d.read_srt(transcript)
         if any(s.text.strip() for s in segments):
             d._progress(options, "使用缓存的语音转写字幕", 48)

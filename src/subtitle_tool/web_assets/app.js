@@ -300,6 +300,7 @@ function formPayload() {
     subtitleVideoMode: String(data.get("subtitleVideoMode") || "soft"),
     subtitleEncodingProfile: String(data.get("subtitleEncodingProfile") || "auto"),
     subtitlePosition: String(data.get("subtitlePosition") || "auto"),
+    forceRegenerate: Boolean(data.get("forceRegenerate")),
     forceDownload: Boolean(data.get("forceDownload")),
     downloadOnly: Boolean(data.get("downloadOnly")),
   };
@@ -489,7 +490,15 @@ function isJobRunning(job) {
   return ["running", "queued", "canceling"].includes(job?.status);
 }
 
+let visibleLogLines = [];
+let visibleLogCharacters = 0;
+const MAX_VISIBLE_LOG_LINES = 1000;
+const MAX_VISIBLE_LOG_CHARACTERS = 1024 * 1024;
+
 function resetLogDisplay() {
+  visibleLogLines = [];
+  visibleLogCharacters = 0;
+  document.querySelector("#logWindowHint").textContent = "显示最近 1000 条日志；完整日志可下载。";
   logBox.textContent = "等待日志";
   logTextNode = null;
   logLineCount = 0;
@@ -503,6 +512,9 @@ function selectJob(jobId, reset = false) {
   stopElapsedTimer();
   activeJob = null;
   activeJobId.textContent = jobId;
+  const downloadLink = document.querySelector("#downloadLogLink");
+  downloadLink.href = `/api/jobs/${encodeURIComponent(jobId)}/logs`;
+  downloadLink.hidden = false;
   clearResults();
   resetLogDisplay();
   scheduleActiveMonitor();
@@ -558,10 +570,20 @@ function appendJobLogs(chunk) {
     logTextNode = document.createTextNode("");
     logBox.replaceChildren(logTextNode);
   }
-  // 保留现有文本节点，仅追加新日志，避免每次轮询重建完整日志。
-  // Preserve the text node and append only new logs instead of rebuilding the full log on every poll.
-  logTextNode.appendData(`${logLineCount ? "\n" : ""}${chunk.lines.join("\n")}`);
-  logLineCount += chunk.lines.length;
+  // 页面仅保留有界窗口；完整日志由下载接口分块读取。
+  // Keep a bounded display window; the download endpoint reads the complete log in chunks.
+  const lines = chunk.lines.map((line) => String(line).length > 16384
+    ? `[单条日志过长，显示末尾] ${String(line).slice(-16384)}` : String(line));
+  visibleLogLines.push(...lines);
+  visibleLogCharacters += lines.reduce((sum, line) => sum + line.length + 1, 0);
+  let trimmed = false;
+  while (visibleLogLines.length > MAX_VISIBLE_LOG_LINES || visibleLogCharacters > MAX_VISIBLE_LOG_CHARACTERS) {
+    visibleLogCharacters -= visibleLogLines.shift().length + 1;
+    trimmed = true;
+  }
+  if (trimmed) logTextNode.textContent = visibleLogLines.join("\n");
+  else logTextNode.appendData(`${logLineCount ? "\n" : ""}${lines.join("\n")}`);
+  logLineCount = visibleLogLines.length;
   logBox.scrollTop = logBox.scrollHeight;
 }
 
@@ -906,7 +928,34 @@ async function loadCache() {
   }
 }
 
+document.querySelector("#clearRetainedInputsButton").addEventListener("click", clearRetainedInputs);
+
+async function clearRetainedInputs() {
+  const confirmed = await openConfirmationDialog({
+    title: "清理无引用的上传原视频？",
+    message: "删除当前输出目录中已无任务历史引用的保留上传文件。",
+    safetyNote: "已有任务引用的文件、生成的视频和字幕会保留。此操作不可撤销。",
+  });
+  if (!confirmed) return;
+  const button = document.querySelector("#clearRetainedInputsButton");
+  button.disabled = true;
+  try {
+    const outDir = String(document.querySelector("#outDir").value || "output").trim();
+    const response = await fetch("/api/inputs/clear", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ outDir }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "原视频清理失败");
+    renderCache(data);
+  } catch (error) {
+    document.querySelector("#retainedInputSummary").textContent = error.message;
+  } finally { button.disabled = false; }
+}
+
 function renderCache(data) {
+  const retained = data.retainedInputs || {};
+  document.querySelector("#retainedInputSummary").textContent =
+    `${retained.files || 0} 个文件 · ${formatBytes(retained.bytes || 0)} · 可清理 ${formatBytes(retained.reclaimableBytes || 0)}`;
   const totalBytes = Number(data.totalBytes || 0);
   const limitBytes = Math.max(1, Number(cacheLimitGb.value || 10)) * 1024 ** 3;
   const overLimit = totalBytes > limitBytes;

@@ -105,3 +105,12 @@ test('history paging ignores stale page responses and resets to first page', () 
   assert.equal(pages.total, 0);
   assert.equal(pages.hasMore, false);
 });
+
+test('truncated memory-only streams advance to retained absolute offset', () => {
+  const stream = new JobStream();
+  stream.select('a');
+  const chunk = stream.consume(stream.begin(), {id:'a', logs:['tail'], logOffset:100, logTotal:101, logTruncated:true});
+  assert.deepEqual(chunk.lines, ['tail']);
+  assert.equal(stream.offset, 101);
+  assert.equal(chunk.reset, true);
+});

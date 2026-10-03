@@ -146,6 +146,9 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/media":
             self._serve_media(parsed)
             return
+        if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/logs"):
+            self._download_job_logs(unquote(parsed.path.removeprefix("/api/jobs/").removesuffix("/logs")))
+            return
         if parsed.path.startswith("/api/jobs/"):
             self._send_job(unquote(parsed.path.removeprefix("/api/jobs/")))
             return
@@ -180,6 +183,11 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/upload":
             self._handle_upload()
+            return
+        if path == "/api/inputs/clear":
+            payload = self._read_json()
+            out_dir = self.policy.output_directory(payload.get("outDir") or "output")
+            self._send_json(service.clear_retained_inputs(out_dir))
             return
         if path == "/api/cache/clear":
             try:
@@ -312,6 +320,35 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         print(f"[web] {self.address_string()} - {format % args}")
 
+    def _download_job_logs(self, job_id: str) -> None:
+        payload = service.job_payload(job_id, log_limit=200)
+        if payload is None:
+            self._send_json({"error": "Job not found."}, status=404)
+            return
+        total = payload["logTotal"]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="subtitle-job.log"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            if payload.get("logTruncated"):
+                self.wfile.write("较早日志不可用，以下为保留日志。\n".encode())
+            while payload:
+                lines = payload["logs"][:max(0, total - payload["logOffset"])]
+                if not lines:
+                    break
+                self.wfile.write(("\n".join(lines) + "\n").encode("utf-8"))
+                offset = payload["nextLogOffset"]
+                if offset >= total:
+                    break
+                payload = service.job_payload(job_id, log_offset=offset, log_limit=min(200, total - offset))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _send_job(self, job_id: str) -> None:
         query = parse_qs(urlparse(self.path).query)
         offset = self._query_integer(query, "logOffset", 0, 0, 1000000000)
@@ -361,6 +398,8 @@ class SubtitleToolHandler(BaseHTTPRequestHandler):
             self.policy.artifact(payload.get("outDir") or "output", payload.get("path"), {".srt"})
         elif path == "/api/settings" and "outputDir" in payload:
             self.policy.output_directory(payload["outputDir"])
+        elif path == "/api/inputs/clear":
+            self.policy.output_directory(payload.get("outDir") or "output")
         elif path == "/api/cache/clear":
             self._validate_cache_directory(payload.get("outDir") or "output")
         return payload

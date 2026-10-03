@@ -185,3 +185,13 @@ test('late background metadata cannot unlock a newly selected active job or sche
   assert.equal(app.nodes.get('#logBox').textContent, 'live log');
   assert.equal(app.timers.size, 1);
 });
+
+test('log display keeps a bounded tail and links a complete download', () => {
+  const app = browser();
+  app.run('selectJob("large"); appendJobLogs({lines: Array.from({length:1200}, (_, i) => `line-${i}`)})');
+  const text = app.nodes.get('#logBox').textContent;
+  assert.equal(text.split('\n').length, 1000);
+  assert.equal(text.split('\n')[0], 'line-200');
+  assert.match(app.nodes.get('#logWindowHint').textContent, /1000/);
+  assert.equal(app.nodes.get('#downloadLogLink').href, '/api/jobs/large/logs');
+});

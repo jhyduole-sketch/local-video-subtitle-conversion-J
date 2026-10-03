@@ -100,6 +100,7 @@ class PipelineOptions:
     subtitle_encoding_profile: str = "auto"
     progress_callback: ProgressCallback | None = None
     cancel_check: CancelCheck | None = None
+    force_regenerate: bool = False
 
 
 @dataclass(frozen=True)
@@ -306,18 +307,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                     engine = "源字幕直出"
                     attempts.append(TranslationAttempt(engine, "success").to_dict())
                 else:
-                    partial = translation_cache.load_partial(
-                        source_segments,
-                        options.source_lang,
-                        target_lang,
-                        cache_provider,
+                    translation_session = translation_cache.bind(
+                        source_segments, options.source_lang, target_lang, cache_provider
                     )
-                    cached = translation_cache.load(
-                        source_segments,
-                        options.source_lang,
-                        target_lang,
-                        cache_provider,
-                    )
+                    if options.force_regenerate:
+                        translation_session.clear()
+                    partial = translation_session.load_partial()
+                    cached = partial if partial and partial.complete else None
                     if cached:
                         translations = cached.translations
                         engine = f"{cached.engine}（缓存）"
@@ -345,11 +341,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                             target_lang,
                             min(translated_percent - 1, base_percent + 1),
                             initial_translations,
-                            lambda values: translation_cache.store_partial(
-                                source_segments,
-                                options.source_lang,
-                                target_lang,
-                                cache_provider,
+                            lambda values: translation_session.store_partial(
                                 values,
                                 translation_run_state.checkpoint_engine or translator_label(cache_provider),
                             ),
@@ -358,11 +350,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineResult:
                             attempt_callback=lambda attempt: attempts.append(attempt.to_dict()),
                             initial_engine=partial.engine if partial and initial_translations else None,
                         )
-                        translation_cache.store(
-                            source_segments,
-                            options.source_lang,
-                            target_lang,
-                            cache_provider,
+                        translation_session.store(
                             translations,
                             engine,
                         )

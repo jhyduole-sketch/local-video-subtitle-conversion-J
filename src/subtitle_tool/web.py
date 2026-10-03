@@ -28,6 +28,7 @@ from .user_settings import parse_boolean
 from .media_preview import build_media_response, VIDEO_SUFFIXES
 from .web_security import AccessPolicy, RequestError, content_length, is_loopback
 from .upload_store import UploadStore
+from .retained_inputs import retained_inputs, paths_in_record
 from .onboarding import first_run_guidance
 from .pipeline import (
     PipelineOptions,
@@ -58,6 +59,8 @@ class JobState:
     payload: dict[str, object] = field(default_factory=dict)
     resumed_from: str | None = None
     persisted_log_count: int = field(default=0, repr=False)
+    log_base: int = field(default=0, repr=False)
+    persistence_ok: bool = field(default=False, repr=False)
 
 
 class ActiveJobError(SubtitleToolError):
@@ -66,6 +69,9 @@ class ActiveJobError(SubtitleToolError):
         super().__init__(f"已有任务正在运行: {job.id}")
 
 
+MAX_JOB_LOG_CHARACTERS = 1024 * 1024
+MAX_JOB_LOG_LINES = 1000
+MAX_FINISHED_JOBS_IN_MEMORY = 20
 JOBS: dict[str, JobState] = {}
 JOB_LOCK = threading.Lock()
 SERVICE_STOPPING = threading.Event()
@@ -101,6 +107,12 @@ def _reserve_job(
         existing = _active_job_unlocked()
         if existing:
             raise ActiveJobError(existing)
+        if JOB_STORE:
+            finished = sorted((item for item in JOBS.values()
+                               if item.status not in ACTIVE_JOB_STATUSES and item.persistence_ok),
+                              key=lambda item: item.updated_at, reverse=True)
+            for old in finished[MAX_FINISHED_JOBS_IN_MEMORY - 1:]:
+                JOBS.pop(old.id, None)
         job = JobState(
             id=uuid.uuid4().hex[:12],
             payload=payload,
@@ -267,6 +279,7 @@ def options_from_payload(payload: dict[str, object]) -> PipelineOptions:
         out_dir=out_dir,
         source=str(payload.get("source") or "auto"),
         output_format="srt",
+        force_regenerate=parse_boolean(payload.get("forceRegenerate", False), "forceRegenerate"),
         force_download=parse_boolean(payload.get("forceDownload", False), "forceDownload"),
         download_only=parse_boolean(payload.get("downloadOnly", False), "downloadOnly"),
         transcriber=str(payload.get("transcriber") or "local-whisper"),
@@ -588,13 +601,13 @@ def job_payload(job_id: str, *, log_offset: int = 0, log_limit: int | None = Non
         if job is None:
             return None
         payload = _job_to_dict(job, include_logs=False)
-        if job_id in JOBS:
-            total = len(job.logs)
-            start = min(log_offset, total)
-            lines = job.logs[start:] if log_limit is None else job.logs[start:start + log_limit]
-        else:
-            # 历史详情按需读日志，启动和列表请求不加载日志正文。
-            # Read historical logs on demand; startup and listing avoid loading log bodies.
+        durable_available = JOB_STORE and (job_id not in JOBS or job.persistence_ok)
+        if durable_available and job_id in JOBS and JOB_STORE.get(job_id, include_logs=False) is None:
+            # 已完成任务不会再次保存；数据库丢失时仍展示保留窗口。
+            # Completed jobs never save again; retain their memory window if the database disappears.
+            durable_available = False
+            job.persistence_ok = False
+        if durable_available:
             if log_limit is None:
                 record = JOB_STORE.get(job_id)
                 all_logs = record["logs"] if record else []
@@ -603,8 +616,15 @@ def job_payload(job_id: str, *, log_offset: int = 0, log_limit: int | None = Non
             else:
                 lines, total = JOB_STORE.read_logs(job_id, start=log_offset, limit=log_limit)
             start = min(log_offset, total)
+            truncated = False
+        else:
+            total = job.log_base + len(job.logs)
+            start = max(job.log_base, min(log_offset, total))
+            local_start = start - job.log_base
+            lines = job.logs[local_start:] if log_limit is None else job.logs[local_start:local_start + log_limit]
+            truncated = log_offset < job.log_base
         payload.update(logs=[sanitize_diagnostic_text(line, Path.home()) for line in lines],
-                       logsIncluded=True, logOffset=start, nextLogOffset=start + len(lines),
+                       logsIncluded=True, logOffset=start, logTruncated=truncated, nextLogOffset=start + len(lines),
                        logTotal=total, hasMoreLogs=start + len(lines) < total)
         return payload
 
@@ -631,8 +651,37 @@ def jobs_payload(limit: int = 50, offset: int = 0) -> dict[str, object]:
         }
 
 
+def _input_references_unlocked() -> set[Path]:
+    references: set[Path] = set()
+    if JOB_STORE:
+        offset = 0
+        while True:
+            records = JOB_STORE.list(limit=100, offset=offset, include_logs=False)
+            for record in records:
+                references.update(paths_in_record(record.get("payload")))
+                references.update(paths_in_record(record.get("result")))
+            if len(records) < 100:
+                break
+            offset += len(records)
+    for job in JOBS.values():
+        references.update(paths_in_record(job.payload))
+        references.update(paths_in_record(job.result))
+    return references
+
+
 def cache_summary(out_dir: Path) -> dict[str, object]:
-    return AssetCache(cache_root(out_dir)).summary()
+    result = AssetCache(cache_root(out_dir)).summary()
+    with JOB_LOCK:
+        result["retainedInputs"] = retained_inputs(out_dir, _input_references_unlocked())
+    return result
+
+
+def clear_retained_inputs(out_dir: Path) -> dict[str, object]:
+    with JOB_LOCK:
+        if _active_job_unlocked():
+            raise RequestError("任务正在运行，请在任务结束后清理原视频。", 409)
+        result = retained_inputs(out_dir, _input_references_unlocked(), clear=True)
+    return {**cache_summary(out_dir), "removedFiles": result["removedFiles"], "removedBytes": result["removedBytes"]}
 
 
 def _settings_path() -> Path:
@@ -647,7 +696,9 @@ def clear_cache(out_dir: Path, categories: list[str]) -> dict[str, object]:
     with JOB_LOCK:
         if _active_job_unlocked():
             raise RequestError("任务正在使用缓存，请在任务结束后清理。", 409)
-        return AssetCache(cache_root(out_dir)).clear(categories)
+        result = AssetCache(cache_root(out_dir)).clear(categories)
+        result["retainedInputs"] = retained_inputs(out_dir, _input_references_unlocked())
+        return result
 
 
 def clear_finished_jobs() -> dict[str, int]:
@@ -689,23 +740,44 @@ def resume_job(job_id: str) -> JobState | None:
 
 
 def _persist_job(job: JobState) -> None:
+    job.persistence_ok = False
     if JOB_STORE:
-        # 只发送新增日志；事务成功后再前移游标，失败重试不会漏记。
-        # Send only new entries and advance the cursor after commit so retries cannot lose logs.
         try:
             JOB_STORE.save(_job_record(job, log_start=job.persisted_log_count), log_start=job.persisted_log_count)
         except MissingJobError:
-            # 状态库被重建时只恢复缺失任务，已有任务的游标冲突仍报错。
-            # Replay only a missing job after database recreation; existing cursor conflicts remain errors.
+            # 数据库被外部删除后只能恢复内存窗口，明确记录较早日志已丢失。
+            # After external database deletion only the memory window can be recovered; disclose the lost prefix.
+            if job.log_base:
+                job.logs.insert(0, "日志存储已重建，较早日志已丢失；以下为内存保留日志。")
+            job.log_base = 0
             JOB_STORE.save(_job_record(job), log_start=0)
-        job.persisted_log_count = len(job.logs)
+        job.persisted_log_count = job.log_base + len(job.logs)
+        job.persistence_ok = True
+    # 成功落盘后才淘汰旧行，绝对游标不随内存窗口移动。
+    # Evict old lines only after successful persistence; absolute cursors do not move with the window.
+    excess = max(0, len(job.logs) - MAX_JOB_LOG_LINES)
+    if excess:
+        del job.logs[:excess]
+        job.log_base += excess
+    if job.logs:
+        if len(job.logs[-1]) > MAX_JOB_LOG_CHARACTERS:
+            marker = "[单条日志过长，内存仅保留末尾；完整日志见下载] "
+            job.logs[-1] = marker + job.logs[-1][-(MAX_JOB_LOG_CHARACTERS - len(marker)):]
+        characters = sum(map(len, job.logs))
+        remove = 0
+        while characters > MAX_JOB_LOG_CHARACTERS and remove < len(job.logs) - 1:
+            characters -= len(job.logs[remove])
+            remove += 1
+        if remove:
+            del job.logs[:remove]
+            job.log_base += remove
 
 
 def _job_record(job: JobState, *, log_start: int = 0) -> dict[str, object]:
     return {
         "id": job.id,
         "status": job.status,
-        "logs": job.logs[log_start:],
+        "logs": job.logs[max(0, log_start - job.log_base):],
         "result": job.result,
         "error": job.error,
         "progress": job.progress,

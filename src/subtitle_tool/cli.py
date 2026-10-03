@@ -49,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="srt",
         help="Subtitle output format. v1 supports only srt.",
     )
+    parser.add_argument("--force-regenerate", action="store_true", help="Regenerate transcription and translations without reusing their caches.")
     parser.add_argument(
         "--force-download",
         action="store_true",
@@ -134,6 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=Path(args.out_dir).expanduser().resolve(),
         source=args.source,
         output_format=args.format,
+        force_regenerate=args.force_regenerate,
         force_download=args.force_download,
         download_only=args.download_only,
         transcriber=args.transcriber,

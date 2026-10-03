@@ -32,6 +32,36 @@ class WebBoundaryTests(unittest.TestCase):
         response = connection.getresponse()
         return response.status, response.read(), dict(response.getheaders())
 
+    def test_complete_log_download_streams_beyond_memory_window_and_redacts_secrets(self):
+        from subtitle_tool.job_store import JobStore
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "jobs.sqlite3")
+            job = web.JobState("download", logs=[f"line-{i}" for i in range(1200)] + ["token=private-secret"])
+            with patch.object(web, "JOB_STORE", store), patch.dict(web.JOBS, {job.id: job}, clear=True):
+                web._persist_job(job)
+                self.assertLessEqual(len(job.logs), 1000)
+                status, body, headers = self.request("GET", "/api/jobs/download/logs")
+                store.path.unlink()
+                recovery_status, recovered, _ = self.request("GET", "/api/jobs/download/logs")
+                self.assertEqual(recovery_status, 200)
+                self.assertIn("较早日志", recovered.decode().splitlines()[0])
+                self.assertEqual(len(recovered.decode().splitlines()), 1001)
+            self.assertEqual(status, 200)
+            lines = body.decode().splitlines()
+            self.assertEqual(len(lines), 1201)
+            self.assertEqual(lines[0], "line-0")
+            self.assertEqual(lines[1199], "line-1199")
+            self.assertNotIn(b"private-secret", body)
+            self.assertIn("attachment", headers["Content-Disposition"])
+
+    def test_retained_cleanup_requires_allowed_output_root_and_same_origin(self):
+        status, _, _ = self.request("POST", "/api/inputs/clear", json.dumps({"outDir": "/"}),
+                                    {"Content-Type": "application/json"})
+        self.assertEqual(status, 403)
+        status, _, _ = self.request("POST", "/api/inputs/clear", "{}",
+                                    {"Content-Type": "application/json", "Origin": "https://attacker.invalid"})
+        self.assertEqual(status, 403)
+
     def test_client_cannot_authorize_arbitrary_subtitle_root(self):
         from urllib.parse import urlencode
         with tempfile.TemporaryDirectory() as directory:

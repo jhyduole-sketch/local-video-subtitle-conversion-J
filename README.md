@@ -301,3 +301,8 @@ env PYTHONPYCACHEPREFIX=/private/tmp/subtitle-tool-pycache python3 -m compileall
 ```
 
 项目不会提交 `.env`、`output/`、本地模型、缓存和任务数据库。
+
+
+## 2026-09-30 稳定性与资源优化
+
+新增异常进程清理、配置感知缓存、原视频安全清理、日志窗口和完整日志下载，以及自动回归与核心依赖锁定。详见 [本轮记录](docs/2026-09-30-remaining-hardening.md)。

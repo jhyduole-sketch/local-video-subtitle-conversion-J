@@ -473,8 +473,7 @@ class PipelineTests(unittest.TestCase):
                 return_value={1: "Hello", 2: "World"},
             ) as nllb_translate:
                 cache = cache_class.return_value
-                cache.load.return_value = None
-                cache.load_partial.return_value = partial
+                cache.bind.return_value.load_partial.return_value = partial
                 run_pipeline(
                     PipelineOptions(
                         input_value=str(input_path),
@@ -487,7 +486,7 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(cache.load_partial.call_args.args[-1], "local-nllb-quality")
+        self.assertEqual(cache.bind.call_args.args[-1], "local-nllb-quality")
         self.assertEqual(
             nllb_translate.call_args.kwargs["initial_translations"], {1: "Hello"}
         )
@@ -603,7 +602,7 @@ class PipelineTests(unittest.TestCase):
             ]
             progress_messages = []
 
-            def fake_local(segments, source_lang, target_lang):
+            def fake_local(segments, source_lang, target_lang, **kwargs):
                 return {segment.index: f"{target_lang}: {segment.text}" for segment in segments}
 
             with patch(

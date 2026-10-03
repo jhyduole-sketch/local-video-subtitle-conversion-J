@@ -193,6 +193,7 @@ def _run_whisper_process(
         heartbeat_interval_seconds=30.0,
         heartbeat_callback=heartbeat,
         operation_name="本地 Whisper 转写",
+        capture_limit_bytes=1024 * 1024,
     )
 
 

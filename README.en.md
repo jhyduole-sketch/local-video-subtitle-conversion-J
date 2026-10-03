@@ -153,3 +153,8 @@ Task completion and cancellation now resolve atomically, failed submissions rele
 - Small local transcription and translation models prioritize speed over maximum quality.
 - Burned-in subtitles require video re-encoding and can take a long time for high-resolution videos.
 - Job state and caches remain on the current computer and are not synchronized between machines.
+
+
+## 2026-09-30 reliability and resource updates
+
+Adds exception-safe process cleanup, configuration-aware caches, retained-input cleanup, bounded logs with complete downloads, automated regression and pinned core dependencies. See [implementation notes](docs/2026-09-30-remaining-hardening.md).

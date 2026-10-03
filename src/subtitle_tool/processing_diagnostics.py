@@ -19,7 +19,7 @@ def estimate_input(options, video_path, cache, fingerprint, duration, video_mode
         return path.is_file() and path.stat().st_size > 0
     stage_cache = {"audio": present(cache.audio_path(fingerprint))}
     if options.source in {"audio", "auto"}:
-        stage_cache["transcription"] = present(transcript)
+        stage_cache["transcription"] = present(transcript) and not options.force_regenerate
     if options.source in {"embedded", "auto"}:
         stage_cache["source"] = present(embedded)
     history = cache.root / "analysis" / "processing-estimates.json"

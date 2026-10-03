@@ -32,54 +32,14 @@ def run_process(
     heartbeat_interval_seconds: float | None = None,
     heartbeat_callback: HeartbeatCallback | None = None,
     operation_name: str | None = None,
+    capture_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    if cancel_check and cancel_check():
-        raise CancellationError("Task was cancelled by user.")
-
-    process = subprocess.Popen(
-        command,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
+    return run_process_streaming(
+        command, cancel_check=cancel_check, timeout_seconds=timeout_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        heartbeat_callback=heartbeat_callback, operation_name=operation_name,
+        capture_limit_bytes=capture_limit_bytes,
     )
-    started_at = time.monotonic()
-    last_heartbeat_at = started_at
-    while True:
-        if cancel_check and cancel_check():
-            _terminate_process_group(process)
-            raise CancellationError("Task was cancelled by user.")
-        now = time.monotonic()
-        if timeout_seconds is not None and now - started_at >= timeout_seconds:
-            _terminate_process_group(process)
-            raise _process_timeout_error(operation_name, timeout_seconds, inactivity=False)
-        if (
-            heartbeat_callback is not None
-            and heartbeat_interval_seconds is not None
-            and heartbeat_interval_seconds > 0
-            and now - last_heartbeat_at >= heartbeat_interval_seconds
-        ):
-            heartbeat_callback(now - started_at)
-            last_heartbeat_at = now
-        try:
-            stdout, stderr = process.communicate(
-                timeout=_poll_timeout(
-                    started_at,
-                    last_heartbeat_at,
-                    timeout_seconds,
-                    heartbeat_interval_seconds,
-                )
-            )
-            return subprocess.CompletedProcess(
-                args=command,
-                returncode=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
-            )
-        except subprocess.TimeoutExpired:
-            continue
 
 
 def run_process_streaming(
@@ -91,7 +51,10 @@ def run_process_streaming(
     heartbeat_interval_seconds: float | None = None,
     heartbeat_callback: HeartbeatCallback | None = None,
     operation_name: str | None = None,
+    capture_limit_bytes: int | None = 1024 * 1024,
 ) -> subprocess.CompletedProcess[str]:
+    if capture_limit_bytes is not None and capture_limit_bytes < 0:
+        raise ValueError("capture_limit_bytes must be non-negative")
     if cancel_check and cancel_check():
         raise CancellationError("Task was cancelled by user.")
 
@@ -108,13 +71,14 @@ def run_process_streaming(
     started_at = time.monotonic()
     last_activity_at = started_at
     last_heartbeat_at = started_at
-    if process.stdout is not None:
-        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    if process.stderr is not None:
-        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-
     try:
-        while selector.get_map():
+        if process.stdout is not None:
+            selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        if process.stderr is not None:
+            selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        # 管道关闭不代表进程退出；等待期间仍执行取消、超时和心跳检查。
+        # Closed pipes do not mean process exit; keep cancellation, timeout and heartbeat checks active.
+        while selector.get_map() or process.poll() is None:
             if cancel_check and cancel_check():
                 _terminate_process_group(process)
                 raise CancellationError("Task was cancelled by user.")
@@ -146,6 +110,9 @@ def run_process_streaming(
                 inactivity_timeout_seconds,
                 heartbeat_interval_seconds,
             )
+            if not selector.get_map():
+                time.sleep(wait_seconds)
+                continue
             for key, _ in selector.select(timeout=wait_seconds):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
@@ -153,7 +120,9 @@ def run_process_streaming(
                     continue
                 last_activity_at = time.monotonic()
                 if key.data == "stdout":
-                    stdout_bytes.extend(chunk)
+                    _append_capture(stdout_bytes, chunk, capture_limit_bytes)
+                    if stdout_line_callback is None:
+                        continue
                     stdout_line_buffer.extend(chunk)
                     while b"\n" in stdout_line_buffer:
                         raw_line, _, remainder = stdout_line_buffer.partition(b"\n")
@@ -162,9 +131,18 @@ def run_process_streaming(
                             stdout_line_callback(
                                 raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
                             )
+                    # 异常长的无换行进度行直接拒绝，避免缓冲区无限增长。
+                    # Reject malformed newline-free progress records instead of unbounded buffering.
+                    if len(stdout_line_buffer) > 1024 * 1024:
+                        raise ValueError("Subprocess progress line exceeds 1 MiB")
                 else:
-                    stderr_bytes.extend(chunk)
+                    _append_capture(stderr_bytes, chunk, capture_limit_bytes)
         process.wait()
+    except BaseException:
+        # 回调和读取错误也必须终止并回收子进程，不能只关闭管道。
+        # Callback and read failures must terminate and reap the child, not only close pipes.
+        _terminate_process_group(process)
+        raise
     finally:
         selector.close()
         if process.stdout is not None:
@@ -180,6 +158,12 @@ def run_process_streaming(
         stdout=stdout_bytes.decode("utf-8", errors="replace"),
         stderr=stderr_bytes.decode("utf-8", errors="replace"),
     )
+
+
+def _append_capture(buffer: bytearray, chunk: bytes, limit: int | None) -> None:
+    buffer.extend(chunk)
+    if limit is not None and len(buffer) > limit:
+        del buffer[:len(buffer) - limit]
 
 
 def _poll_timeout(
@@ -238,20 +222,29 @@ def _format_limit_seconds(seconds: float) -> str:
     return f"{seconds / 60:g} 分钟"
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        process.terminate()
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    # 父进程退出后同组子孙仍可能存活；不能用 poll() 跳过整个进程组。
+    # Descendants may survive their leader; poll() must not skip process-group cleanup.
+    def send(sig: int) -> None:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            if process.poll() is None:
+                process.send_signal(sig)
+
+    deadline = time.monotonic() + 1.0
+    send(signal.SIGTERM)
     try:
         process.communicate(timeout=1.0)
-        return
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        process.kill()
+    # 即使后代关闭了输出管道，也给它们有限时间退出，再强制终止。
+    # Give descendants a bounded grace period even when they closed their output pipes.
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    send(signal.SIGKILL)
     process.communicate()

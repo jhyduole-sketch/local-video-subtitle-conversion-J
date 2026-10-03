@@ -9,6 +9,7 @@ from pathlib import Path
 from time import monotonic
 from typing import Callable
 
+from .cache_identity import transcription_identity
 from .atomic_files import atomic_write_text
 from .errors import CancellationError
 from .process_control import CancelCheck
@@ -96,7 +97,7 @@ class AssetCache:
             "video": video_fingerprint,
             "transcriber": transcriber,
             "source": source_lang or "auto",
-            "model": str(whisper_model or "default"),
+            "model": transcription_identity(transcriber, whisper_model, transcription_profile),
             "profile": transcription_profile or "standard",
         }
         digest = sha256(

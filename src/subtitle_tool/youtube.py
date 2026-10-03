@@ -231,6 +231,7 @@ def _download_with_ytdlp(
         ),
         heartbeat_interval_seconds=30.0,
         heartbeat_callback=_download_heartbeat(progress_callback, f"{label} 下载仍在进行"),
+        capture_limit_bytes=1024 * 1024,
         operation_name=f"{label} 视频下载",
     )
     if completed.returncode != 0:
